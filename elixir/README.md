@@ -210,7 +210,9 @@ codex:
   supported. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
 - Scope and paging: candidate reads filter the configured project slug and requested state names,
   following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
-  state/ID lists return `{:ok, []}` without a Linear request.
+  state/ID lists return `{:ok, []}` without a Linear request. In the checked-in default workflow,
+  Symphony polls the configured Linear project every 5 seconds by default; configure this with
+  `polling.interval_ms` in `WORKFLOW.md`.
 - Identity and normalization: `issue.id` is the Linear issue ID and `issue.native_ref` is currently
   `nil`. Records missing a nonblank ID, identifier, title, or state are dropped from candidate
   pages and fail ID refreshes. State keeps Linear's spelling; integer priorities are preserved and
