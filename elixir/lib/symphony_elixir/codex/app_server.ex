@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, Shell, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -190,7 +190,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil, dynamic_tool_binding) do
-    executable = System.find_executable("bash")
+    executable = Shell.bash_executable()
 
     if is_nil(executable) do
       {:error, :bash_not_found}
@@ -221,10 +221,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp local_launch_command(dynamic_tool_binding) do
     [
       tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{Config.settings!().codex.command}"
+      "exec #{Config.settings!().codex.command |> local_shell_command()}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
+  end
+
+  defp local_shell_command(command) when is_binary(command) do
+    case Regex.run(~r/^([A-Za-z]:[^\s]*)(.*)$/s, command, capture: :all_but_first) do
+      [path, rest] -> String.replace(path, "\\", "/") <> rest
+      _ -> command
+    end
   end
 
   defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do

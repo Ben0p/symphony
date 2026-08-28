@@ -68,6 +68,48 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
 
+  def path_env(paths), do: path_env(paths, System.get_env("PATH") || "")
+
+  def path_env(paths, existing_path) when is_list(paths) do
+    paths
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Kernel.++([existing_path])
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(path_separator())
+  end
+
+  def shell_path(path) when is_binary(path), do: String.replace(path, "\\", "/")
+
+  def shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(shell_path(value), "'", "'\"'\"'") <> "'"
+  end
+
+  def write_executable_script!(path, script) when is_binary(path) and is_binary(script) do
+    File.write!(path, script)
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  def symlink_or_skip!(target, link) when is_binary(target) and is_binary(link) do
+    case File.ln_s(target, link) do
+      :ok ->
+        :ok
+
+      {:error, reason} when reason in [:eperm, :eacces, :enotsup] ->
+        {:symlink_unavailable, reason}
+
+      {:error, reason} ->
+        ExUnit.Assertions.flunk("symlink capability probe failed unexpectedly: #{inspect(reason)}")
+    end
+  end
+
+  defp path_separator do
+    case :os.type() do
+      {:win32, _name} -> ";"
+      _other -> ":"
+    end
+  end
+
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
            {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
@@ -206,7 +248,12 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_binary(value) do
-    "\"" <> String.replace(value, "\"", "\\\"") <> "\""
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+
+    "\"" <> escaped <> "\""
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)
