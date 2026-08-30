@@ -32,6 +32,23 @@ defmodule SymphonyElixir.ExecutionFence do
     %{schema_version: @schema_version, executions: %{}, sessions: %{}, history: []}
   end
 
+  @doc "Returns a sanitized, deterministic projection for operator/API observability."
+  @spec snapshot(state()) :: map() | {:error, :invalid_state}
+  def snapshot(state) do
+    case validate_state(state) do
+      :ok ->
+        %{
+          schema_version: @schema_version,
+          executions: state.executions |> Map.values() |> Enum.sort_by(&execution_sort_key/1) |> Enum.map(&sanitize_execution/1),
+          sessions: state.sessions |> Map.values() |> Enum.sort_by(&session_sort_key/1) |> Enum.map(&sanitize_session/1),
+          history: Enum.map(state.history, &sanitize_execution/1)
+        }
+
+      {:error, :invalid_state} = error ->
+        error
+    end
+  end
+
   @doc "Admits one mutable generation for an issue and repository."
   @spec admit(state(), map(), non_neg_integer()) ::
           {:ok, state(), token()} | {:error, atom() | tuple()}
@@ -389,6 +406,59 @@ defmodule SymphonyElixir.ExecutionFence do
   end
 
   defp valid_terminal?(_terminal), do: false
+
+  defp execution_sort_key(execution), do: {execution.issue_id, execution.generation}
+
+  defp session_sort_key(session), do: {session.issue_id, session.generation, session.session_id}
+
+  defp sanitize_execution(execution) do
+    execution
+    |> Map.take([
+      :issue_id,
+      :repository,
+      :generation,
+      :branch,
+      :worktree,
+      :status,
+      :ownership,
+      :cleanup,
+      :admitted_at_ms,
+      :cleaned_at_ms
+    ])
+    |> Map.put(:terminal, sanitize_terminal(execution.terminal))
+    |> Map.put(
+      :sessions,
+      execution.leases
+      |> Map.values()
+      |> Enum.sort_by(&session_sort_key/1)
+      |> Enum.map(&sanitize_session/1)
+    )
+  end
+
+  defp sanitize_terminal(nil), do: nil
+
+  defp sanitize_terminal(terminal),
+    do: Map.take(terminal, [:state, :accepted_head, :merge_identity, :observed_at_ms])
+
+  defp sanitize_session(session) do
+    Map.take(session, [
+      :issue_id,
+      :repository,
+      :generation,
+      :role,
+      :session_id,
+      :process_id,
+      :branch,
+      :worktree,
+      :status,
+      :registered_at_ms,
+      :last_heartbeat_at,
+      :linear_state,
+      :pr_state,
+      :head,
+      :release_reason
+    ])
+  end
 
   defp positive_integer?(value), do: is_integer(value) and value > 0
 

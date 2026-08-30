@@ -48,3 +48,10 @@ or later mutable work. The current runtime does not publish an exact accepted Gi
 head before every terminal cleanup request; the integrated cleanup path preserves
 that workspace until such a head is supplied, rather than treating `PR merged` or
 an unknown head as proof of quiescence.
+
+The orchestrator snapshot and reconciliation API expose this serializable
+registry, but they do not make it restart durable. `SPEC.md` Section 14.3
+continues to govern restart recovery: tracker/filesystem polling and preserved
+workspaces are the recovery model. A higher-level deployment must persist and
+rehydrate the serialized fence snapshot before cross-restart ownership can be
+treated as durable.

@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @execution_fence_lease_ttl_ms 300_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -1571,9 +1572,49 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Reconciles an explicit sanitized execution-session observation snapshot."
+  @spec reconcile_execution_fence([map()], non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def reconcile_execution_fence(observations, now_ms) when is_list(observations) do
+    reconcile_execution_fence(__MODULE__, observations, now_ms, @execution_fence_lease_ttl_ms)
+  end
+
+  @spec reconcile_execution_fence([map()], non_neg_integer(), pos_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def reconcile_execution_fence(observations, now_ms, ttl_ms) when is_list(observations) do
+    reconcile_execution_fence(__MODULE__, observations, now_ms, ttl_ms)
+  end
+
+  @spec reconcile_execution_fence(GenServer.server(), [map()], non_neg_integer(), pos_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def reconcile_execution_fence(server, observations, now_ms, ttl_ms)
+      when is_list(observations) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_reconcile, observations, now_ms, ttl_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call({:execution_fence_authorize, token, action}, _from, %State{} = state) do
     {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
+  end
+
+  def handle_call({:execution_fence_reconcile, observations, now_ms, ttl_ms}, _from, %State{} = state) do
+    case ExecutionFence.reconcile_sessions(state.execution_fence, observations, now_ms, ttl_ms) do
+      {:ok, fence_state, summary} ->
+        reply = {:ok, %{summary: summary, execution_fence: execution_fence_snapshot(fence_state)}}
+        {:reply, reply, %{state | execution_fence: fence_state}}
+
+      {:error, reason} = error ->
+        Logger.warning("Execution-fence reconciliation rejected: #{inspect(reason)}")
+        {:reply, error, state}
+    end
   end
 
   def handle_call(:snapshot, _from, state) do
@@ -1644,6 +1685,7 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       execution_fence: execution_fence_snapshot(state.execution_fence),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1674,6 +1716,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(_metadata), do: nil
+
+  defp execution_fence_snapshot(fence_state) do
+    case ExecutionFence.snapshot(fence_state) do
+      snapshot when is_map(snapshot) -> snapshot
+      {:error, reason} -> %{schema_version: 1, status: :invalid, error: reason}
+    end
+  end
+
+  defp server_available?(server) when is_pid(server), do: Process.alive?(server)
+  defp server_available?(server) when is_atom(server), do: is_pid(Process.whereis(server))
+  defp server_available?(_server), do: false
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
