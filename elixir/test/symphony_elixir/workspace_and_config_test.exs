@@ -857,14 +857,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       tracker_terminal_states: []
     )
 
-    state = %Orchestrator.State{
-      max_concurrent_agents: 3,
-      running: %{},
-      claimed: MapSet.new(),
-      blocked: %{},
-      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-      retry_attempts: %{}
-    }
+    state = %Orchestrator.State{max_concurrent_agents: 3, running: %{}, claimed: MapSet.new(), blocked: %{}, codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}, retry_attempts: %{}}
 
     for terminal_state <- ["Done", "Closed", "Canceled"] do
       issue = %Issue{id: "terminal-#{terminal_state}", identifier: "MT-#{terminal_state}", title: "Terminal stale ready", state: terminal_state, labels: ["symphony-ready"], dispatchable: true}

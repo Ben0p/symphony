@@ -410,7 +410,8 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "memory",
       workspace_root: test_root,
       poll_interval_ms: 10,
-      hook_before_run: "mkfifo #{shell_escape(hook_fifo)}; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
+      hook_before_run:
+        "mkfifo #{shell_escape(hook_fifo)}; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
       hook_timeout_ms: 60_000
     )
 
@@ -568,7 +569,8 @@ defmodule SymphonyElixir.CoreTest do
         workspace_root: test_root,
         tracker_active_states: ["Todo", "In Progress", "In Review"],
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
-        hook_before_remove: "if [ -f #{shell_escape(worker_alive_marker)} ]; then printf alive > #{shell_escape(cleanup_marker)}; else printf stopped > #{shell_escape(cleanup_marker)}; fi"
+        hook_before_remove:
+          "if [ -f #{shell_escape(worker_alive_marker)} ]; then printf alive > #{shell_escape(cleanup_marker)}; else printf stopped > #{shell_escape(cleanup_marker)}; fi"
       )
 
       File.mkdir_p!(workspace)

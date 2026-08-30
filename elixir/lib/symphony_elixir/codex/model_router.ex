@@ -48,17 +48,12 @@ defmodule SymphonyElixir.Codex.ModelRouter do
     explicit = Enum.find(@explicit_labels, fn {label, _tier} -> MapSet.member?(labels, label) end)
 
     cond do
-      explicit ->
-        {elem(explicit, 1), "explicit #{elem(explicit, 0)} label"}
-
+      explicit -> {elem(explicit, 1), "explicit #{elem(explicit, 0)} label"}
       Enum.any?(@retired_labels, &MapSet.member?(labels, &1)) ->
         {"luna-high", "retired model:spark label fell back to luna-high"}
-
       Enum.any?(@luna_xhigh_labels, &MapSet.member?(labels, &1)) ->
         {"luna-xhigh", "high-complexity Linear label routed to luna-xhigh"}
-
-      true ->
-        {"luna-high", "default cost-sensitive coding route"}
+      true -> {"luna-high", "default cost-sensitive coding route"}
     end
   end
 

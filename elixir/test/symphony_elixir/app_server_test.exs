@@ -1,6 +1,5 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
-
   import SymphonyElixir.TestSupport,
     only: [
       path_env: 2,
