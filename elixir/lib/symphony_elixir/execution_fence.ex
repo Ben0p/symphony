@@ -23,13 +23,20 @@ defmodule SymphonyElixir.ExecutionFence do
           schema_version: 1,
           executions: %{optional(String.t()) => map()},
           sessions: %{optional(String.t()) => map()},
-          history: [map()]
+          history: [map()],
+          triage_records: %{optional(String.t()) => map()}
         }
 
   @doc "Creates an empty, versioned execution-fence snapshot."
   @spec new() :: state()
   def new do
-    %{schema_version: @schema_version, executions: %{}, sessions: %{}, history: []}
+    %{
+      schema_version: @schema_version,
+      executions: %{},
+      sessions: %{},
+      history: [],
+      triage_records: %{}
+    }
   end
 
   @doc "Validates a fence state before it is persisted or used for admission."
@@ -73,7 +80,12 @@ defmodule SymphonyElixir.ExecutionFence do
             |> Map.values()
             |> Enum.sort_by(&session_sort_key/1)
             |> Enum.map(&sanitize_session/1),
-          history: Enum.map(state.history, &sanitize_execution/1)
+          history: Enum.map(state.history, &sanitize_execution/1),
+          triage_records:
+            state.triage_records
+            |> Map.values()
+            |> Enum.sort_by(&triage_sort_key/1)
+            |> Enum.map(&sanitize_triage_record/1)
         }
 
       {:error, :invalid_state} = error ->
@@ -193,6 +205,53 @@ defmodule SymphonyElixir.ExecutionFence do
 
   def observe_session_head(_state, _token, _session_id, _head, _now_ms),
     do: {:error, :invalid_session_head}
+
+  @doc "Records one idempotent triage record for a post-terminal head divergence."
+  @spec record_head_divergence(state(), token(), String.t(), String.t(), non_neg_integer()) ::
+          {:ok, state(), :recorded | :already_recorded} | {:error, term()}
+  def record_head_divergence(state, token, expected_head, observed_head, now_ms)
+      when is_binary(expected_head) and is_binary(observed_head) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_state(state),
+         {:ok, execution} <- current_execution(state, token),
+         :ok <- terminal_execution(execution),
+         true <- present_string?(expected_head),
+         true <- present_string?(observed_head) do
+      triage_id = triage_id(execution)
+
+      case Map.get(state.triage_records, triage_id) do
+        nil ->
+          record = %{
+            id: triage_id,
+            type: :post_terminal_head_divergence,
+            issue_id: execution.issue_id,
+            repository: execution.repository,
+            generation: execution.generation,
+            branch: execution.branch,
+            worktree: execution.worktree,
+            expected_head: expected_head,
+            observed_head: observed_head,
+            detected_at_ms: now_ms
+          }
+
+          next_state = %{state | triage_records: Map.put(state.triage_records, triage_id, record)}
+          {:ok, next_state, :recorded}
+
+        existing ->
+          if same_triage_incident?(existing, execution, expected_head) do
+            {:ok, state, :already_recorded}
+          else
+            {:error, :triage_conflict}
+          end
+      end
+    else
+      false -> {:error, :invalid_head}
+      {:error, _reason} = error -> error
+      _ -> {:error, :not_terminal}
+    end
+  end
+
+  def record_head_divergence(_state, _token, _expected_head, _observed_head, _now_ms),
+    do: {:error, :invalid_triage_record}
 
   @doc "Releases one generation-bound lease. Releasing twice is harmless."
   @spec release(state(), token(), String.t(), atom()) ::
@@ -360,13 +419,15 @@ defmodule SymphonyElixir.ExecutionFence do
          schema_version: @schema_version,
          executions: executions,
          sessions: sessions,
-         history: history
+         history: history,
+         triage_records: triage_records
        })
-       when is_map(executions) and is_map(sessions) and is_list(history) do
+       when is_map(executions) and is_map(sessions) and is_list(history) and is_map(triage_records) do
     if Enum.all?(executions, fn {issue_id, execution} -> valid_execution?(issue_id, execution) end) and
          Enum.all?(sessions, fn {session_id, session} -> valid_lease?(session_id, session) end) and
          valid_session_registry?(executions, sessions) and
-         Enum.all?(history, &valid_history_execution?/1) do
+         Enum.all?(history, &valid_history_execution?/1) and
+         valid_triage_records?(triage_records) do
       :ok
     else
       {:error, :invalid_state}
@@ -422,6 +483,28 @@ defmodule SymphonyElixir.ExecutionFence do
   end
 
   defp valid_history_execution?(_execution), do: false
+
+  defp valid_triage_records?(records) when is_map(records) do
+    Enum.all?(records, fn {triage_id, record} -> valid_triage_record?(triage_id, record) end)
+  end
+
+  defp valid_triage_records?(_records), do: false
+
+  defp valid_triage_record?(triage_id, record) when is_binary(triage_id) and is_map(record) do
+    Map.get(record, :id) == triage_id and
+      Map.get(record, :type) == :post_terminal_head_divergence and
+      present_string?(Map.get(record, :issue_id)) and
+      present_string?(Map.get(record, :repository)) and
+      positive_integer?(Map.get(record, :generation)) and
+      present_string?(Map.get(record, :branch)) and
+      present_string?(Map.get(record, :worktree)) and
+      present_string?(Map.get(record, :expected_head)) and
+      present_string?(Map.get(record, :observed_head)) and
+      non_negative_integer?(Map.get(record, :detected_at_ms)) and
+      triage_id == triage_id_for(Map.get(record, :issue_id), Map.get(record, :generation))
+  end
+
+  defp valid_triage_record?(_triage_id, _record), do: false
 
   defp valid_execution_status?(execution) do
     valid_status_cleanup_pair?(Map.get(execution, :status), Map.get(execution, :cleanup)) and
@@ -501,6 +584,8 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp session_sort_key(session), do: {session.issue_id, session.generation, session.session_id}
 
+  defp triage_sort_key(record), do: record.id
+
   defp sanitize_execution(execution) do
     execution
     |> Map.take([
@@ -547,6 +632,21 @@ defmodule SymphonyElixir.ExecutionFence do
       :pr_state,
       :head,
       :release_reason
+    ])
+  end
+
+  defp sanitize_triage_record(record) do
+    Map.take(record, [
+      :id,
+      :type,
+      :issue_id,
+      :repository,
+      :generation,
+      :branch,
+      :worktree,
+      :expected_head,
+      :observed_head,
+      :detected_at_ms
     ])
   end
 
@@ -632,6 +732,9 @@ defmodule SymphonyElixir.ExecutionFence do
   defp active_execution(%{status: :active}), do: :ok
   defp active_execution(%{status: :terminal}), do: {:error, :terminal_fenced}
   defp active_execution(_execution), do: {:error, :invalid_execution}
+
+  defp terminal_execution(%{status: :terminal}), do: :ok
+  defp terminal_execution(_execution), do: {:error, :not_terminal}
 
   defp reconciled_ownership(%{ownership: :reconciled}), do: :ok
   defp reconciled_ownership(_execution), do: {:error, :ownership_unreconciled}
@@ -739,6 +842,24 @@ defmodule SymphonyElixir.ExecutionFence do
     Map.take(left, [:state, :accepted_head, :merge_identity]) ==
       Map.take(right, [:state, :accepted_head, :merge_identity])
   end
+
+  defp same_triage_incident?(record, execution, expected_head) do
+    Map.take(record, [:type, :issue_id, :repository, :generation, :branch, :worktree, :expected_head]) ==
+      %{
+        type: :post_terminal_head_divergence,
+        issue_id: execution.issue_id,
+        repository: execution.repository,
+        generation: execution.generation,
+        branch: execution.branch,
+        worktree: execution.worktree,
+        expected_head: expected_head
+      }
+  end
+
+  defp triage_id(execution), do: triage_id_for(execution.issue_id, execution.generation)
+
+  defp triage_id_for(issue_id, generation),
+    do: "#{issue_id}:#{generation}:post-terminal-head-divergence"
 
   defp canonical_observations(observations) do
     observations
