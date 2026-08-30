@@ -131,10 +131,27 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
         {:error, {:enoent, ""}}
 
       path ->
-        case System.cmd(path, args, stderr_to_stdout: true) do
+        {executable, command_args} = command_invocation(path, args)
+
+        case System.cmd(executable, command_args, stderr_to_stdout: true) do
           {output, 0} -> {:ok, output}
           {output, status} -> {:error, {status, output}}
         end
+    end
+  end
+
+  defp command_invocation(path, args) do
+    if windows?() and String.downcase(Path.extname(path)) in [".bat", ".cmd"] do
+      {"cmd.exe", ["/d", "/c", path | args]}
+    else
+      {path, args}
+    end
+  end
+
+  defp windows? do
+    case :os.type() do
+      {:win32, _name} -> true
+      _other -> false
     end
   end
 end
