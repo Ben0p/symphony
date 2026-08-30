@@ -21,7 +21,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
-          dynamic_tool_binding: map()
+          dynamic_tool_binding: map(),
+          execution_fence_guard: (-> term()) | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -39,8 +40,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
+    execution_fence_guard = Keyword.get(opts, :execution_fence_guard)
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with :ok <- execution_fence_preflight(execution_fence_guard),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
@@ -58,7 +61,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
+           dynamic_tool_binding: dynamic_tool_binding,
+           execution_fence_guard: execution_fence_guard
          }}
       else
         {:error, reason} ->
@@ -78,63 +82,65 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace,
-          dynamic_tool_binding: dynamic_tool_binding
+          dynamic_tool_binding: dynamic_tool_binding,
+          execution_fence_guard: session_execution_fence_guard
         },
         prompt,
         issue,
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    execution_fence_guard = Keyword.get(opts, :execution_fence_guard, session_execution_fence_guard)
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-      {:ok, turn_id} ->
-        session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+    with :ok <- execution_fence_preflight(execution_fence_guard),
+         {:ok, turn_id} <- start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+      session_id = "#{thread_id}-#{turn_id}"
+      Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
-        emit_message(
-          on_message,
-          :session_started,
-          %{
-            session_id: session_id,
-            thread_id: thread_id,
-            turn_id: turn_id
-          },
-          metadata
-        )
+      emit_message(
+        on_message,
+        :session_started,
+        %{
+          session_id: session_id,
+          thread_id: thread_id,
+          turn_id: turn_id
+        },
+        metadata
+      )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
-          {:ok, result} ->
-            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+      case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, execution_fence_guard) do
+        {:ok, result} ->
+          Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
-            {:ok,
-             %{
-               result: result,
-               session_id: session_id,
-               thread_id: thread_id,
-               turn_id: turn_id
-             }}
+          {:ok,
+           %{
+             result: result,
+             session_id: session_id,
+             thread_id: thread_id,
+             turn_id: turn_id
+           }}
 
-          {:error, reason} ->
-            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
-            emit_message(
-              on_message,
-              :turn_ended_with_error,
-              %{
-                session_id: session_id,
-                reason: reason
-              },
-              metadata
-            )
+          emit_message(
+            on_message,
+            :turn_ended_with_error,
+            %{
+              session_id: session_id,
+              reason: reason
+            },
+            metadata
+          )
 
-            {:error, reason}
-        end
-
+          {:error, reason}
+      end
+    else
       {:error, reason} ->
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
@@ -249,6 +255,19 @@ defmodule SymphonyElixir.Codex.AppServer do
       names -> "unset " <> Enum.join(names, " ")
     end
   end
+
+  defp execution_fence_preflight(nil), do: :ok
+
+  defp execution_fence_preflight(guard) when is_function(guard, 0) do
+    case guard.() do
+      :ok -> :ok
+      {:ok, _metadata} -> :ok
+      {:error, _reason} = error -> error
+      _other -> {:error, :invalid_execution_fence_guard_result}
+    end
+  end
+
+  defp execution_fence_preflight(_invalid), do: {:error, :invalid_execution_fence_guard}
 
   defp valid_environment_names(names) do
     Enum.filter(names, fn name ->
@@ -365,22 +384,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, execution_fence_guard) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      execution_fence_guard
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, execution_fence_guard) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, execution_fence_guard)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -389,7 +409,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          execution_fence_guard
         )
 
       {^port, {:exit_status, status}} ->
@@ -400,7 +421,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, execution_fence_guard) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -442,7 +463,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          execution_fence_guard
         )
 
       {:ok, payload} ->
@@ -456,7 +478,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, execution_fence_guard)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -473,7 +495,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, execution_fence_guard)
     end
   end
 
@@ -498,7 +520,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         execution_fence_guard
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -510,7 +533,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            on_message,
            metadata,
            tool_executor,
-           auto_approve_requests
+           auto_approve_requests,
+           execution_fence_guard
          ) do
       :input_required ->
         emit_message(
@@ -523,7 +547,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, execution_fence_guard)
 
       :approval_required ->
         emit_message(
@@ -557,7 +581,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, execution_fence_guard)
         end
     end
   end
@@ -570,7 +594,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         execution_fence_guard
        ) do
     approve_or_require(
       port,
@@ -580,7 +605,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      execution_fence_guard
     )
   end
 
@@ -592,15 +618,22 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          tool_executor,
-         _auto_approve_requests
+         _auto_approve_requests,
+         execution_fence_guard
        ) do
     tool_name = tool_call_name(params)
     arguments = tool_call_arguments(params)
 
     result =
-      tool_name
-      |> tool_executor.(arguments)
-      |> normalize_dynamic_tool_result()
+      case execution_fence_preflight(execution_fence_guard) do
+        :ok ->
+          tool_name
+          |> tool_executor.(arguments)
+          |> normalize_dynamic_tool_result()
+
+        {:error, reason} ->
+          normalize_dynamic_tool_result({:execution_fence_rejected, reason})
+      end
 
     send_message(port, %{
       "id" => id,
@@ -627,7 +660,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         execution_fence_guard
        ) do
     approve_or_require(
       port,
@@ -637,7 +671,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      execution_fence_guard
     )
   end
 
@@ -649,7 +684,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         execution_fence_guard
        ) do
     approve_or_require(
       port,
@@ -659,7 +695,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      execution_fence_guard
     )
   end
 
@@ -671,7 +708,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         execution_fence_guard
        ) do
     approve_or_require(
       port,
@@ -681,7 +719,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      execution_fence_guard
     )
   end
 
@@ -693,7 +732,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         execution_fence_guard
        ) do
     maybe_auto_answer_tool_request_user_input(
       port,
@@ -703,7 +743,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_requests,
+      execution_fence_guard
     )
   end
 
@@ -715,7 +756,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          _on_message,
          _metadata,
          _tool_executor,
-         _auto_approve_requests
+         _auto_approve_requests,
+         _execution_fence_guard
        ) do
     :unhandled
   end
@@ -766,18 +808,25 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload_string,
          on_message,
          metadata,
-         true
+         true,
+         execution_fence_guard
        ) do
-    send_message(port, %{"id" => id, "result" => %{"decision" => decision}})
+    case execution_fence_preflight(execution_fence_guard) do
+      :ok ->
+        send_message(port, %{"id" => id, "result" => %{"decision" => decision}})
 
-    emit_message(
-      on_message,
-      :approval_auto_approved,
-      %{payload: payload, raw: payload_string, decision: decision},
-      metadata
-    )
+        emit_message(
+          on_message,
+          :approval_auto_approved,
+          %{payload: payload, raw: payload_string, decision: decision},
+          metadata
+        )
 
-    :approved
+        :approved
+
+      {:error, _reason} ->
+        :approval_required
+    end
   end
 
   defp approve_or_require(
@@ -788,7 +837,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          _payload_string,
          _on_message,
          _metadata,
-         false
+         false,
+         _execution_fence_guard
        ) do
     :approval_required
   end
@@ -801,22 +851,29 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload_string,
          on_message,
          metadata,
-         true
+         true,
+         execution_fence_guard
        ) do
-    case tool_request_user_input_approval_answers(params) do
-      {:ok, answers, decision} ->
-        send_message(port, %{"id" => id, "result" => %{"answers" => answers}})
+    case execution_fence_preflight(execution_fence_guard) do
+      :ok ->
+        case tool_request_user_input_approval_answers(params) do
+          {:ok, answers, decision} ->
+            send_message(port, %{"id" => id, "result" => %{"answers" => answers}})
 
-        emit_message(
-          on_message,
-          :approval_auto_approved,
-          %{payload: payload, raw: payload_string, decision: decision},
-          metadata
-        )
+            emit_message(
+              on_message,
+              :approval_auto_approved,
+              %{payload: payload, raw: payload_string, decision: decision},
+              metadata
+            )
 
-        :approved
+            :approved
 
-      :error ->
+          :error ->
+            :input_required
+        end
+
+      {:error, _reason} ->
         :input_required
     end
   end
@@ -829,7 +886,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          _payload_string,
          _on_message,
          _metadata,
-         false
+         false,
+         _execution_fence_guard
        ),
        do: :input_required
 

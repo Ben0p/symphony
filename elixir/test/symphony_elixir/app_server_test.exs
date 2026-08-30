@@ -1,6 +1,20 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "app server rejects a fenced execution before opening Codex" do
+    test_pid = self()
+
+    assert {:error, :terminal_fenced} =
+             AppServer.start_session("C:/does-not-matter",
+               execution_fence_guard: fn ->
+                 send(test_pid, :execution_fence_checked)
+                 {:error, :terminal_fenced}
+               end
+             )
+
+    assert_received :execution_fence_checked
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -947,6 +961,131 @@ defmodule SymphonyElixir.AppServerTest do
                      get_in(payload, ["result", "output"]),
                      "Unsupported dynamic tool"
                    )
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fences dynamic tool calls before executor side effects" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-fenced-tool-call-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-90F")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-fenced-tool-call.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-fenced-tool-call.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-90f"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-90f"}}}'
+            printf '%s\\n' '{"id":104,"method":"item/tool/call","params":{"name":"linear_graphql","callId":"call-90f","threadId":"thread-90f","turnId":"turn-90f","arguments":{"query":"query Viewer { viewer { id } }"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-fenced-tool-call",
+        identifier: "MT-90F",
+        title: "Fenced tool call",
+        description: "Ensure fenced sessions cannot invoke dynamic tools",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-90F",
+        labels: ["backend"]
+      }
+
+      {:ok, guard_state} = Agent.start_link(fn -> 0 end)
+
+      on_exit(fn ->
+        Agent.stop(guard_state)
+        System.delete_env("SYMP_TEST_CODEx_TRACE")
+      end)
+
+      execution_fence_guard = fn ->
+        Agent.get_and_update(guard_state, fn calls ->
+          result = if calls < 2, do: :ok, else: {:error, :terminal_fenced}
+          {result, calls + 1}
+        end)
+      end
+
+      test_pid = self()
+
+      tool_executor = fn tool, arguments ->
+        send(test_pid, {:tool_called, tool, arguments})
+        %{"success" => true, "output" => "should not execute"}
+      end
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Reject fenced tool calls", issue,
+                 execution_fence_guard: execution_fence_guard,
+                 tool_executor: tool_executor
+               )
+
+      refute_received {:tool_called, _, _}
+      assert Agent.get(guard_state, & &1) >= 3
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 104 and
+                   get_in(payload, ["result", "success"]) == false and
+                   String.contains?(get_in(payload, ["result", "output"]), "terminal_fenced")
                else
                  false
                end

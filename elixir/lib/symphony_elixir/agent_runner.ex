@@ -44,11 +44,12 @@ defmodule SymphonyElixir.AgentRunner do
           send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
           try do
-            with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+            with :ok <- execution_fence_preflight(opts),
+                 :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
               run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
             end
           after
-            Workspace.run_after_run_hook(workspace, issue, worker_host)
+            run_after_run_hook_if_authorized(workspace, issue, worker_host, opts)
           end
 
         {:error, reason} ->
@@ -109,7 +110,12 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, session} <-
+           AppServer.start_session(
+             workspace,
+             worker_host: worker_host,
+             execution_fence_guard: Keyword.get(opts, :execution_fence_guard)
+           ) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
@@ -126,7 +132,8 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue),
+             execution_fence_guard: Keyword.get(opts, :execution_fence_guard)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -232,5 +239,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
+  end
+
+  defp run_after_run_hook_if_authorized(workspace, issue, worker_host, opts) do
+    case execution_fence_preflight(opts) do
+      :ok ->
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+
+      {:error, reason} ->
+        Logger.warning("Skipping after-run hook after execution fence rejection for #{issue_context(issue)}: #{inspect(reason)}")
+        :ok
+    end
   end
 end
