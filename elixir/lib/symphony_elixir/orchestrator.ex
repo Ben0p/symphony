@@ -7,13 +7,16 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, ExecutionFence, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, ExecutionFence, StartupMaintenance, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.ExecutionFence.Persistence
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @execution_fence_lease_ttl_ms 300_000
+  # Terminal tracker states always dominate dynamic labels and local workflow
+  # configuration. A stale ready label must never re-admit completed work.
+  @mandatory_terminal_states ["closed", "cancelled", "canceled", "duplicate", "done"]
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -43,8 +46,10 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       execution_fence: ExecutionFence.new(),
       execution_fence_path: nil,
+      stall_restarts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      startup_maintenance: nil
     ]
   end
 
@@ -61,12 +66,10 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, config} ->
         case load_execution_fence(config.execution_fence.state_path) do
           {:ok, fence_state} ->
-            now_ms = System.monotonic_time(:millisecond)
-
             state = %State{
               poll_interval_ms: config.polling.interval_ms,
               max_concurrent_agents: config.agent.max_concurrent_agents,
-              next_poll_due_at_ms: now_ms,
+              next_poll_due_at_ms: nil,
               poll_check_in_progress: false,
               tick_timer_ref: nil,
               tick_token: nil,
@@ -77,8 +80,7 @@ defmodule SymphonyElixir.Orchestrator do
               codex_rate_limits: nil
             }
 
-            state = run_terminal_workspace_cleanup(state)
-            state = schedule_tick(state, 0)
+            state = start_startup_maintenance(state, opts)
 
             {:ok, state}
 
@@ -132,6 +134,53 @@ defmodule SymphonyElixir.Orchestrator do
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:startup_maintenance_timeout, ref}, %{startup_maintenance: %{task_ref: ref}} = state)
+      when is_reference(ref) do
+    maintenance = state.startup_maintenance
+
+    if is_pid(maintenance[:task_pid]) and Process.alive?(maintenance.task_pid) do
+      Task.Supervisor.terminate_child(state.task_supervisor, maintenance.task_pid)
+    end
+
+    Logger.warning("Startup terminal workspace cleanup timed out; scheduler and dashboard remain healthy")
+
+    state =
+      state
+      |> Map.put(:startup_maintenance, StartupMaintenance.timeout(maintenance))
+      |> schedule_tick(0)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:startup_maintenance_timeout, _ref}, state), do: {:noreply, state}
+
+  def handle_info({ref, {:ok, result}}, %{startup_maintenance: %{task_ref: ref}} = state)
+      when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+
+    state =
+      state
+      |> Map.put(:startup_maintenance, StartupMaintenance.complete(state.startup_maintenance, result))
+      |> schedule_tick(0)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{startup_maintenance: %{task_ref: ref}} = state)
+      when is_reference(ref) do
+    Logger.warning("Startup terminal workspace cleanup failed; scheduler and dashboard remain healthy")
+
+    state =
+      state
+      |> Map.put(:startup_maintenance, StartupMaintenance.fail(state.startup_maintenance, reason))
+      |> schedule_tick(0)
 
     notify_dashboard()
     {:noreply, state}
@@ -608,9 +657,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
+    max_no_progress_tokens = Config.settings!().codex.max_no_progress_tokens
 
     cond do
-      timeout_ms <= 0 ->
+      timeout_ms <= 0 and max_no_progress_tokens <= 0 ->
         state
 
       map_size(state.running) == 0 ->
@@ -618,27 +668,55 @@ defmodule SymphonyElixir.Orchestrator do
 
       true ->
         now = DateTime.utc_now()
+        now_ms = monotonic_now_ms()
 
         Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-          maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
+          maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, now_ms, timeout_ms)
         end)
     end
   end
 
-  defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
+  defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms) do
     if Map.has_key?(state.blocked, issue_id) do
       state
     else
-      restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
+      restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms)
     end
   end
 
-  defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
-    elapsed_ms = stall_elapsed_ms(running_entry, now)
+  defp restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms) do
+    elapsed_ms = stall_elapsed_ms(running_entry, now_ms)
+    max_no_progress_tokens = Config.settings!().codex.max_no_progress_tokens
+    no_progress_tokens = no_progress_token_count(running_entry)
+    no_durable_progress_tokens = no_durable_progress_token_count(running_entry)
+    time_stall? = timeout_ms > 0 and is_integer(elapsed_ms) and elapsed_ms > timeout_ms
 
-    if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
+    command_token_stall? =
+      max_no_progress_tokens > 0 and no_progress_tokens >= max_no_progress_tokens
+
+    durable_token_stall? =
+      max_no_progress_tokens > 0 and no_durable_progress_tokens >= max_no_progress_tokens
+
+    token_stall? = command_token_stall? or durable_token_stall?
+
+    if time_stall? or token_stall? do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
+      restart_count = Map.get(state.stall_restarts, issue_id, 0) + 1
+
+      diagnostic =
+        stall_diagnostic(
+          running_entry,
+          now,
+          elapsed_ms,
+          timeout_ms,
+          restart_count,
+          token_stall?,
+          durable_token_stall?,
+          no_progress_tokens,
+          no_durable_progress_tokens,
+          max_no_progress_tokens
+        )
 
       if input_required_blocker?(running_entry) do
         error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
@@ -649,40 +727,152 @@ defmodule SymphonyElixir.Orchestrator do
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, error)
       else
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+        max_retries = Config.settings!().codex.max_stall_retries
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+        if restart_count > max_retries do
+          error = "codex stalled #{restart_count} consecutive times; automatic recovery exhausted"
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+          Logger.warning("Issue stopped after repeated stalls: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} restart_count=#{restart_count} elapsed_ms=#{elapsed_ms}")
+
+          state
+          |> record_session_completion_totals(running_entry)
+          |> put_stall_restart_count(issue_id, restart_count)
+          |> stop_and_block_issue(
+            issue_id,
+            Map.put(running_entry, :stall_diagnostic, diagnostic),
+            error
+          )
+        else
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+
+          next_attempt = next_retry_attempt_from_running(running_entry)
+
+          state
+          |> put_stall_restart_count(issue_id, restart_count)
+          |> terminate_running_issue(issue_id, false)
+          |> reserve_issue_claim_for_retry(issue_id)
+          |> schedule_issue_retry(issue_id, next_attempt, %{
+            identifier: identifier,
+            issue_url: running_entry.issue.url,
+            error:
+              stall_retry_error(
+                elapsed_ms,
+                token_stall?,
+                no_progress_tokens,
+                no_durable_progress_tokens,
+                max_no_progress_tokens
+              ),
+            stall_diagnostic: diagnostic
+          })
+        end
       end
     else
       state
     end
   end
 
-  defp stall_elapsed_ms(running_entry, now) do
-    running_entry
-    |> last_activity_timestamp()
-    |> case do
-      %DateTime{} = timestamp ->
-        max(0, DateTime.diff(now, timestamp, :millisecond))
-
-      _ ->
-        nil
+  defp stall_elapsed_ms(running_entry, now_ms) when is_integer(now_ms) do
+    case last_activity_monotonic_ms(running_entry) do
+      timestamp_ms when is_integer(timestamp_ms) -> max(0, now_ms - timestamp_ms)
+      _ -> nil
     end
   end
 
-  defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+  defp last_activity_monotonic_ms(running_entry) when is_map(running_entry) do
+    Map.get(running_entry, :codex_last_activity_monotonic_ms) ||
+      Map.get(running_entry, :started_monotonic_ms)
   end
 
-  defp last_activity_timestamp(_running_entry), do: nil
+  defp last_activity_monotonic_ms(_running_entry), do: nil
+
+  defp stall_retry_error(
+         elapsed_ms,
+         true,
+         no_progress_tokens,
+         no_durable_progress_tokens,
+         threshold
+       ) do
+    "token progress guard reached #{threshold} tokens " <>
+      "(meaningful=#{no_progress_tokens}, durable=#{no_durable_progress_tokens}, " <>
+      "qualifying_activity_silence_ms=#{inspect(elapsed_ms)})"
+  end
+
+  defp stall_retry_error(elapsed_ms, false, _no_progress, _no_durable_progress, _threshold) do
+    "stalled for #{elapsed_ms}ms without qualifying codex activity"
+  end
+
+  defp no_progress_token_count(running_entry) do
+    max(
+      0,
+      Map.get(running_entry, :codex_total_tokens, 0) -
+        Map.get(running_entry, :codex_progress_token_baseline, 0)
+    )
+  end
+
+  defp no_durable_progress_token_count(running_entry) do
+    max(
+      0,
+      Map.get(running_entry, :codex_total_tokens, 0) -
+        Map.get(running_entry, :codex_durable_progress_token_baseline, 0)
+    )
+  end
+
+  defp stall_diagnostic(
+         running_entry,
+         now,
+         elapsed_ms,
+         timeout_ms,
+         restart_count,
+         token_stall?,
+         durable_token_stall?,
+         no_progress_tokens,
+         no_durable_progress_tokens,
+         max_no_progress_tokens
+       ) do
+    %{
+      reason:
+        if(token_stall?,
+          do: "codex_token_growth_without_meaningful_progress",
+          else: "codex_no_activity"
+        ),
+      observed_at: now,
+      elapsed_ms: elapsed_ms,
+      threshold_ms: timeout_ms,
+      restart_count: restart_count,
+      no_progress_tokens: no_progress_tokens,
+      no_durable_progress_tokens: no_durable_progress_tokens,
+      no_progress_token_threshold: max_no_progress_tokens,
+      durable_progress_token_threshold: max_no_progress_tokens,
+      durable_token_stall: durable_token_stall?,
+      last_progress_at: Map.get(running_entry, :codex_last_progress_timestamp),
+      last_progress_method: Map.get(running_entry, :codex_last_progress_method),
+      last_durable_progress_at: Map.get(running_entry, :codex_last_durable_progress_timestamp),
+      last_durable_progress_method: Map.get(running_entry, :codex_last_durable_progress_method),
+      session_id: running_entry_session_id(running_entry),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      last_event: Map.get(running_entry, :last_codex_event),
+      last_event_at: Map.get(running_entry, :last_codex_timestamp),
+      last_qualifying_activity_class: Map.get(running_entry, :codex_last_activity_method) || "worker_started",
+      worker_process_alive: worker_process_alive?(Map.get(running_entry, :pid)),
+      codex_app_server_pid: Map.get(running_entry, :codex_app_server_pid),
+      token_totals: %{
+        input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+        output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+        total_tokens: Map.get(running_entry, :codex_total_tokens, 0)
+      }
+    }
+  end
+
+  defp worker_process_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
+  defp worker_process_alive?(_pid), do: false
+
+  defp put_stall_restart_count(%State{} = state, issue_id, count) do
+    %{state | stall_restarts: Map.put(state.stall_restarts, issue_id, count)}
+  end
+
+  defp reserve_issue_claim_for_retry(%State{} = state, issue_id) do
+    %{state | claimed: MapSet.put(state.claimed, issue_id)}
+  end
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
@@ -798,7 +988,8 @@ defmodule SymphonyElixir.Orchestrator do
       execution_token: Map.get(running_entry, :execution_token),
       execution_session_id: Map.get(running_entry, :execution_session_id),
       accepted_head: Map.get(running_entry, :accepted_head),
-      merge_identity: Map.get(running_entry, :merge_identity)
+      merge_identity: Map.get(running_entry, :merge_identity),
+      stall_diagnostic: Map.get(running_entry, :stall_diagnostic)
     }
 
     %{
@@ -923,7 +1114,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminal_state_set do
-    Config.settings!().tracker.terminal_states
+    (@mandatory_terminal_states ++ Config.settings!().tracker.terminal_states)
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
@@ -1029,9 +1220,16 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            codex_progress_token_baseline: 0,
+            codex_durable_progress_token_baseline: 0,
+            codex_last_progress_timestamp: nil,
+            codex_last_progress_method: nil,
+            codex_last_activity_monotonic_ms: nil,
+            codex_last_activity_method: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            started_monotonic_ms: monotonic_now_ms()
           })
 
         %{
@@ -1224,7 +1422,8 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        stall_restarts: Map.delete(state.stall_restarts, issue_id)
     }
   end
 
@@ -1241,6 +1440,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    stall_diagnostic = metadata[:stall_diagnostic] || Map.get(previous_retry, :stall_diagnostic)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1268,7 +1468,8 @@ defmodule SymphonyElixir.Orchestrator do
             execution_token: Map.get(metadata, :execution_token),
             execution_session_id: Map.get(metadata, :execution_session_id),
             accepted_head: Map.get(metadata, :accepted_head),
-            merge_identity: Map.get(metadata, :merge_identity)
+            merge_identity: Map.get(metadata, :merge_identity),
+            stall_diagnostic: stall_diagnostic
           })
     }
   end
@@ -1285,7 +1486,8 @@ defmodule SymphonyElixir.Orchestrator do
           execution_token: Map.get(retry_entry, :execution_token),
           execution_session_id: Map.get(retry_entry, :execution_session_id),
           accepted_head: Map.get(retry_entry, :accepted_head),
-          merge_identity: Map.get(retry_entry, :merge_identity)
+          merge_identity: Map.get(retry_entry, :merge_identity),
+          stall_diagnostic: Map.get(retry_entry, :stall_diagnostic)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1363,24 +1565,39 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup(%State{} = state) do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
-      {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{} = issue ->
-            Logger.info("Deferring startup cleanup for terminal issue #{issue_context(issue)} until its persisted execution fence is reconciled")
+  defp start_startup_maintenance(%State{} = state, opts) do
+    metadata = StartupMaintenance.start()
+    task_supervisor = state.task_supervisor
+    startup_cleanup_fun = Keyword.get(opts, :startup_cleanup_fun, &defer_startup_workspace_cleanup/1)
 
-          _ ->
-            :ok
-        end)
+    maintenance_fun =
+      Keyword.get_lazy(opts, :startup_maintenance_fun, fn ->
+        fn ->
+          StartupMaintenance.run(
+            &Tracker.fetch_issues_by_states/1,
+            startup_cleanup_fun,
+            Config.settings!().tracker
+          )
+        end
+      end)
 
-        state
+    task =
+      Task.Supervisor.async_nolink(task_supervisor, maintenance_fun)
 
-      {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
-        state
-    end
+    Process.send_after(self(), {:startup_maintenance_timeout, task.ref}, StartupMaintenance.timeout_ms())
+
+    %{
+      state
+      | startup_maintenance:
+          metadata
+          |> Map.put(:task_ref, task.ref)
+          |> Map.put(:task_pid, task.pid)
+    }
+  end
+
+  defp defer_startup_workspace_cleanup(%Issue{} = issue) do
+    Logger.info("Deferring startup cleanup for terminal issue #{issue_context(issue)} until its persisted execution fence is reconciled")
+    {:error, :execution_fence_reconciliation_required}
   end
 
   defp notify_dashboard do
@@ -1434,7 +1651,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        stall_restarts: Map.delete(state.stall_restarts, issue_id)
     }
   end
 
@@ -1805,6 +2023,9 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          configured_stall_timeout_ms: Config.settings!().codex.stall_timeout_ms,
+          qualifying_activity_silence_ms: stall_elapsed_ms(metadata, now_ms),
+          last_qualifying_activity_class: Map.get(metadata, :codex_last_activity_method) || "worker_started",
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1820,7 +2041,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry, :issue_url),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          stall_diagnostic: Map.get(retry, :stall_diagnostic)
         }
       end)
 
@@ -1839,7 +2061,8 @@ defmodule SymphonyElixir.Orchestrator do
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          stall_diagnostic: Map.get(metadata, :stall_diagnostic)
         }
       end)
 
@@ -1851,6 +2074,7 @@ defmodule SymphonyElixir.Orchestrator do
        execution_fence: execution_fence_snapshot(state.execution_fence),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       startup_maintenance: StartupMaintenance.snapshot(state.startup_maintenance),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1944,7 +2168,7 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
+    updated_running_entry =
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
@@ -1958,9 +2182,109 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
-    }
+      })
+
+    updated_running_entry =
+      if meaningful_progress_update?(update) do
+        updated_running_entry
+        |> Map.put(:codex_progress_token_baseline, updated_running_entry.codex_total_tokens)
+        |> Map.put(:codex_last_progress_timestamp, timestamp)
+        |> Map.put(:codex_last_progress_method, codex_update_method(update))
+      else
+        updated_running_entry
+      end
+
+    updated_running_entry =
+      if qualifying_liveness_update?(update) do
+        updated_running_entry
+        |> Map.put(:codex_last_activity_monotonic_ms, monotonic_now_ms())
+        |> Map.put(:codex_last_activity_method, codex_update_method(update))
+      else
+        updated_running_entry
+      end
+
+    updated_running_entry =
+      if durable_progress_update?(update) do
+        updated_running_entry
+        |> Map.put(:codex_durable_progress_token_baseline, updated_running_entry.codex_total_tokens)
+        |> Map.put(:codex_last_durable_progress_timestamp, timestamp)
+        |> Map.put(:codex_last_durable_progress_method, codex_update_method(update))
+      else
+        updated_running_entry
+      end
+
+    {updated_running_entry, token_delta}
+  end
+
+  defp meaningful_progress_update?(%{event: event})
+       when event in [
+              :session_started,
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :tool_call_completed
+            ],
+       do: true
+
+  defp meaningful_progress_update?(update) do
+    case codex_update_method(update) do
+      method when is_binary(method) ->
+        String.contains?(method, "commandExecution") or
+          String.contains?(method, "/tool/") or
+          String.contains?(method, "fileChange")
+
+      _ ->
+        false
+    end
+  end
+
+  defp qualifying_liveness_update?(%{event: event})
+       when event in [
+              :session_started,
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :tool_call_completed,
+              :turn_input_required,
+              :approval_required
+            ],
+       do: true
+
+  defp qualifying_liveness_update?(update) do
+    case codex_update_method(update) do
+      method when is_binary(method) ->
+        String.starts_with?(method, "item/") or
+          String.contains?(method, "commandExecution") or
+          String.contains?(method, "/tool/") or
+          String.contains?(method, "fileChange") or
+          method == "mcpServer/elicitation/request"
+
+      _ ->
+        false
+    end
+  end
+
+  defp durable_progress_update?(%{event: event})
+       when event in [:session_started, :turn_completed, :turn_failed, :turn_cancelled],
+       do: true
+
+  defp durable_progress_update?(update) do
+    case codex_update_method(update) do
+      method when is_binary(method) -> String.contains?(method, "fileChange")
+      _ -> false
+    end
+  end
+
+  defp codex_update_method(%{payload: %{"method" => method}}) when is_binary(method), do: method
+  defp codex_update_method(%{payload: %{method: method}}) when is_binary(method), do: method
+  defp codex_update_method(%{event: event}) when is_atom(event), do: Atom.to_string(event)
+  defp codex_update_method(_update), do: nil
+
+  defp monotonic_now_ms do
+    case Application.get_env(:symphony_elixir, :monotonic_now_ms) do
+      now_ms when is_integer(now_ms) -> now_ms
+      _ -> System.monotonic_time(:millisecond)
+    end
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})

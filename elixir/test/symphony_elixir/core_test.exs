@@ -1,6 +1,18 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  import SymphonyElixir.TestSupport,
+    only: [
+      path_env: 2,
+      restore_env: 2,
+      shell_escape: 1,
+      shell_path: 1,
+      stop_default_http_server: 0,
+      write_executable_script!: 2,
+      write_workflow_file!: 1,
+      write_workflow_file!: 2
+    ]
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -398,7 +410,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "memory",
       workspace_root: test_root,
       poll_interval_ms: 10,
-      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
+      hook_before_run: "mkfifo #{shell_escape(hook_fifo)}; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
       hook_timeout_ms: 60_000
     )
 
@@ -556,7 +568,7 @@ defmodule SymphonyElixir.CoreTest do
         workspace_root: test_root,
         tracker_active_states: ["Todo", "In Progress", "In Review"],
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
-        hook_before_remove: "if [ -f \"#{worker_alive_marker}\" ]; then printf alive > \"#{cleanup_marker}\"; else printf stopped > \"#{cleanup_marker}\"; fi"
+        hook_before_remove: "if [ -f #{shell_escape(worker_alive_marker)} ]; then printf alive > #{shell_escape(cleanup_marker)}; else printf stopped > #{shell_escape(cleanup_marker)}; fi"
       )
 
       File.mkdir_p!(workspace)
@@ -1585,7 +1597,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{shell_escape(Path.join(template_repo, "README.md"))} README.md",
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -1670,7 +1682,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{shell_escape(Path.join(template_repo, "README.md"))} README.md",
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -1716,10 +1728,12 @@ defmodule SymphonyElixir.CoreTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_shim = System.get_env("SYMPHONY_TEST_SSH_SHIM")
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMPHONY_TEST_SSH_SHIM", previous_shim)
     end)
 
     try do
@@ -1727,10 +1741,11 @@ defmodule SymphonyElixir.CoreTest do
       fake_ssh = Path.join(test_root, "ssh")
 
       File.mkdir_p!(test_root)
-      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+      System.put_env("SYMP_TEST_SSH_TRACE", shell_path(trace_file))
+      System.put_env("SYMPHONY_TEST_SSH_SHIM", shell_path(fake_ssh))
+      System.put_env("PATH", path_env([test_root], previous_path || ""))
 
-      File.write!(fake_ssh, """
+      write_executable_script!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
@@ -1749,8 +1764,6 @@ defmodule SymphonyElixir.CoreTest do
           ;;
       esac
       """)
-
-      File.chmod!(fake_ssh, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "~/.symphony-remote-workspaces",
@@ -1830,13 +1843,13 @@ defmodule SymphonyElixir.CoreTest do
       """)
 
       File.chmod!(codex_binary, 0o755)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
 
       on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{shell_escape(Path.join(template_repo, "README.md"))} README.md",
         codex_command: "#{codex_binary} app-server",
         max_turns: 3
       )
@@ -1961,13 +1974,13 @@ defmodule SymphonyElixir.CoreTest do
       """)
 
       File.chmod!(codex_binary, 0o755)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
 
       on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: "cp #{shell_escape(Path.join(template_repo, "README.md"))} README.md",
         codex_command: "#{codex_binary} app-server",
         max_turns: 2
       )
@@ -2029,7 +2042,7 @@ defmodule SymphonyElixir.CoreTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODex_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -2175,7 +2188,7 @@ defmodule SymphonyElixir.CoreTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODex_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -2260,7 +2273,7 @@ defmodule SymphonyElixir.CoreTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODex_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """

@@ -33,6 +33,9 @@ defmodule SymphonyElixir.PathSafety do
           resolve_segments(target_root, [], target_segments ++ rest)
         end
 
+      {:ok, %File.Stat{type: type}} when type != :directory and rest != [] ->
+        {:error, :enotdir}
+
       {:ok, _stat} ->
         resolve_segments(root, resolved_segments ++ [segment], rest)
 

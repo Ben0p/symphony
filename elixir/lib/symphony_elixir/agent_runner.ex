@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.{AppServer, ModelRouter}
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
@@ -109,11 +109,17 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    route = ModelRouter.resolve(issue, Keyword.get(opts, :attempt))
+
+    Logger.info(
+      "Codex model route selected for #{issue_context(issue)} model=#{route.model} tier=#{route.tier} effort=#{route.effort} attempt=#{route.attempt} escalated=#{route.escalated} reason=#{inspect(route.reason)}"
+    )
 
     with {:ok, session} <-
            AppServer.start_session(
              workspace,
              worker_host: worker_host,
+             model_route: route,
              execution_fence_guard: Keyword.get(opts, :execution_fence_guard)
            ) do
       try do
@@ -125,7 +131,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, app_session.model_route)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -166,9 +172,16 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns, route) do
+    """
+    Codex routing evidence: model=#{route.model}; tier=#{route.tier}; effort=#{route.effort}; attempt=#{route.attempt}; escalated=#{route.escalated}; reason=#{route.reason}.
+    Include this routing evidence in the Linear implementation handoff comment.
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+    #{PromptBuilder.build_prompt(issue, opts)}
+    """
+  end
+
+  defp build_turn_prompt(_issue, _opts, turn_number, max_turns, _route) do
     """
     Continuation guidance:
 

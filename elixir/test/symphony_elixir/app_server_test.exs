@@ -1,6 +1,18 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  import SymphonyElixir.TestSupport,
+    only: [
+      path_env: 2,
+      restore_env: 2,
+      shell_path: 1,
+      stop_default_http_server: 0,
+      symlink_or_skip!: 2,
+      write_executable_script!: 2,
+      write_workflow_file!: 1,
+      write_workflow_file!: 2
+    ]
+
   test "app server rejects a fenced execution before opening Codex" do
     test_pid = self()
 
@@ -67,7 +79,6 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.mkdir_p!(workspace_root)
       File.mkdir_p!(outside_workspace)
-      File.ln_s!(outside_workspace, symlink_workspace)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root
@@ -83,8 +94,20 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
-               AppServer.run(symlink_workspace, "guard", issue)
+      case symlink_or_skip!(outside_workspace, symlink_workspace) do
+        :ok ->
+          assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
+                   AppServer.run(symlink_workspace, "guard", issue)
+
+        {:symlink_unavailable, _reason} ->
+          assert {:error, {:invalid_workspace_cwd, :outside_workspace_root, outside_path, _root}} =
+                   AppServer.run(outside_workspace, "guard", issue)
+
+          assert {:ok, canonical_outside_workspace} =
+                   SymphonyElixir.PathSafety.canonicalize(outside_workspace)
+
+          assert outside_path == canonical_outside_workspace
+      end
     after
       File.rm_rf(test_root)
     end
@@ -201,7 +224,7 @@ defmodule SymphonyElixir.AppServerTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -308,7 +331,7 @@ defmodule SymphonyElixir.AppServerTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -515,7 +538,7 @@ defmodule SymphonyElixir.AppServerTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODex_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -652,7 +675,7 @@ defmodule SymphonyElixir.AppServerTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -891,7 +914,7 @@ defmodule SymphonyElixir.AppServerTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -1117,7 +1140,7 @@ defmodule SymphonyElixir.AppServerTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -1239,7 +1262,7 @@ defmodule SymphonyElixir.AppServerTest do
         end
       end)
 
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
       File.mkdir_p!(workspace)
 
       File.write!(codex_binary, """
@@ -1573,7 +1596,7 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
       System.put_env(custom_secret_env, "custom-secret-that-must-not-reach-child")
       System.put_env("HOME", bash_home)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1644,10 +1667,12 @@ defmodule SymphonyElixir.AppServerTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_shim = System.get_env("SYMPHONY_TEST_SSH_SHIM")
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("SYMPHONY_TEST_SSH_SHIM", previous_shim)
     end)
 
     try do
@@ -1656,10 +1681,11 @@ defmodule SymphonyElixir.AppServerTest do
       remote_workspace = "/remote/workspaces/MT-REMOTE"
 
       File.mkdir_p!(test_root)
-      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+      System.put_env("SYMP_TEST_SSH_TRACE", shell_path(trace_file))
+      System.put_env("SYMPHONY_TEST_SSH_SHIM", shell_path(fake_ssh))
+      System.put_env("PATH", path_env([test_root], previous_path || ""))
 
-      File.write!(fake_ssh, """
+      write_executable_script!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       count=0
@@ -1689,8 +1715,6 @@ defmodule SymphonyElixir.AppServerTest do
         esac
       done
       """)
-
-      File.chmod!(fake_ssh, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "/remote/workspaces",

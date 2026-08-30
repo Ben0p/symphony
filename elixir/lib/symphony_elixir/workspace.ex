@@ -161,6 +161,56 @@ defmodule SymphonyElixir.Workspace do
     File.rm_rf(workspace)
   end
 
+  defp remove_startup_workspace(workspace, nil) do
+    if File.exists?(workspace) do
+      with :ok <- validate_workspace_path(workspace, nil) do
+        maybe_run_before_remove_hook(workspace, nil)
+        remove_local_workspace_out_of_process(workspace)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp remove_startup_workspace(workspace, worker_host) when is_binary(worker_host) do
+    case remove(workspace, worker_host) do
+      {:ok, _removed} -> :ok
+      {:error, reason, path} -> {:error, {reason, path}}
+    end
+  end
+
+  defp remove_local_workspace_out_of_process(workspace) do
+    {executable, arguments} =
+      case :os.type() do
+        {:win32, _name} ->
+          {"cmd.exe",
+           [
+             "/d",
+             "/s",
+             "/c",
+             "rmdir",
+             "/s",
+             "/q",
+             String.replace(workspace, "/", "\\")
+           ]}
+
+        _other ->
+          {"rm", ["-rf", "--", workspace]}
+      end
+
+    case System.cmd(executable, arguments, stderr_to_stdout: true) do
+      {_output, 0} ->
+        if File.exists?(workspace),
+          do: {:error, {:workspace_remove_incomplete, Path.basename(workspace)}},
+          else: :ok
+
+      {_output, status} ->
+        {:error, {:workspace_remove_failed, status}}
+    end
+  rescue
+    error -> {:error, {:workspace_remove_failed, error.__struct__}}
+  end
+
   @spec remove_issue_workspaces(term()) :: :ok
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 
@@ -215,6 +265,48 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
+
+  @doc false
+  @spec remove_issue_workspaces_for_startup(term()) :: :ok | {:error, term()}
+  def remove_issue_workspaces_for_startup(issue_or_identifier) do
+    remove_issue_workspaces_for_startup(issue_or_identifier, nil)
+  end
+
+  @doc false
+  @spec remove_issue_workspaces_for_startup(term(), worker_host()) :: :ok | {:error, term()}
+  def remove_issue_workspaces_for_startup(issue_or_identifier, worker_host)
+      when is_binary(worker_host) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue_or_identifier), worker_host) do
+      remove_startup_workspace(workspace, worker_host)
+    end
+  end
+
+  def remove_issue_workspaces_for_startup(%{identifier: identifier} = issue, nil)
+      when is_binary(identifier),
+      do: remove_valid_issue_workspaces_for_startup(issue)
+
+  def remove_issue_workspaces_for_startup(identifier, nil) when is_binary(identifier),
+    do: remove_valid_issue_workspaces_for_startup(identifier)
+
+  def remove_issue_workspaces_for_startup(_issue_or_identifier, _worker_host),
+    do: {:error, :invalid_issue_identifier}
+
+  defp remove_valid_issue_workspaces_for_startup(issue_or_identifier) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue_or_identifier), nil) do
+          remove_startup_workspace(workspace, nil)
+        end
+
+      worker_hosts ->
+        Enum.reduce_while(worker_hosts, :ok, fn worker_host, :ok ->
+          case remove_issue_workspaces_for_startup(issue_or_identifier, worker_host) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+    end
+  end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}

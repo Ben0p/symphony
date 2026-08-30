@@ -76,8 +76,10 @@ defmodule Mix.Tasks.PrBody.Check do
 
   defp extract_template_headings(template, template_path) do
     headings =
-      Regex.scan(~r/^\#{4,6}\s+.+$/m, template)
-      |> Enum.map(&hd/1)
+      template
+      |> normalize_newlines()
+      |> then(&Regex.scan(~r/^\#{4,6}\s+.+$/m, &1))
+      |> Enum.map(&(hd(&1) |> String.trim()))
 
     if headings == [] do
       {:error, "No markdown headings found in #{template_path}"}
@@ -99,11 +101,18 @@ defmodule Mix.Tasks.PrBody.Check do
   end
 
   defp lint(template, body, headings) do
+    template = normalize_newlines(template)
+    body = normalize_newlines(body)
+
     []
     |> check_required_headings(body, headings)
     |> check_order(body, headings)
     |> check_no_placeholders(body)
     |> check_sections_from_template(template, body, headings)
+  end
+
+  defp normalize_newlines(text) when is_binary(text) do
+    String.replace(text, "\r\n", "\n")
   end
 
   defp check_required_headings(errors, body, headings) do
@@ -169,23 +178,28 @@ defmodule Mix.Tasks.PrBody.Check do
   end
 
   defp heading_position(body, heading) do
-    case :binary.match(body, heading) do
-      {idx, _len} -> idx
+    case Regex.run(heading_line_regex(heading), body, return: :index) do
+      [{idx, _len}] -> idx
       :nomatch -> :nomatch
+      nil -> :nomatch
     end
   end
 
   defp capture_heading_section(doc, heading, headings) do
-    with {heading_idx, _} <- :binary.match(doc, heading),
-         section_start <- heading_idx + byte_size(heading),
+    with [{heading_idx, heading_len}] <- Regex.run(heading_line_regex(heading), doc, return: :index),
+         section_start <- heading_idx + heading_len,
          true <- section_start + 2 <= byte_size(doc),
          "\n\n" <- binary_part(doc, section_start, 2) do
       extract_section_content(doc, section_start + 2, heading, headings)
     else
-      :nomatch -> nil
+      nil -> nil
       false -> ""
       _ -> nil
     end
+  end
+
+  defp heading_line_regex(heading) do
+    Regex.compile!("(?m)^" <> Regex.escape(heading) <> "$")
   end
 
   defp extract_section_content(doc, content_start, heading, headings) do
@@ -199,9 +213,13 @@ defmodule Mix.Tasks.PrBody.Check do
 
   defp next_heading_offset(content, heading, headings) do
     headings_after(heading, headings)
-    |> Enum.map(fn marker -> :binary.match(content, marker) end)
-    |> Enum.filter(&(&1 != :nomatch))
-    |> Enum.map(fn {idx, _} -> idx end)
+    |> Enum.map(fn marker ->
+      case Regex.run(heading_line_regex(marker), content, return: :index) do
+        [{idx, _len}] -> idx
+        _ -> :nomatch
+      end
+    end)
+    |> Enum.reject(&(&1 == :nomatch))
     |> case do
       [] -> nil
       indexes -> Enum.min(indexes)

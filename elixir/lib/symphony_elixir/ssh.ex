@@ -3,14 +3,14 @@ defmodule SymphonyElixir.SSH do
 
   @spec run(String.t(), String.t(), keyword()) :: {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
   def run(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
-    with {:ok, executable} <- ssh_executable() do
-      {:ok, System.cmd(executable, ssh_args(host, command), opts)}
+    with {:ok, executable, executable_args} <- ssh_executable() do
+      {:ok, System.cmd(executable, executable_args ++ ssh_args(host, command), opts)}
     end
   end
 
   @spec start_port(String.t(), String.t(), keyword()) :: {:ok, port()} | {:error, term()}
   def start_port(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
-    with {:ok, executable} <- ssh_executable() do
+    with {:ok, executable, executable_args} <- ssh_executable() do
       line_bytes = Keyword.get(opts, :line)
 
       port_opts =
@@ -18,7 +18,7 @@ defmodule SymphonyElixir.SSH do
           :binary,
           :exit_status,
           :stderr_to_stdout,
-          args: Enum.map(ssh_args(host, command), &String.to_charlist/1)
+          args: Enum.map(executable_args ++ ssh_args(host, command), &String.to_charlist/1)
         ]
         |> maybe_put_line_option(line_bytes)
 
@@ -32,9 +32,18 @@ defmodule SymphonyElixir.SSH do
   end
 
   defp ssh_executable do
-    case System.find_executable("ssh") do
-      nil -> {:error, :ssh_not_found}
-      executable -> {:ok, executable}
+    case System.get_env("SYMPHONY_TEST_SSH_SHIM") do
+      shim when is_binary(shim) and shim != "" ->
+        case System.find_executable("sh") do
+          nil -> {:error, :ssh_not_found}
+          executable -> {:ok, executable, [shim]}
+        end
+
+      _ ->
+        case System.find_executable("ssh") do
+          nil -> {:error, :ssh_not_found}
+          executable -> {:ok, executable, []}
+        end
     end
   end
 
