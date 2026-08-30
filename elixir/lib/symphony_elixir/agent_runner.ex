@@ -41,7 +41,7 @@ defmodule SymphonyElixir.AgentRunner do
     with :ok <- execution_fence_preflight(opts) do
       case Workspace.create_for_issue(issue, worker_host) do
         {:ok, workspace} ->
-          send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+          send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
 
           try do
             with :ok <- execution_fence_preflight(opts),
@@ -50,6 +50,7 @@ defmodule SymphonyElixir.AgentRunner do
             end
           after
             run_after_run_hook_if_authorized(workspace, issue, worker_host, opts)
+            send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
           end
 
         {:error, reason} ->
@@ -90,21 +91,28 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace
-       }}
-    )
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, opts)
+       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) and is_list(opts) do
+    runtime_info =
+      %{
+        worker_host: worker_host,
+        workspace_path: workspace,
+        execution_token: Keyword.get(opts, :execution_token),
+        execution_session_id: Keyword.get(opts, :execution_session_id)
+      }
+      |> maybe_put_runtime_head(Workspace.current_head(workspace, worker_host))
+
+    send(recipient, {:worker_runtime_info, issue_id, runtime_info})
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
+
+  defp maybe_put_runtime_head(runtime_info, {:ok, head}),
+    do: Map.put(runtime_info, :head, head)
+
+  defp maybe_put_runtime_head(runtime_info, _result), do: runtime_info
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)

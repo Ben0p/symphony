@@ -63,8 +63,16 @@ defmodule SymphonyElixir.ExecutionFence do
       :ok ->
         %{
           schema_version: @schema_version,
-          executions: state.executions |> Map.values() |> Enum.sort_by(&execution_sort_key/1) |> Enum.map(&sanitize_execution/1),
-          sessions: state.sessions |> Map.values() |> Enum.sort_by(&session_sort_key/1) |> Enum.map(&sanitize_session/1),
+          executions:
+            state.executions
+            |> Map.values()
+            |> Enum.sort_by(&execution_sort_key/1)
+            |> Enum.map(&sanitize_execution/1),
+          sessions:
+            state.sessions
+            |> Map.values()
+            |> Enum.sort_by(&session_sort_key/1)
+            |> Enum.map(&sanitize_session/1),
           history: Enum.map(state.history, &sanitize_execution/1)
         }
 
@@ -159,6 +167,33 @@ defmodule SymphonyElixir.ExecutionFence do
 
   def heartbeat(_state, _token, _session_id, _now_ms), do: {:error, :invalid_session}
 
+  @doc "Persists an exact head observation for a live generation-bound session."
+  @spec observe_session_head(state(), token(), String.t(), String.t(), non_neg_integer()) ::
+          {:ok, state()} | {:error, term()}
+  def observe_session_head(state, token, session_id, head, now_ms)
+      when is_binary(session_id) and is_binary(head) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_state(state),
+         {:ok, execution} <- current_execution(state, token),
+         :ok <- active_execution(execution),
+         %{status: :active} = lease <- Map.get(execution.leases, session_id),
+         true <- present_string?(head) do
+      updated_lease =
+        lease
+        |> Map.put(:head, head)
+        |> Map.put(:last_heartbeat_at, now_ms)
+
+      {:ok, put_lease(state, execution, updated_lease)}
+    else
+      nil -> {:error, :unknown_session}
+      false -> {:error, :invalid_head}
+      {:error, _reason} = error -> error
+      _ -> {:error, :unknown_session}
+    end
+  end
+
+  def observe_session_head(_state, _token, _session_id, _head, _now_ms),
+    do: {:error, :invalid_session_head}
+
   @doc "Releases one generation-bound lease. Releasing twice is harmless."
   @spec release(state(), token(), String.t(), atom()) ::
           {:ok, state(), :released | :already_released} | {:error, term()}
@@ -199,7 +234,12 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp refresh_registration(state, execution, existing, session) do
     if same_registration?(existing, session) do
-      updated = Map.merge(existing, Map.take(session, [:last_heartbeat_at, :linear_state, :pr_state, :head]))
+      updated =
+        Map.merge(
+          existing,
+          Map.take(session, [:last_heartbeat_at, :linear_state, :pr_state, :head])
+        )
+
       {:ok, put_lease(state, execution, updated), :already_registered}
     else
       {:error, :registration_conflict}
@@ -316,12 +356,17 @@ defmodule SymphonyElixir.ExecutionFence do
   def reconcile_sessions(_state, _observations, _now_ms, _ttl_ms),
     do: {:error, :invalid_reconciliation_input}
 
-  defp validate_state(%{schema_version: @schema_version, executions: executions, sessions: sessions, history: history})
+  defp validate_state(%{
+         schema_version: @schema_version,
+         executions: executions,
+         sessions: sessions,
+         history: history
+       })
        when is_map(executions) and is_map(sessions) and is_list(history) do
     if Enum.all?(executions, fn {issue_id, execution} -> valid_execution?(issue_id, execution) end) and
          Enum.all?(sessions, fn {session_id, session} -> valid_lease?(session_id, session) end) and
          valid_session_registry?(executions, sessions) and
-         Enum.all?(history, &is_map/1) do
+         Enum.all?(history, &valid_history_execution?/1) do
       :ok
     else
       {:error, :invalid_state}
@@ -340,14 +385,23 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp valid_session_registry?(executions, sessions) do
     Enum.all?(sessions, fn {session_id, session} ->
-      case Map.get(executions, session.issue_id) do
-        %{generation: generation, leases: leases} when generation == session.generation ->
-          Map.get(leases, session_id) == session
+      session_in_execution?(executions, session_id, session)
+    end) and
+      Enum.all?(executions, fn {_issue_id, execution} ->
+        Enum.all?(execution.leases, fn {session_id, lease} ->
+          Map.get(sessions, session_id) == lease
+        end)
+      end)
+  end
 
-        _ ->
-          false
-      end
-    end)
+  defp session_in_execution?(executions, session_id, session) do
+    case Map.get(executions, session.issue_id) do
+      %{generation: generation, leases: leases} when generation == session.generation ->
+        Map.get(leases, session_id) == session
+
+      _ ->
+        false
+    end
   end
 
   defp valid_execution_identity?(issue_id, execution) do
@@ -355,8 +409,19 @@ defmodule SymphonyElixir.ExecutionFence do
       present_string?(Map.get(execution, :repository)) and
       positive_integer?(Map.get(execution, :generation)) and
       present_string?(Map.get(execution, :branch)) and
-      present_string?(Map.get(execution, :worktree))
+      present_string?(Map.get(execution, :worktree)) and
+      non_negative_integer?(Map.get(execution, :admitted_at_ms)) and
+      optional_non_negative_integer?(Map.get(execution, :cleaned_at_ms))
   end
+
+  defp valid_history_execution?(execution) when is_map(execution) do
+    case Map.get(execution, :issue_id) do
+      issue_id when is_binary(issue_id) -> valid_execution?(issue_id, execution)
+      _ -> false
+    end
+  end
+
+  defp valid_history_execution?(_execution), do: false
 
   defp valid_execution_status?(execution) do
     valid_status_cleanup_pair?(Map.get(execution, :status), Map.get(execution, :cleanup)) and
@@ -424,7 +489,8 @@ defmodule SymphonyElixir.ExecutionFence do
   defp valid_terminal?(nil), do: true
 
   defp valid_terminal?(terminal) when is_map(terminal) do
-    present_string?(Map.get(terminal, :state)) and present_string?(Map.get(terminal, :accepted_head)) and
+    present_string?(Map.get(terminal, :state)) and
+      present_string?(Map.get(terminal, :accepted_head)) and
       optional_string?(Map.get(terminal, :merge_identity)) and
       is_integer(Map.get(terminal, :observed_at_ms)) and Map.get(terminal, :observed_at_ms) >= 0
   end
@@ -488,7 +554,11 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp non_negative_integer?(value), do: is_integer(value) and value >= 0
 
-  defp validate_admission(attrs, now_ms) when is_map(attrs) and is_integer(now_ms) and now_ms >= 0 do
+  defp optional_non_negative_integer?(nil), do: true
+  defp optional_non_negative_integer?(value), do: non_negative_integer?(value)
+
+  defp validate_admission(attrs, now_ms)
+       when is_map(attrs) and is_integer(now_ms) and now_ms >= 0 do
     required = [:issue_id, :repository, :branch, :worktree]
 
     if Enum.all?(required, &present_string?(Map.get(attrs, &1))) do
@@ -608,7 +678,9 @@ defmodule SymphonyElixir.ExecutionFence do
   end
 
   defp worker_available(execution, :worker, session_id) do
-    case Enum.find(execution.leases, fn {id, lease} -> id != session_id and lease.role == :worker and lease.status == :active end) do
+    case Enum.find(execution.leases, fn {id, lease} ->
+           id != session_id and lease.role == :worker and lease.status == :active
+         end) do
       nil -> :ok
       _ -> {:error, :worker_already_registered}
     end
@@ -617,8 +689,26 @@ defmodule SymphonyElixir.ExecutionFence do
   defp worker_available(_execution, :reviewer, _session_id), do: :ok
 
   defp same_registration?(left, right) do
-    Map.take(left, [:issue_id, :repository, :generation, :role, :session_id, :process_id, :branch, :worktree]) ==
-      Map.take(right, [:issue_id, :repository, :generation, :role, :session_id, :process_id, :branch, :worktree])
+    Map.take(left, [
+      :issue_id,
+      :repository,
+      :generation,
+      :role,
+      :session_id,
+      :process_id,
+      :branch,
+      :worktree
+    ]) ==
+      Map.take(right, [
+        :issue_id,
+        :repository,
+        :generation,
+        :role,
+        :session_id,
+        :process_id,
+        :branch,
+        :worktree
+      ])
   end
 
   defp put_lease(state, execution, lease) do
@@ -629,10 +719,13 @@ defmodule SymphonyElixir.ExecutionFence do
     |> put_in([:sessions, lease.session_id], lease)
   end
 
-  defp put_execution(state, execution), do: put_in(state, [:executions, execution.issue_id], execution)
+  defp put_execution(state, execution),
+    do: put_in(state, [:executions, execution.issue_id], execution)
 
-  defp validate_terminal(attrs, now_ms) when is_map(attrs) and is_integer(now_ms) and now_ms >= 0 do
-    if present_string?(Map.get(attrs, :terminal_state)) and present_string?(Map.get(attrs, :accepted_head)) and
+  defp validate_terminal(attrs, now_ms)
+       when is_map(attrs) and is_integer(now_ms) and now_ms >= 0 do
+    if present_string?(Map.get(attrs, :terminal_state)) and
+         present_string?(Map.get(attrs, :accepted_head)) and
          optional_string?(Map.get(attrs, :merge_identity)) do
       :ok
     else
@@ -692,7 +785,8 @@ defmodule SymphonyElixir.ExecutionFence do
     ]
 
     if Enum.all?(required, &present_observation_field?(Map.get(observation, &1))) and
-         observation.role in @roles and is_integer(observation.generation) and observation.generation > 0 do
+         observation.role in @roles and is_integer(observation.generation) and
+         observation.generation > 0 do
       :ok
     else
       {:error, :invalid_session_observation}
@@ -704,10 +798,13 @@ defmodule SymphonyElixir.ExecutionFence do
   defp present_observation_field?(value) when is_integer(value), do: value >= 0
   defp present_observation_field?(value), do: present_string?(value)
 
-  defp observation_sort_key(observation), do: {observation.issue_id, observation.generation, observation.session_id}
+  defp observation_sort_key(observation),
+    do: {observation.issue_id, observation.generation, observation.session_id}
 
   defp reset_ownership(executions) do
-    Map.new(executions, fn {issue_id, execution} -> {issue_id, %{execution | ownership: :reconciled}} end)
+    Map.new(executions, fn {issue_id, execution} ->
+      {issue_id, %{execution | ownership: :reconciled}}
+    end)
   end
 
   defp empty_summary do
@@ -788,7 +885,10 @@ defmodule SymphonyElixir.ExecutionFence do
 
       true ->
         refreshed =
-          Map.merge(lease, Map.take(observation, [:last_heartbeat_at, :linear_state, :pr_state, :head]))
+          Map.merge(
+            lease,
+            Map.take(observation, [:last_heartbeat_at, :linear_state, :pr_state, :head])
+          )
 
         {put_lease(state, execution, refreshed), summary, mark_seen(seen, execution, observation)}
     end
@@ -818,12 +918,30 @@ defmodule SymphonyElixir.ExecutionFence do
   defp expire_or_block_missing_leases(state, summary, seen, now_ms, ttl_ms) do
     Enum.reduce(state.executions, {state, summary}, fn {issue_id, execution}, accumulator ->
       Enum.reduce(execution.leases, accumulator, fn {session_id, lease}, inner ->
-        reconcile_missing_lease(inner, issue_id, execution, session_id, lease, seen, now_ms, ttl_ms)
+        reconcile_missing_lease(
+          inner,
+          issue_id,
+          execution,
+          session_id,
+          lease,
+          seen,
+          now_ms,
+          ttl_ms
+        )
       end)
     end)
   end
 
-  defp reconcile_missing_lease({state, summary}, issue_id, execution, session_id, lease, seen, now_ms, ttl_ms) do
+  defp reconcile_missing_lease(
+         {state, summary},
+         issue_id,
+         execution,
+         session_id,
+         lease,
+         seen,
+         now_ms,
+         ttl_ms
+       ) do
     key = {issue_id, execution.generation, session_id}
 
     cond do
@@ -846,7 +964,8 @@ defmodule SymphonyElixir.ExecutionFence do
     |> put_in([:sessions, session_id, :status], :expired)
   end
 
-  defp mark_ownership(state, issue_id, :contradictory), do: put_in(state, [:executions, issue_id, :ownership], :contradictory)
+  defp mark_ownership(state, issue_id, :contradictory),
+    do: put_in(state, [:executions, issue_id, :ownership], :contradictory)
 
   defp mark_ownership(state, issue_id, :unknown) do
     if get_in(state, [:executions, issue_id, :ownership]) == :contradictory do
@@ -882,7 +1001,9 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp present_string?(value) when is_binary(value) do
     trimmed = String.trim(value)
-    trimmed != "" and byte_size(trimmed) <= 512 and not String.contains?(trimmed, ["\n", "\r", <<0>>])
+
+    trimmed != "" and byte_size(trimmed) <= 512 and
+      not String.contains?(trimmed, ["\n", "\r", <<0>>])
   end
 
   defp present_string?(_value), do: false

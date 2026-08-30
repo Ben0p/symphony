@@ -39,19 +39,23 @@ The current orchestrator can adopt this contract at its scheduling and
 workspace boundaries without giving the contract authority to delete a
 worktree, mutate a branch, terminate a process, or change Linear/GitHub state.
 
-The worker seam now accepts a synchronous `execution_fence_guard` callback. The
+The worker seam accepts a synchronous `execution_fence_guard` callback. The
 orchestrator owns the serializable snapshot, admits and registers a logical worker
 lease before spawning, and the worker calls the guard before
-`Workspace.create_for_issue/2`. Terminal observation fences the generation before
-the existing stop path. A fenced task may therefore not begin workspace creation
-or later mutable work. The current runtime does not publish an exact accepted Git
-head before every terminal cleanup request; the integrated cleanup path preserves
-that workspace until such a head is supplied, rather than treating `PR merged` or
-an unknown head as proof of quiescence.
+`Workspace.create_for_issue/2`. The worker reports the exact checked-out Git head
+at workspace start and shutdown; matching, generation-bound runtime messages
+persist that head on the lease and carry it into terminal cleanup. Terminal
+observation fences the generation before the existing stop path. A fenced task may
+therefore not begin workspace creation or later mutable work.
 
-The orchestrator snapshot and reconciliation API expose this serializable
-registry, but they do not make it restart durable. `SPEC.md` Section 14.3
-continues to govern restart recovery: tracker/filesystem polling and preserved
-workspaces are the recovery model. A higher-level deployment must persist and
-rehydrate the serialized fence snapshot before cross-restart ownership can be
-treated as durable.
+Cleanup re-reads the exact Git head from the recorded local or remote workspace
+after all leases quiesce. A changed, unreadable, or unrecorded head preserves the
+workspace and leaves the execution pending for reconciliation; `PR merged` or an
+unknown head is never treated as proof of quiescence.
+
+The serialized snapshot is persisted through
+`ExecutionFence.Persistence`. Save uses a temporary file and a recoverable
+previous-snapshot rename on platforms where replacement cannot be atomic; startup
+rehydration validates the complete bidirectional lease registry and can recover a
+valid previous snapshot if the primary is missing. Non-cleaned generations are
+marked unknown and fail closed after restart.

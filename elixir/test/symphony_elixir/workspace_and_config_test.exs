@@ -374,6 +374,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace reports the exact current Git head" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-workspace-current-head-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-HEAD")
+
+      System.cmd("git", ["-C", workspace, "init", "-b", "main"])
+      System.cmd("git", ["-C", workspace, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(workspace, "README.md"), "head\n")
+      System.cmd("git", ["-C", workspace, "add", "README.md"])
+      {_, 0} = System.cmd("git", ["-C", workspace, "commit", "-m", "initial"])
+
+      assert {:ok, head} = Workspace.current_head(workspace)
+      assert Regex.match?(~r/\A[0-9a-f]{40,64}\z/, head)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace removes all workspaces for a closed issue identifier" do
     workspace_root =
       Path.join(
