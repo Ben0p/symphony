@@ -18,7 +18,7 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   @actions [:read, :observe, :delegate, :reconcile, :edit, :commit, :push, :state_mutation, :cleanup, :review, :report]
   @authority_classes [:routine_engineering, :coordination, :read_only, :exception]
   @efforts [:none, :minimal, :low, :medium, :high, :xhigh, :max, :ultra]
-  @scope_identifiers [:company_id, :objective_id, :initiative_id, :project_id, :work_package_id, :issue_id]
+  @scope_identifiers [:company_id, :objective_id, :initiative_id, :project_id, :work_package_id, :issue_id, :repository]
   @scope_collections [:paths, :modules, :environments, :actions]
 
   @type state :: %{
