@@ -32,6 +32,30 @@ defmodule SymphonyElixir.ExecutionFence do
     %{schema_version: @schema_version, executions: %{}, sessions: %{}, history: []}
   end
 
+  @doc "Validates a fence state before it is persisted or used for admission."
+  @spec validate(state()) :: :ok | {:error, :invalid_state}
+  def validate(state), do: validate_state(state)
+
+  @doc "Marks non-cleaned executions unknown after an orchestrator restart."
+  @spec mark_unreconciled_after_restart(state()) :: {:ok, state()} | {:error, :invalid_state}
+  def mark_unreconciled_after_restart(state) do
+    with :ok <- validate_state(state) do
+      executions =
+        Map.new(state.executions, fn {issue_id, execution} ->
+          next_execution =
+            if execution.cleanup == :cleaned do
+              execution
+            else
+              %{execution | ownership: :unknown}
+            end
+
+          {issue_id, next_execution}
+        end)
+
+      {:ok, %{state | executions: executions}}
+    end
+  end
+
   @doc "Returns a sanitized, deterministic projection for operator/API observability."
   @spec snapshot(state()) :: map() | {:error, :invalid_state}
   def snapshot(state) do

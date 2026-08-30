@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, ExecutionFence, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.ExecutionFence.Persistence
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -41,6 +42,7 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       execution_fence: ExecutionFence.new(),
+      execution_fence_path: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -57,24 +59,32 @@ defmodule SymphonyElixir.Orchestrator do
   def init(opts) do
     case Config.settings() do
       {:ok, config} ->
-        now_ms = System.monotonic_time(:millisecond)
+        case load_execution_fence(config.execution_fence.state_path) do
+          {:ok, fence_state} ->
+            now_ms = System.monotonic_time(:millisecond)
 
-        state = %State{
-          poll_interval_ms: config.polling.interval_ms,
-          max_concurrent_agents: config.agent.max_concurrent_agents,
-          next_poll_due_at_ms: now_ms,
-          poll_check_in_progress: false,
-          tick_timer_ref: nil,
-          tick_token: nil,
-          task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
-          codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
-        }
+            state = %State{
+              poll_interval_ms: config.polling.interval_ms,
+              max_concurrent_agents: config.agent.max_concurrent_agents,
+              next_poll_due_at_ms: now_ms,
+              poll_check_in_progress: false,
+              tick_timer_ref: nil,
+              tick_token: nil,
+              task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+              execution_fence: fence_state,
+              execution_fence_path: config.execution_fence.state_path,
+              codex_totals: @empty_codex_totals,
+              codex_rate_limits: nil
+            }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+            state = run_terminal_workspace_cleanup(state)
+            state = schedule_tick(state, 0)
 
-        {:ok, state}
+            {:ok, state}
+
+          {:error, reason} ->
+            {:stop, {:execution_fence_unavailable, reason}}
+        end
 
       {:error, reason} ->
         {:stop, reason}
@@ -1067,8 +1077,9 @@ defmodule SymphonyElixir.Orchestrator do
              :worker,
              execution_session_attributes(attrs, session_id),
              now_ms
-           ) do
-      {:ok, %{state | execution_fence: fence_state}, token, session_id}
+           ),
+         {:ok, next_state} <- persist_execution_fence(state, fence_state) do
+      {:ok, next_state, token, session_id}
     end
   end
 
@@ -1103,7 +1114,14 @@ defmodule SymphonyElixir.Orchestrator do
     with %{execution_token: token, execution_session_id: session_id} <- running_entry,
          {:ok, fence_state, _result} <-
            ExecutionFence.release(state.execution_fence, token, session_id, normalize_release_reason(reason)) do
-      %{state | execution_fence: fence_state}
+      case persist_execution_fence(state, fence_state) do
+        {:ok, next_state} ->
+          next_state
+
+        {:error, persist_reason} ->
+          Logger.error("Execution-fence lease release was not persisted: #{inspect(persist_reason)}")
+          state
+      end
     else
       _ ->
         state
@@ -1120,9 +1138,16 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_head = Map.get(entry, :accepted_head, "unobserved")
     terminal_attrs = %{terminal_state: issue_state, accepted_head: terminal_head, merge_identity: Map.get(entry, :merge_identity)}
 
-    case ExecutionFence.fence(state.execution_fence, token, terminal_attrs, max(0, System.monotonic_time(:millisecond))) do
+    case ExecutionFence.fence(state.execution_fence, token, terminal_attrs, execution_fence_now_ms()) do
       {:ok, fence_state, _result} ->
-        %{state | execution_fence: fence_state}
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, persist_reason} ->
+            Logger.error("Terminal execution fence was not persisted: #{inspect(persist_reason)}")
+            state
+        end
 
       {:error, reason} ->
         Logger.warning("Terminal execution fence rejected for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1135,15 +1160,29 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_fenced_workspace_or_legacy(%State{} = state, issue_or_identifier, %{execution_token: token} = entry) do
     case Map.get(entry, :accepted_head) do
       head when is_binary(head) and head != "" and head != "unobserved" ->
-        now_ms = max(0, System.monotonic_time(:millisecond))
+        now_ms = execution_fence_now_ms()
 
         case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
           {:ok, fence_state, :cleaned} ->
-            cleanup_issue_workspace(issue_or_identifier, entry)
-            %{state | execution_fence: fence_state}
+            case persist_execution_fence(state, fence_state) do
+              {:ok, next_state} ->
+                cleanup_issue_workspace(issue_or_identifier, entry)
+                next_state
+
+              {:error, persist_reason} ->
+                Logger.error("Execution-fence cleanup was not persisted: #{inspect(persist_reason)}")
+                state
+            end
 
           {:ok, fence_state, :already_cleaned} ->
-            %{state | execution_fence: fence_state}
+            case persist_execution_fence(state, fence_state) do
+              {:ok, next_state} ->
+                next_state
+
+              {:error, persist_reason} ->
+                Logger.error("Execution-fence cleanup state was not persisted: #{inspect(persist_reason)}")
+                state
+            end
 
           {:error, reason} ->
             Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
@@ -1302,7 +1341,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(identifier, worker_host)
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     case Map.get(metadata, :workspace_path) do
@@ -1324,20 +1363,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
+  defp run_terminal_workspace_cleanup(%State{} = state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
         issues
         |> Enum.each(fn
           %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
+            Logger.info("Deferring startup cleanup for terminal issue #{issue_context(issue)} until its persisted execution fence is reconciled")
 
           _ ->
             :ok
         end)
 
+        state
+
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        state
     end
   end
 
@@ -1600,16 +1642,137 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc false
+  @spec register_execution_session(GenServer.server(), map(), :worker | :reviewer, map(), non_neg_integer()) ::
+          {:ok, :registered | :already_registered} | {:error, term()} | :unavailable
+  def register_execution_session(server, token, role, attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_register, token, role, attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec heartbeat_execution_session(GenServer.server(), map(), String.t(), non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def heartbeat_execution_session(server, token, session_id, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_heartbeat, token, session_id, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec release_execution_session(GenServer.server(), map(), String.t(), atom()) ::
+          {:ok, :released | :already_released} | {:error, term()} | :unavailable
+  def release_execution_session(server, token, session_id, reason \\ :released) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_release, token, session_id, reason})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec fence_execution(GenServer.server(), map(), map(), non_neg_integer()) ::
+          {:ok, :fenced | :already_fenced} | {:error, term()} | :unavailable
+  def fence_execution(server, token, attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_terminal, token, attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call({:execution_fence_authorize, token, action}, _from, %State{} = state) do
     {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
   end
 
+  def handle_call({:execution_fence_register, token, role, attrs, now_ms}, _from, %State{} = state) do
+    case ExecutionFence.register(state.execution_fence, token, role, attrs, now_ms) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_heartbeat, token, session_id, now_ms}, _from, %State{} = state) do
+    case ExecutionFence.heartbeat(state.execution_fence, token, session_id, now_ms) do
+      {:ok, fence_state} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, :persisted}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_release, token, session_id, reason}, _from, %State{} = state) do
+    case ExecutionFence.release(state.execution_fence, token, session_id, reason) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            {:reply, {:ok, result}, next_state}
+
+          {:error, persist_reason} ->
+            {:reply, {:error, {:execution_fence_persistence_failed, persist_reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_terminal, token, attrs, now_ms}, _from, %State{} = state) do
+    case ExecutionFence.fence(state.execution_fence, token, attrs, now_ms) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call({:execution_fence_reconcile, observations, now_ms, ttl_ms}, _from, %State{} = state) do
     case ExecutionFence.reconcile_sessions(state.execution_fence, observations, now_ms, ttl_ms) do
       {:ok, fence_state, summary} ->
-        reply = {:ok, %{summary: summary, execution_fence: execution_fence_snapshot(fence_state)}}
-        {:reply, reply, %{state | execution_fence: fence_state}}
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            reply = {:ok, %{summary: summary, execution_fence: execution_fence_snapshot(fence_state)}}
+            {:reply, reply, next_state}
+
+          {:error, reason} ->
+            {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
 
       {:error, reason} = error ->
         Logger.warning("Execution-fence reconciliation rejected: #{inspect(reason)}")
@@ -1723,6 +1886,48 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} -> %{schema_version: 1, status: :invalid, error: reason}
     end
   end
+
+  defp load_execution_fence(path) when is_binary(path) do
+    case Persistence.load(path) do
+      :missing ->
+        fence_state = ExecutionFence.new()
+
+        case Persistence.save(path, fence_state) do
+          :ok -> {:ok, fence_state}
+          {:error, reason} -> {:error, {:initial_persistence_failed, reason}}
+        end
+
+      {:ok, fence_state} ->
+        with {:ok, restarted_state} <- ExecutionFence.mark_unreconciled_after_restart(fence_state),
+             :ok <- Persistence.save(path, restarted_state) do
+          {:ok, restarted_state}
+        else
+          {:error, reason} -> {:error, {:restart_reconciliation_persistence_failed, reason}}
+          other -> {:error, {:restart_reconciliation_persistence_failed, other}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp load_execution_fence(path), do: {:error, {:invalid_state_path, path}}
+
+  defp persist_execution_fence(%State{execution_fence_path: nil} = state, fence_state) do
+    {:ok, %{state | execution_fence: fence_state}}
+  end
+
+  defp persist_execution_fence(%State{execution_fence_path: path} = state, fence_state)
+       when is_binary(path) do
+    case Persistence.save(path, fence_state) do
+      :ok -> {:ok, %{state | execution_fence: fence_state}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_execution_fence(_state, _fence_state), do: {:error, :invalid_state_path}
+
+  defp execution_fence_now_ms, do: max(0, System.system_time(:millisecond))
 
   defp server_available?(server) when is_pid(server), do: Process.alive?(server)
   defp server_available?(server) when is_atom(server), do: is_pid(Process.whereis(server))

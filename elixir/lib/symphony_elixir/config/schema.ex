@@ -289,6 +289,23 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule ExecutionFence do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:state_path, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:state_path], empty_values: [])
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -299,6 +316,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:execution_fence, ExecutionFence, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -393,6 +411,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:execution_fence, with: &ExecutionFence.changeset/2)
   end
 
   defp finalize_settings(settings) do
@@ -454,13 +473,22 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
+    execution_fence = %{
+      settings.execution_fence
+      | state_path:
+          resolve_path_value(
+            settings.execution_fence.state_path,
+            Path.join(workspace.root, ".symphony/execution-fence.json")
+          )
+    }
+
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    %{settings | tracker: tracker, workspace: workspace, execution_fence: execution_fence, codex: codex}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -513,6 +541,8 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_path_value(nil, default), do: default
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
