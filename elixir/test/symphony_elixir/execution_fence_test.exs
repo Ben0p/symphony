@@ -47,9 +47,23 @@ defmodule SymphonyElixir.ExecutionFenceTest do
 
     {:ok, state, next_token} = ExecutionFence.admit(state, admission(), 130)
     assert next_token.generation == 2
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, next_token, :worker, Map.put(session("worker-2", 130), :generation, 2), 130)
+
     assert {:error, :stale_generation} = ExecutionFence.authorize(state, token, :commit)
     assert {:error, :stale_generation} = ExecutionFence.cleanup(state, token, "abc123", 131)
     assert {:error, :generation_active} = ExecutionFence.admit(state, admission(), 132)
+  end
+
+  test "a released generation is quiescent and the next admission gets a new generation" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+    {:ok, state, :released} = ExecutionFence.release(state, token, "worker-1", :worker_exit)
+
+    assert {:ok, state, next_token} = ExecutionFence.admit(state, admission(), 110)
+    assert next_token.generation == 2
+    assert {:error, :stale_generation} = ExecutionFence.authorize(state, token, :commit)
   end
 
   test "reconciliation blocks unknown and contradictory ownership, then expires a missing lease" do

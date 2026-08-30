@@ -408,8 +408,12 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp admission_allowed(state, attrs) do
     case Map.get(state.executions, attrs.issue_id) do
-      %{status: :active} ->
-        {:error, :generation_active}
+      %{status: :active} = execution ->
+        if quiescent?(execution) do
+          repository_execution_blocker(state.executions, attrs.repository)
+        else
+          {:error, :generation_active}
+        end
 
       %{status: :terminal, cleanup: cleanup} when cleanup != :cleaned ->
         {:error, :execution_not_quiescent}
@@ -428,8 +432,9 @@ defmodule SymphonyElixir.ExecutionFence do
   end
 
   defp quiescent?(execution) do
-    execution.status == :terminal and execution.cleanup == :cleaned and
-      execution.ownership == :reconciled
+    execution.ownership == :reconciled and active_lease_ids(execution) == [] and
+      (execution.status == :active or
+         (execution.status == :terminal and execution.cleanup == :cleaned))
   end
 
   defp archive_previous_execution(state, nil), do: state

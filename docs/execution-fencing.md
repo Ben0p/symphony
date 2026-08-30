@@ -24,8 +24,10 @@ corresponding decision succeeds.
   matches, whose ownership is reconciled, and whose leases are all released or
   expired. Repeating cleanup for that generation is `:already_cleaned`.
 - A same-repository admission is blocked while another generation is active,
-  unquiescent, or has unknown/contradictory ownership. Terminal tracker state
-  dominates stale non-terminal session observations.
+  unquiescent, or has unknown/contradictory ownership. Once every lease for an
+  active generation is released, that generation is quiescent and the next
+  admission receives a new generation, fencing the released worker token.
+  Terminal tracker state dominates stale non-terminal session observations.
 
 `reconcile_sessions/4` consumes an explicit, sanitized session snapshot. It
 returns deterministic `:reconciled` or `:blocked` evidence and expires leases
@@ -36,3 +38,13 @@ observations remain fail-closed.
 The current orchestrator can adopt this contract at its scheduling and
 workspace boundaries without giving the contract authority to delete a
 worktree, mutate a branch, terminate a process, or change Linear/GitHub state.
+
+The worker seam now accepts a synchronous `execution_fence_guard` callback. The
+orchestrator owns the serializable snapshot, admits and registers a logical worker
+lease before spawning, and the worker calls the guard before
+`Workspace.create_for_issue/2`. Terminal observation fences the generation before
+the existing stop path. A fenced task may therefore not begin workspace creation
+or later mutable work. The current runtime does not publish an exact accepted Git
+head before every terminal cleanup request; the integrated cleanup path preserves
+that workspace until such a head is supplied, rather than treating `PR merged` or
+an unknown head as proof of quiescence.

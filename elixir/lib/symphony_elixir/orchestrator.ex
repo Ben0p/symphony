@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, ExecutionFence, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -39,6 +39,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      execution_fence: ExecutionFence.new(),
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -137,6 +138,7 @@ defmodule SymphonyElixir.Orchestrator do
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
+        state = release_execution_lease(state, running_entry, reason)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
 
@@ -218,7 +220,11 @@ defmodule SymphonyElixir.Orchestrator do
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
+        workspace_path: Map.get(running_entry, :workspace_path),
+        execution_token: Map.get(running_entry, :execution_token),
+        execution_session_id: Map.get(running_entry, :execution_session_id),
+        accepted_head: Map.get(running_entry, :accepted_head),
+        merge_identity: Map.get(running_entry, :merge_identity)
       })
     end
   end
@@ -249,7 +255,11 @@ defmodule SymphonyElixir.Orchestrator do
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
+      workspace_path: Map.get(running_entry, :workspace_path),
+      execution_token: Map.get(running_entry, :execution_token),
+      execution_session_id: Map.get(running_entry, :execution_session_id),
+      accepted_head: Map.get(running_entry, :accepted_head),
+      merge_identity: Map.get(running_entry, :merge_identity)
     })
   end
 
@@ -457,7 +467,9 @@ defmodule SymphonyElixir.Orchestrator do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
+        blocked_entry = Map.get(state.blocked, issue.id, %{})
+        state = maybe_fence_terminal_execution(state, Map.put(blocked_entry, :issue, issue), true)
+        state = cleanup_fenced_workspace_or_legacy(state, issue, blocked_entry)
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
@@ -558,12 +570,17 @@ defmodule SymphonyElixir.Orchestrator do
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+        state = maybe_fence_terminal_execution(state, running_entry, cleanup_workspace)
 
         stop_running_task(pid, ref, state.task_supervisor)
+        state = release_execution_lease(state, running_entry, :orchestrator_stop)
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
-        end
+        state =
+          if cleanup_workspace do
+            cleanup_fenced_workspace_or_legacy(state, Map.get(running_entry, :issue, identifier), running_entry)
+          else
+            state
+          end
 
         %{
           state
@@ -766,7 +783,11 @@ defmodule SymphonyElixir.Orchestrator do
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      execution_token: Map.get(running_entry, :execution_token),
+      execution_session_id: Map.get(running_entry, :execution_session_id),
+      accepted_head: Map.get(running_entry, :accepted_head),
+      merge_identity: Map.get(running_entry, :merge_identity)
     }
 
     %{
@@ -951,8 +972,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    case admit_execution(state, issue, worker_host) do
+      {:ok, state, token, session_id} ->
+        spawn_fenced_issue(state, issue, attempt, recipient, worker_host, token, session_id)
+
+      {:error, reason} ->
+        Logger.warning("Skipping fenced dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp spawn_fenced_issue(%State{} = state, issue, attempt, recipient, worker_host, token, session_id) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             execution_fence_guard: fn ->
+               GenServer.call(recipient, {:execution_fence_authorize, token, :state_mutation})
+             end
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -968,6 +1006,8 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            execution_token: token,
+            execution_session_id: session_id,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -994,13 +1034,130 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
+        state =
+          release_execution_lease(
+            state,
+            %{execution_token: token, execution_session_id: session_id},
+            :spawn_failed
+          )
+
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
           issue_url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          worker_host: worker_host,
+          execution_token: token,
+          execution_session_id: session_id
         })
     end
+  end
+
+  defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host)
+       when is_binary(issue_id) do
+    now_ms = max(0, System.monotonic_time(:millisecond))
+    attrs = execution_attributes(issue, worker_host)
+
+    with {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),
+         session_id = execution_session_id(issue_id, token.generation),
+         {:ok, fence_state, _result} <-
+           ExecutionFence.register(
+             fence_state,
+             token,
+             :worker,
+             execution_session_attributes(attrs, session_id),
+             now_ms
+           ) do
+      {:ok, %{state | execution_fence: fence_state}, token, session_id}
+    end
+  end
+
+  defp admit_execution(_state, _issue, _worker_host), do: {:error, :invalid_issue}
+
+  defp execution_attributes(%Issue{id: issue_id, identifier: identifier, branch_name: branch_name}, _worker_host) do
+    workspace = Path.join(Config.settings!().workspace.root, Workspace.workspace_key(identifier || issue_id))
+
+    %{
+      issue_id: issue_id,
+      repository: "openai/symphony",
+      branch: branch_name || "codex/#{Workspace.workspace_key(identifier || issue_id)}",
+      worktree: workspace
+    }
+  end
+
+  defp execution_session_attributes(attrs, session_id) do
+    Map.merge(attrs, %{
+      session_id: session_id,
+      process_id: session_id,
+      role: :worker,
+      linear_state: "admitted",
+      pr_state: "unopened",
+      head: "unobserved",
+      last_heartbeat_at: 0
+    })
+  end
+
+  defp execution_session_id(issue_id, generation), do: "worker:#{issue_id}:#{generation}"
+
+  defp release_execution_lease(%State{} = state, running_entry, reason) do
+    with %{execution_token: token, execution_session_id: session_id} <- running_entry,
+         {:ok, fence_state, _result} <-
+           ExecutionFence.release(state.execution_fence, token, session_id, normalize_release_reason(reason)) do
+      %{state | execution_fence: fence_state}
+    else
+      _ ->
+        state
+    end
+  end
+
+  defp normalize_release_reason(reason) when is_atom(reason), do: reason
+  defp normalize_release_reason(_reason), do: :worker_exit
+
+  defp maybe_fence_terminal_execution(state, _running_entry, false), do: state
+
+  defp maybe_fence_terminal_execution(state, %{execution_token: token, issue: %Issue{state: issue_state} = issue} = entry, true)
+       when is_binary(issue_state) do
+    terminal_head = Map.get(entry, :accepted_head, "unobserved")
+    terminal_attrs = %{terminal_state: issue_state, accepted_head: terminal_head, merge_identity: Map.get(entry, :merge_identity)}
+
+    case ExecutionFence.fence(state.execution_fence, token, terminal_attrs, max(0, System.monotonic_time(:millisecond))) do
+      {:ok, fence_state, _result} ->
+        %{state | execution_fence: fence_state}
+
+      {:error, reason} ->
+        Logger.warning("Terminal execution fence rejected for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp maybe_fence_terminal_execution(state, _running_entry, _cleanup_workspace), do: state
+
+  defp cleanup_fenced_workspace_or_legacy(%State{} = state, issue_or_identifier, %{execution_token: token} = entry) do
+    case Map.get(entry, :accepted_head) do
+      head when is_binary(head) and head != "" and head != "unobserved" ->
+        now_ms = max(0, System.monotonic_time(:millisecond))
+
+        case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
+          {:ok, fence_state, :cleaned} ->
+            cleanup_issue_workspace(issue_or_identifier, entry)
+            %{state | execution_fence: fence_state}
+
+          {:ok, fence_state, :already_cleaned} ->
+            %{state | execution_fence: fence_state}
+
+          {:error, reason} ->
+            Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
+            state
+        end
+
+      _ ->
+        Logger.warning("Preserving fenced workspace until an exact terminal head is observed")
+        state
+    end
+  end
+
+  defp cleanup_fenced_workspace_or_legacy(state, issue_or_identifier, entry) do
+    cleanup_issue_workspace(issue_or_identifier, entry)
+    state
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
@@ -1067,7 +1224,11 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            execution_token: Map.get(metadata, :execution_token),
+            execution_session_id: Map.get(metadata, :execution_session_id),
+            accepted_head: Map.get(metadata, :accepted_head),
+            merge_identity: Map.get(metadata, :merge_identity)
           })
     }
   end
@@ -1080,7 +1241,11 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          execution_token: Map.get(retry_entry, :execution_token),
+          execution_session_id: Map.get(retry_entry, :execution_session_id),
+          accepted_head: Map.get(retry_entry, :accepted_head),
+          merge_identity: Map.get(retry_entry, :merge_identity)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1117,7 +1282,8 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue, metadata)
+        state = maybe_fence_terminal_execution(state, Map.put(metadata, :issue, issue), true)
+        state = cleanup_fenced_workspace_or_legacy(state, issue, metadata)
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
@@ -1406,6 +1572,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:execution_fence_authorize, token, action}, _from, %State{} = state) do
+    {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()

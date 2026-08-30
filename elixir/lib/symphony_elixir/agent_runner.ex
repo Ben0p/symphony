@@ -38,20 +38,40 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with :ok <- execution_fence_preflight(opts) do
+      case Workspace.create_for_issue(issue, worker_host) do
+        {:ok, workspace} ->
+          send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          try do
+            with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+              run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            end
+          after
+            Workspace.run_after_run_hook(workspace, issue, worker_host)
           end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp execution_fence_preflight(opts) do
+    case Keyword.get(opts, :execution_fence_guard) do
+      nil ->
+        :ok
+
+      guard when is_function(guard, 0) ->
+        case guard.() do
+          :ok -> :ok
+          {:ok, _metadata} -> :ok
+          {:error, _reason} = error -> error
+          _other -> {:error, :invalid_execution_fence_guard_result}
         end
 
-      {:error, reason} ->
-        {:error, reason}
+      _invalid ->
+        {:error, :invalid_execution_fence_guard}
     end
   end
 
