@@ -52,7 +52,11 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
         Map.new(state.sessions, fn {session_id, session} ->
           {session_id, encode_lease(session)}
         end),
-      "history" => Enum.map(state.history, &encode_execution/1)
+      "history" => Enum.map(state.history, &encode_execution/1),
+      "triage_records" =>
+        Map.new(state.triage_records, fn {triage_id, record} ->
+          {triage_id, encode_triage_record(record)}
+        end)
     })
   end
 
@@ -160,22 +164,27 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
     }
   end
 
-  defp decode_state(%{
-         "schema_version" => @schema_version,
-         "executions" => executions,
-         "sessions" => sessions,
-         "history" => history
-       })
+  defp decode_state(
+         payload = %{
+           "schema_version" => @schema_version,
+           "executions" => executions,
+           "sessions" => sessions,
+           "history" => history
+         }
+       )
        when is_map(executions) and is_map(sessions) and is_list(history) do
     with {:ok, decoded_executions} <- decode_map(executions, &decode_execution/1),
          {:ok, decoded_sessions} <- decode_map(sessions, &decode_lease/1),
-         {:ok, decoded_history} <- decode_list(history, &decode_execution/1) do
+         {:ok, decoded_history} <- decode_list(history, &decode_execution/1),
+         {:ok, decoded_triage_records} <-
+           decode_map(Map.get(payload, "triage_records", %{}), &decode_triage_record/1) do
       {:ok,
        %{
          schema_version: @schema_version,
          executions: decoded_executions,
          sessions: decoded_sessions,
-         history: decoded_history
+         history: decoded_history,
+         triage_records: decoded_triage_records
        }}
     end
   end
@@ -271,6 +280,50 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
   end
 
   defp decode_terminal(_payload), do: {:error, :invalid_terminal}
+
+  defp encode_triage_record(record) do
+    %{
+      "id" => record.id,
+      "type" => Atom.to_string(record.type),
+      "issue_id" => record.issue_id,
+      "repository" => record.repository,
+      "generation" => record.generation,
+      "branch" => record.branch,
+      "worktree" => record.worktree,
+      "expected_head" => record.expected_head,
+      "observed_head" => record.observed_head,
+      "detected_at_ms" => record.detected_at_ms
+    }
+  end
+
+  defp decode_triage_record(payload) when is_map(payload) do
+    with {:ok, id} <- required(payload, "id"),
+         {:ok, type} <- decode_status(Map.get(payload, "type"), [:post_terminal_head_divergence]),
+         {:ok, issue_id} <- required(payload, "issue_id"),
+         {:ok, repository} <- required(payload, "repository"),
+         {:ok, generation} <- required(payload, "generation"),
+         {:ok, branch} <- required(payload, "branch"),
+         {:ok, worktree} <- required(payload, "worktree"),
+         {:ok, expected_head} <- required(payload, "expected_head"),
+         {:ok, observed_head} <- required(payload, "observed_head"),
+         {:ok, detected_at_ms} <- required(payload, "detected_at_ms") do
+      {:ok,
+       %{
+         id: id,
+         type: type,
+         issue_id: issue_id,
+         repository: repository,
+         generation: generation,
+         branch: branch,
+         worktree: worktree,
+         expected_head: expected_head,
+         observed_head: observed_head,
+         detected_at_ms: detected_at_ms
+       }}
+    end
+  end
+
+  defp decode_triage_record(_payload), do: {:error, :invalid_triage_record}
 
   defp decode_map(payload, decoder) when is_map(payload) do
     Enum.reduce_while(payload, {:ok, %{}}, fn

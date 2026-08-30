@@ -23,6 +23,10 @@ corresponding decision succeeds.
 - Cleanup is admitted only for a terminal generation whose exact accepted head
   matches, whose ownership is reconciled, and whose leases are all released or
   expired. Repeating cleanup for that generation is `:already_cleaned`.
+- A post-terminal head mismatch emits one generation-bound, idempotent
+  `post_terminal_head_divergence` triage record in the durable fence snapshot.
+  Repeated cleanup attempts cannot overwrite the original evidence or silently
+  delete the preserved delta.
 - A same-repository admission is blocked while another generation is active,
   unquiescent, or has unknown/contradictory ownership. Once every lease for an
   active generation is released, that generation is quiescent and the next

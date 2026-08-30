@@ -72,6 +72,23 @@ defmodule SymphonyElixir.ExecutionFenceTest do
     assert {:error, :head_diverged} = ExecutionFence.cleanup(state, token, "def456", 120)
   end
 
+  test "records exactly one durable triage record for a post-terminal head divergence" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 110)
+
+    assert {:ok, state, :recorded} =
+             ExecutionFence.record_head_divergence(state, token, "abc123", "def456", 120)
+
+    assert [%{type: :post_terminal_head_divergence, expected_head: "abc123", observed_head: "def456"}] =
+             ExecutionFence.snapshot(state).triage_records
+
+    assert {:ok, same_state, :already_recorded} =
+             ExecutionFence.record_head_divergence(state, token, "abc123", "ghi789", 121)
+
+    assert same_state == state
+    assert length(ExecutionFence.snapshot(same_state).triage_records) == 1
+  end
+
   test "stale generations fail closed and cannot clean a newer generation" do
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
     {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 110)

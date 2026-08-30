@@ -64,6 +64,19 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
     assert {:ok, ^state} = Persistence.load(path)
   end
 
+  test "persists and rehydrates the exactly-once divergence triage record", %{path: path} do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 110)
+
+    {:ok, state, :recorded} =
+      ExecutionFence.record_head_divergence(state, token, "abc123", "def456", 120)
+
+    assert :ok = Persistence.save(path, state)
+    assert {:ok, restored} = Persistence.load(path)
+    assert restored == state
+    assert [%{observed_head: "def456"}] = Map.values(restored.triage_records)
+  end
+
   defp admission(issue_id \\ @issue) do
     %{
       issue_id: issue_id,
@@ -84,5 +97,9 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
       head: "abc123",
       last_heartbeat_at: 100
     })
+  end
+
+  defp terminal do
+    %{terminal_state: "Done", accepted_head: "abc123"}
   end
 end

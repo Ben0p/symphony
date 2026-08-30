@@ -1177,8 +1177,7 @@ defmodule SymphonyElixir.Orchestrator do
                 cleanup_fenced_execution(state, issue_or_identifier, Map.put(entry, :workspace_path, workspace_path), token, head)
 
               {:ok, observed_head} ->
-                Logger.warning("Preserving fenced workspace after head divergence expected=#{head} observed=#{observed_head}")
-                state
+                record_head_divergence(state, token, head, observed_head)
 
               {:error, reason} ->
                 Logger.warning("Preserving fenced workspace because exact head could not be observed: #{inspect(reason)}")
@@ -1228,6 +1227,35 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp record_head_divergence(state, token, expected_head, observed_head) do
+    case ExecutionFence.record_head_divergence(
+           state.execution_fence,
+           token,
+           expected_head,
+           observed_head,
+           execution_fence_now_ms()
+         ) do
+      {:ok, fence_state, :recorded} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            Logger.warning("Preserving fenced workspace after head divergence expected=#{expected_head} observed=#{observed_head}; triage recorded")
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Head-divergence triage was not persisted: #{inspect(reason)}")
+            state
+        end
+
+      {:ok, _fence_state, :already_recorded} ->
+        Logger.warning("Preserving fenced workspace after previously recorded head divergence expected=#{expected_head} observed=#{observed_head}")
+        state
+
+      {:error, reason} ->
+        Logger.error("Head-divergence triage was rejected: #{inspect(reason)}")
         state
     end
   end
@@ -1788,6 +1816,24 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc false
+  @spec record_execution_head_divergence(GenServer.server(), map(), String.t(), String.t(), non_neg_integer()) ::
+          {:ok, :recorded | :already_recorded} | {:error, term()} | :unavailable
+  def record_execution_head_divergence(server, token, expected_head, observed_head, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(
+          server,
+          {:execution_fence_head_divergence, token, expected_head, observed_head, now_ms}
+        )
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call({:execution_fence_authorize, token, action}, _from, %State{} = state) do
     {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
@@ -1837,6 +1883,29 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_call({:execution_fence_terminal, token, attrs, now_ms}, _from, %State{} = state) do
     case ExecutionFence.fence(state.execution_fence, token, attrs, now_ms) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call(
+        {:execution_fence_head_divergence, token, expected_head, observed_head, now_ms},
+        _from,
+        %State{} = state
+      ) do
+    case ExecutionFence.record_head_divergence(
+           state.execution_fence,
+           token,
+           expected_head,
+           observed_head,
+           now_ms
+         ) do
       {:ok, fence_state, result} ->
         case persist_execution_fence(state, fence_state) do
           {:ok, next_state} -> {:reply, {:ok, result}, next_state}
