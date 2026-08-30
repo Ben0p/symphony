@@ -26,6 +26,15 @@ or terminalizing a delegation returns the affected lease references and
 `revoke_and_fence/6` fences those generations through HGS-294 before the caller
 performs cleanup.
 
+The graph starts in `manual` mode while the bootstrap is still coordinated by
+the bounded prompt convention. After the graph has been reviewed and proven,
+the orchestrator can persist `enforced` mode through
+`Orchestrator.activate_responsibility_graph/1`. In enforced mode, normal worker
+admission must find exactly one active responsible delegation for the issue and
+bind its HGS-294 runtime lease before the worker starts. The worker's side-effect
+guard then authorizes through both contracts; an active worker exit releases the
+binding so a bounded retry can receive a fresh generation.
+
 The orchestrator persists the graph as a versioned, sanitized JSON snapshot at
 `responsibility-graph.json` beside the execution-fence snapshot. On restart,
 active delegations are blocked until their runtime lease is explicitly

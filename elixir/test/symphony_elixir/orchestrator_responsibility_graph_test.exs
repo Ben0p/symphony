@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.OrchestratorResponsibilityGraphTest do
-  use ExUnit.Case, async: true
+  use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.{ExecutionFence, Orchestrator, ResponsibilityGraph}
 
@@ -44,6 +44,51 @@ defmodule SymphonyElixir.OrchestratorResponsibilityGraphTest do
     assert state4.execution_fence.executions["HGS-300"].status == :terminal
   end
 
+  test "enforced graph gates normal worker admission and binds the execution lease" do
+    {:ok, graph, :activated} = ResponsibilityGraph.activate(ResponsibilityGraph.new(), 0)
+
+    {:ok, graph, _owner} =
+      ResponsibilityGraph.delegate(
+        graph,
+        delegation("owner", :accountable, scope: Map.put(scope(), :repository, "openai/symphony")),
+        1
+      )
+
+    {:ok, graph, _worker} =
+      ResponsibilityGraph.delegate(
+        graph,
+        delegation(
+          "worker",
+          :responsible,
+          parent_delegation_id: "owner",
+          scope: Map.put(scope(), :repository, "openai/symphony")
+        ),
+        2
+      )
+
+    state = %Orchestrator.State{
+      execution_fence: ExecutionFence.new(),
+      responsibility_graph: graph,
+      execution_fence_path: nil,
+      responsibility_graph_path: nil
+    }
+
+    issue = %Issue{id: "HGS-300", identifier: "HGS-300", title: "Graph admission", state: "Todo", branch_name: "codex/hgs-300"}
+
+    assert {:ok, admitted, token, session_id, "worker", runtime_lease} =
+             Orchestrator.admit_execution_for_test(state, issue, nil)
+
+    assert admitted.responsibility_graph.delegations["worker"].runtime_lease == runtime_lease
+    assert runtime_lease.session_id == session_id
+
+    assert {:reply, {:ok, _authorization}, ^admitted} =
+             Orchestrator.handle_call(
+               {:execution_authorize, token, "worker", :state_mutation},
+               {self(), make_ref()},
+               admitted
+             )
+  end
+
   defp delegation(id, role, overrides \\ []) do
     Map.merge(
       %{
@@ -55,7 +100,7 @@ defmodule SymphonyElixir.OrchestratorResponsibilityGraphTest do
         authority: authority(),
         budget: %{model: "luna", effort: :max, max_tokens: 10_000, max_children: 4},
         runtime_lease: nil,
-        expires_at_ms: 10_000,
+        expires_at_ms: System.system_time(:millisecond) + 60_000,
         expected_deliverable: "bounded deliverable",
         expected_evidence: "tests and review evidence",
         return_to_parent: %{owner_id: "owner", contract: "return evidence and outcome"}

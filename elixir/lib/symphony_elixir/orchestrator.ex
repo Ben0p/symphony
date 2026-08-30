@@ -489,6 +489,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec admit_execution_for_test(term(), Issue.t(), String.t() | nil) ::
+          {:ok, term(), map(), String.t(), String.t() | nil, map()} | {:error, term()}
+  def admit_execution_for_test(%State{} = state, %Issue{} = issue, worker_host) do
+    admit_execution(state, issue, worker_host)
+  end
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -1206,8 +1213,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
     case admit_execution(state, issue, worker_host) do
-      {:ok, state, token, session_id} ->
-        spawn_fenced_issue(state, issue, attempt, recipient, worker_host, token, session_id)
+      {:ok, state, token, session_id, responsibility_delegation_id, runtime_lease} ->
+        spawn_fenced_issue(
+          state,
+          issue,
+          attempt,
+          recipient,
+          worker_host,
+          token,
+          session_id,
+          responsibility_delegation_id,
+          runtime_lease
+        )
 
       {:error, reason} ->
         Logger.warning("Skipping fenced dispatch for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1215,7 +1232,17 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp spawn_fenced_issue(%State{} = state, issue, attempt, recipient, worker_host, token, session_id) do
+  defp spawn_fenced_issue(
+         %State{} = state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         token,
+         session_id,
+         responsibility_delegation_id,
+         runtime_lease
+       ) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            AgentRunner.run(issue, recipient,
              attempt: attempt,
@@ -1223,7 +1250,10 @@ defmodule SymphonyElixir.Orchestrator do
              execution_token: token,
              execution_session_id: session_id,
              execution_fence_guard: fn ->
-               GenServer.call(recipient, {:execution_fence_authorize, token, :state_mutation})
+               GenServer.call(
+                 recipient,
+                 {:execution_authorize, token, responsibility_delegation_id, :state_mutation}
+               )
              end
            )
          end) do
@@ -1243,6 +1273,8 @@ defmodule SymphonyElixir.Orchestrator do
             session_id: nil,
             execution_token: token,
             execution_session_id: session_id,
+            responsibility_delegation_id: responsibility_delegation_id,
+            responsibility_runtime_lease: runtime_lease,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1279,7 +1311,12 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           release_execution_lease(
             state,
-            %{execution_token: token, execution_session_id: session_id},
+            %{
+              execution_token: token,
+              execution_session_id: session_id,
+              responsibility_delegation_id: responsibility_delegation_id,
+              responsibility_runtime_lease: runtime_lease
+            },
             :spawn_failed
           )
 
@@ -1298,9 +1335,11 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) do
     now_ms = execution_fence_now_ms()
     attrs = execution_attributes(issue, worker_host)
+    session_id_for_generation = fn generation -> execution_session_id(issue_id, generation) end
 
     with {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),
-         session_id = execution_session_id(issue_id, token.generation),
+         session_id = session_id_for_generation.(token.generation),
+         runtime_lease = execution_runtime_lease(issue_id, token, session_id),
          {:ok, fence_state, _result} <-
            ExecutionFence.register(
              fence_state,
@@ -1309,8 +1348,10 @@ defmodule SymphonyElixir.Orchestrator do
              execution_session_attributes(attrs, session_id),
              now_ms
            ),
-         {:ok, next_state} <- persist_execution_fence(state, fence_state) do
-      {:ok, next_state, token, session_id}
+         {:ok, next_state, responsibility_delegation_id} <-
+           bind_execution_responsibility(state, issue, runtime_lease, now_ms),
+         {:ok, next_state} <- persist_execution_fence(next_state, fence_state) do
+      {:ok, next_state, token, session_id, responsibility_delegation_id, runtime_lease}
     end
   end
 
@@ -1341,13 +1382,47 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp execution_session_id(issue_id, generation), do: "worker:#{issue_id}:#{generation}"
 
+  defp execution_runtime_lease(issue_id, %{generation: generation}, session_id) do
+    %{
+      issue_id: issue_id,
+      repository: "openai/symphony",
+      generation: generation,
+      session_id: session_id,
+      process_id: session_id
+    }
+  end
+
+  defp bind_execution_responsibility(%State{} = state, %Issue{} = issue, runtime_lease, now_ms) do
+    if ResponsibilityGraph.enforced?(state.responsibility_graph) do
+      with {:ok, delegation} <-
+             ResponsibilityGraph.admission_delegation(
+               state.responsibility_graph,
+               issue.id,
+               issue.identifier,
+               runtime_lease.repository
+             ),
+           {:ok, graph_state} <-
+             ResponsibilityGraph.bind_runtime_lease(
+               state.responsibility_graph,
+               delegation.id,
+               runtime_lease,
+               now_ms
+             ),
+           {:ok, next_state} <- persist_responsibility_graph(state, graph_state) do
+        {:ok, next_state, delegation.id}
+      end
+    else
+      {:ok, state, nil}
+    end
+  end
+
   defp release_execution_lease(%State{} = state, running_entry, reason) do
     with %{execution_token: token, execution_session_id: session_id} <- running_entry,
          {:ok, fence_state, _result} <-
            ExecutionFence.release(state.execution_fence, token, session_id, normalize_release_reason(reason)) do
       case persist_execution_fence(state, fence_state) do
         {:ok, next_state} ->
-          next_state
+          release_responsibility_lease(next_state, running_entry)
 
         {:error, persist_reason} ->
           Logger.error("Execution-fence lease release was not persisted: #{inspect(persist_reason)}")
@@ -1358,6 +1433,35 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp release_responsibility_lease(
+         %State{} = state,
+         %{responsibility_delegation_id: delegation_id, responsibility_runtime_lease: runtime_lease}
+       )
+       when is_binary(delegation_id) and is_map(runtime_lease) do
+    case ResponsibilityGraph.release_runtime_lease(
+           state.responsibility_graph,
+           delegation_id,
+           runtime_lease,
+           execution_fence_now_ms()
+         ) do
+      {:ok, graph_state, _result} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Responsibility runtime-lease release was not persisted: #{inspect(reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.error("Responsibility runtime-lease release was rejected: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp release_responsibility_lease(state, _running_entry), do: state
 
   defp normalize_release_reason(reason) when is_atom(reason), do: reason
   defp normalize_release_reason(_reason), do: :worker_exit
@@ -1373,7 +1477,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, fence_state, _result} ->
         case persist_execution_fence(state, fence_state) do
           {:ok, next_state} ->
-            next_state
+            complete_responsibility_execution(next_state, entry, terminal_attrs)
 
           {:error, persist_reason} ->
             Logger.error("Terminal execution fence was not persisted: #{inspect(persist_reason)}")
@@ -1387,6 +1491,36 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_fence_terminal_execution(state, _running_entry, _cleanup_workspace), do: state
+
+  defp complete_responsibility_execution(
+         %State{} = state,
+         %{responsibility_delegation_id: delegation_id},
+         terminal_attrs
+       )
+       when is_binary(delegation_id) and is_map(terminal_attrs) do
+    case ResponsibilityGraph.complete(
+           state.responsibility_graph,
+           delegation_id,
+           terminal_attrs,
+           execution_fence_now_ms()
+         ) do
+      {:ok, graph_state, _impact} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Terminal responsibility completion was not persisted: #{inspect(reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning("Terminal responsibility completion rejected: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp complete_responsibility_execution(state, _entry, _terminal_attrs), do: state
 
   defp cleanup_fenced_workspace_or_legacy(%State{} = state, issue_or_identifier, %{execution_token: token} = entry) do
     case Map.get(entry, :accepted_head) do
@@ -2074,6 +2208,26 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Activates machine-enforced responsibility admission after the graph is proven."
+  @spec activate_responsibility_graph(non_neg_integer()) ::
+          {:ok, :activated | :already_activated} | {:error, term()} | :unavailable
+  def activate_responsibility_graph(now_ms),
+    do: activate_responsibility_graph(__MODULE__, now_ms)
+
+  @spec activate_responsibility_graph(GenServer.server(), non_neg_integer()) ::
+          {:ok, :activated | :already_activated} | {:error, term()} | :unavailable
+  def activate_responsibility_graph(server, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_activate, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @doc "Registers a typed responsibility delegation and persists it."
   @spec delegate_responsibility(map(), non_neg_integer()) ::
           {:ok, map()} | {:error, term()} | :unavailable
@@ -2195,6 +2349,27 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
   end
 
+  def handle_call({:execution_authorize, token, nil, action}, _from, %State{} = state) do
+    {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
+  end
+
+  def handle_call({:execution_authorize, token, delegation_id, action}, _from, %State{} = state)
+      when is_binary(delegation_id) do
+    reply =
+      if ResponsibilityGraph.enforced?(state.responsibility_graph) do
+        ResponsibilityGraph.authorize_with_execution_fence(
+          state.responsibility_graph,
+          delegation_id,
+          action,
+          state.execution_fence
+        )
+      else
+        ExecutionFence.authorize(state.execution_fence, token, action)
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:execution_fence_register, token, role, attrs, now_ms}, _from, %State{} = state) do
     case ExecutionFence.register(state.execution_fence, token, role, attrs, now_ms) do
       {:ok, fence_state, result} ->
@@ -2293,6 +2468,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_call(:responsibility_snapshot, _from, %State{} = state) do
     {:reply, ResponsibilityGraph.snapshot(state.responsibility_graph), state}
+  end
+
+  def handle_call({:responsibility_activate, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.activate(state.responsibility_graph, now_ms) do
+      {:ok, graph_state, result} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
   end
 
   def handle_call({:responsibility_delegate, attrs, now_ms}, _from, %State{} = state) do

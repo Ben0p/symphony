@@ -50,9 +50,18 @@ defmodule SymphonyElixir.ResponsibilityGraphPersistenceTest do
     assert {:ok, restored} = Persistence.load(path)
     assert :ok = ResponsibilityGraph.validate(restored)
     assert restored.schema_version == 1
+    assert restored.enforcement == :manual
     assert restored.delegations["owner"].role == :accountable
     assert restored.delegations["worker"].runtime_lease.session_id == "worker"
     assert restored.delegations["worker"].budget.max_tokens == 10_000
+  end
+
+  test "persists machine-enforced admission mode", %{path: path} do
+    {:ok, graph, :activated} = ResponsibilityGraph.activate(ResponsibilityGraph.new(), 0)
+    assert :ok = Persistence.save(path, graph)
+    assert {:ok, restored} = Persistence.load(path)
+    assert restored.enforcement == :enforced
+    assert ResponsibilityGraph.enforced?(restored)
   end
 
   test "rejects malformed snapshots and safely replaces an existing file", %{path: path} do

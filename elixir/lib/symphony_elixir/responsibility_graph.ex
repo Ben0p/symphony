@@ -23,13 +23,36 @@ defmodule SymphonyElixir.ResponsibilityGraph do
 
   @type state :: %{
           schema_version: 1,
+          enforcement: :manual | :enforced,
           delegations: %{optional(String.t()) => map()},
           events: [map()]
         }
 
   @doc "Creates an empty responsibility graph."
   @spec new() :: state()
-  def new, do: %{schema_version: @schema_version, delegations: %{}, events: []}
+  def new, do: %{schema_version: @schema_version, enforcement: :manual, delegations: %{}, events: []}
+
+  @doc "Returns whether worker admission must consume responsibility state."
+  @spec enforced?(state()) :: boolean()
+  def enforced?(%{enforcement: :enforced}), do: true
+  def enforced?(_state), do: false
+
+  @doc "Activates machine-enforced responsibility admission after the graph is proven."
+  @spec activate(state(), non_neg_integer()) :: {:ok, state(), :activated | :already_activated} | {:error, term()}
+  def activate(state, now_ms) when is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_state(state) do
+      if enforced?(state) do
+        {:ok, state, :already_activated}
+      else
+        {:ok,
+         state
+         |> Map.put(:enforcement, :enforced)
+         |> append_event(:enforcement_activated, nil, now_ms, %{}), :activated}
+      end
+    end
+  end
+
+  def activate(_state, _now_ms), do: {:error, :invalid_activation}
 
   @doc "Validates graph structure and all active authority invariants."
   @spec validate(state()) :: :ok | {:error, :invalid_state}
@@ -52,7 +75,13 @@ defmodule SymphonyElixir.ResponsibilityGraph do
           |> Enum.group_by(& &1.parent_delegation_id, & &1.id)
           |> Map.new(fn {parent_id, children} -> {parent_id, Enum.sort(children)} end)
 
-        %{schema_version: @schema_version, delegations: delegations, edges: edges, events: state.events}
+        %{
+          schema_version: @schema_version,
+          enforcement: Map.get(state, :enforcement, :manual),
+          delegations: delegations,
+          edges: edges,
+          events: state.events
+        }
 
       {:error, :invalid_state} = error ->
         error
@@ -125,6 +154,92 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   end
 
   def heartbeat(_state, _delegation_id, _now_ms), do: {:error, :invalid_heartbeat}
+
+  @doc "Finds the unique active responsible delegation for an issue scope."
+  @spec admission_delegation(state(), String.t(), String.t() | nil, String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def admission_delegation(state, issue_id, identifier, repository)
+      when is_binary(issue_id) and is_binary(repository) do
+    with :ok <- validate_state(state) do
+      issue_keys = Enum.filter([issue_id, identifier], &present_string?/1)
+
+      candidates =
+        state.delegations
+        |> Map.values()
+        |> Enum.filter(fn delegation ->
+          delegation.status == :active and delegation.role == :responsible and
+            delegation.scope.repository == repository and
+            delegation.scope.issue_id in issue_keys
+        end)
+        |> Enum.sort_by(& &1.id)
+
+      case candidates do
+        [delegation] -> {:ok, delegation}
+        [] -> {:error, :responsible_delegation_missing}
+        delegations -> {:error, {:ambiguous_responsible_delegation, Enum.map(delegations, & &1.id)}}
+      end
+    end
+  end
+
+  def admission_delegation(_state, _issue_id, _identifier, _repository),
+    do: {:error, :invalid_admission_scope}
+
+  @doc "Binds one HGS-294 runtime lease to an active responsible delegation."
+  @spec bind_runtime_lease(state(), String.t(), map(), non_neg_integer()) ::
+          {:ok, state()} | {:error, term()}
+  def bind_runtime_lease(state, delegation_id, runtime_lease, now_ms)
+      when is_binary(delegation_id) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_state(state),
+         {:ok, delegation} <- fetch_delegation(state, delegation_id),
+         :ok <- active_delegation(delegation),
+         true <- delegation.role == :responsible,
+         :ok <- validate_runtime_lease(runtime_lease),
+         :ok <- runtime_lease_matches_scope?(delegation, runtime_lease),
+         :ok <- runtime_lease_available?(delegation, runtime_lease) do
+      updated = %{delegation | runtime_lease: runtime_lease, last_heartbeat_at: now_ms}
+
+      {:ok,
+       state
+       |> put_in([:delegations, delegation_id], updated)
+       |> append_event(:runtime_lease_bound, delegation_id, now_ms, %{})}
+    else
+      false -> {:error, :delegation_not_responsible}
+      {:error, _reason} = error -> error
+      _ -> {:error, :invalid_runtime_lease}
+    end
+  end
+
+  def bind_runtime_lease(_state, _delegation_id, _runtime_lease, _now_ms),
+    do: {:error, :invalid_runtime_lease_binding}
+
+  @doc "Releases an active delegation's runtime lease after a worker exits."
+  @spec release_runtime_lease(state(), String.t(), map(), non_neg_integer()) ::
+          {:ok, state(), :released | :already_released} | {:error, term()}
+  def release_runtime_lease(state, delegation_id, runtime_lease, now_ms)
+      when is_binary(delegation_id) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_state(state),
+         {:ok, delegation} <- fetch_delegation(state, delegation_id),
+         :ok <- active_delegation(delegation) do
+      case delegation.runtime_lease do
+        nil ->
+          {:ok, state, :already_released}
+
+        ^runtime_lease ->
+          updated = %{delegation | runtime_lease: nil, last_heartbeat_at: now_ms}
+
+          {:ok,
+           state
+           |> put_in([:delegations, delegation_id], updated)
+           |> append_event(:runtime_lease_released, delegation_id, now_ms, %{}), :released}
+
+        _other ->
+          {:error, :runtime_lease_conflict}
+      end
+    end
+  end
+
+  def release_runtime_lease(_state, _delegation_id, _runtime_lease, _now_ms),
+    do: {:error, :invalid_runtime_lease_release}
 
   @doc "Marks active delegations expired when their bounded lease has elapsed."
   @spec reconcile(state(), non_neg_integer()) :: {:ok, state(), map()} | {:error, term()}
@@ -380,9 +495,10 @@ defmodule SymphonyElixir.ResponsibilityGraph do
     %{delegation_ids: ids, execution_leases: leases}
   end
 
-  defp validate_state(%{schema_version: @schema_version, delegations: delegations, events: events})
+  defp validate_state(%{schema_version: @schema_version, delegations: delegations, events: events} = state)
        when is_map(delegations) and is_list(events) do
-    if Enum.all?(delegations, fn {id, delegation} -> valid_delegation?(id, delegation) end) and
+    if Map.get(state, :enforcement, :manual) in [:manual, :enforced] and
+         Enum.all?(delegations, fn {id, delegation} -> valid_delegation?(id, delegation) end) and
          Enum.all?(events, &is_map/1) and
          valid_parent_links?(delegations) and
          valid_scope_invariants?(delegations) do
@@ -733,11 +849,13 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   defp valid_budget_input(_budget), do: {:error, :invalid_budget}
   defp valid_budget?(budget), do: valid_budget_input(budget) == :ok
 
+  defp valid_runtime_lease_for_role?(:responsible, nil), do: true
   defp valid_runtime_lease_for_role?(:responsible, lease), do: valid_runtime_lease(lease) == :ok
   defp valid_runtime_lease_for_role?(:reviewer, lease), do: valid_runtime_lease(lease) == :ok
   defp valid_runtime_lease_for_role?(_role, nil), do: true
   defp valid_runtime_lease_for_role?(_role, lease), do: valid_runtime_lease(lease) == :ok
 
+  defp validate_runtime_lease_for_role?(:responsible, nil), do: :ok
   defp validate_runtime_lease_for_role?(:responsible, lease), do: validate_runtime_lease(lease)
   defp validate_runtime_lease_for_role?(:reviewer, lease), do: validate_runtime_lease(lease)
   defp validate_runtime_lease_for_role?(_role, nil), do: :ok
@@ -752,6 +870,10 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   defp validate_runtime_lease(_lease), do: {:error, :invalid_runtime_lease}
 
   defp valid_runtime_lease(lease), do: validate_runtime_lease(lease)
+
+  defp runtime_lease_available?(%{runtime_lease: nil}, _runtime_lease), do: :ok
+  defp runtime_lease_available?(%{runtime_lease: runtime_lease}, runtime_lease), do: :ok
+  defp runtime_lease_available?(_delegation, _runtime_lease), do: {:error, :runtime_lease_conflict}
 
   defp validate_reconciled_runtime_lease(%{role: role}, nil) when role not in [:responsible, :reviewer], do: :ok
   defp validate_reconciled_runtime_lease(_delegation, lease), do: validate_runtime_lease(lease)

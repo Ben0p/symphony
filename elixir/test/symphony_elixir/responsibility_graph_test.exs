@@ -173,6 +173,29 @@ defmodule SymphonyElixir.ResponsibilityGraphTest do
     assert token == %{issue_id: "HGS-300", generation: 1}
   end
 
+  test "activates enforced admission and binds then releases the runtime lease" do
+    {:ok, graph, :activated} = ResponsibilityGraph.activate(ResponsibilityGraph.new(), 0)
+    assert ResponsibilityGraph.enforced?(graph)
+
+    {:ok, graph, _owner} = ResponsibilityGraph.delegate(graph, delegation("owner", :accountable), 1)
+
+    {:ok, graph, _worker} =
+      ResponsibilityGraph.delegate(
+        graph,
+        delegation("worker", :responsible, parent_delegation_id: "owner"),
+        2
+      )
+
+    assert {:ok, worker} = ResponsibilityGraph.admission_delegation(graph, "HGS-300", "HG-300", "orchestrator")
+
+    lease = runtime_lease()
+    assert {:ok, bound} = ResponsibilityGraph.bind_runtime_lease(graph, worker.id, lease, 3)
+    assert bound.delegations["worker"].runtime_lease == lease
+
+    assert {:ok, released, :released} = ResponsibilityGraph.release_runtime_lease(bound, "worker", lease, 4)
+    assert released.delegations["worker"].runtime_lease == nil
+  end
+
   test "restart blocks delegations and reconciliation restores only the same runtime lease" do
     {:ok, graph, _owner} = ResponsibilityGraph.delegate(ResponsibilityGraph.new(), delegation("owner", :accountable), 0)
     {:ok, graph1, _} = ResponsibilityGraph.delegate(graph, delegation("worker", :responsible, parent_delegation_id: "owner", runtime_lease: runtime_lease()), 1)

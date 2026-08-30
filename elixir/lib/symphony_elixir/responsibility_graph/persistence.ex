@@ -12,6 +12,7 @@ defmodule SymphonyElixir.ResponsibilityGraph.Persistence do
   @schema_version 1
   @roles [:accountable, :responsible, :reviewer, :consulted, :observer]
   @statuses [:active, :blocked, :handed_off, :revoked, :failed, :completed, :expired]
+  @enforcements [:manual, :enforced]
   @actions [:read, :observe, :delegate, :reconcile, :edit, :commit, :push, :state_mutation, :cleanup, :review, :report]
   @efforts [:none, :minimal, :low, :medium, :high, :xhigh, :max, :ultra]
   @classes [:routine_engineering, :coordination, :read_only, :exception]
@@ -57,6 +58,7 @@ defmodule SymphonyElixir.ResponsibilityGraph.Persistence do
   defp encode_state(state) do
     Jason.encode(%{
       "schema_version" => @schema_version,
+      "enforcement" => Atom.to_string(Map.get(state, :enforcement, :manual)),
       "delegations" => Map.new(state.delegations, fn {id, delegation} -> {id, encode_delegation(delegation)} end),
       "events" => Enum.map(state.events, &encode_value/1)
     })
@@ -137,10 +139,17 @@ defmodule SymphonyElixir.ResponsibilityGraph.Persistence do
 
   defp encode_value(value), do: inspect(value, limit: :infinity)
 
-  defp decode_state(%{"schema_version" => @schema_version, "delegations" => delegations, "events" => events})
+  defp decode_state(%{"schema_version" => @schema_version, "delegations" => delegations, "events" => events} = payload)
        when is_map(delegations) and is_list(events) do
-    with {:ok, decoded_delegations} <- decode_map(delegations, &decode_delegation/1) do
-      {:ok, %{schema_version: @schema_version, delegations: decoded_delegations, events: events}}
+    with {:ok, enforcement} <- decode_atom(Map.get(payload, "enforcement", "manual"), @enforcements),
+         {:ok, decoded_delegations} <- decode_map(delegations, &decode_delegation/1) do
+      {:ok,
+       %{
+         schema_version: @schema_version,
+         enforcement: enforcement,
+         delegations: decoded_delegations,
+         events: events
+       }}
     end
   end
 
