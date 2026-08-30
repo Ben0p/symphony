@@ -37,7 +37,9 @@ binding so a bounded retry can receive a fresh generation.
 
 The orchestrator persists the graph as a versioned, sanitized JSON snapshot at
 `responsibility-graph.json` beside the execution-fence snapshot. On restart,
-active delegations are blocked until their runtime lease is explicitly
-reconciled. The orchestrator exposes only a read-only graph projection for
+delegations already bound to a runtime lease are blocked until that lease is
+explicitly reconciled. Unbound responsible delegations remain active because
+no worker has owned them yet; first admission binds their fresh HGS-294
+generation. The orchestrator exposes only a read-only graph projection for
 operations surfaces; delegation mutations remain explicit API calls with
 typed validation.

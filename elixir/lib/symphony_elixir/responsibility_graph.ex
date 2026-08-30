@@ -431,13 +431,14 @@ defmodule SymphonyElixir.ResponsibilityGraph do
     end
   end
 
-  @doc "Blocks live delegations after restart until HGS-294 ownership is reconciled."
+  @doc "Blocks live delegations after restart unless they are unbound responsible delegations awaiting first admission."
   @spec mark_unreconciled_after_restart(state()) :: {:ok, state()} | {:error, :invalid_state}
   def mark_unreconciled_after_restart(state) do
     with :ok <- validate_state(state) do
       {delegations, events} =
         Enum.reduce(state.delegations, {state.delegations, state.events}, fn {id, delegation}, {acc, event_acc} ->
-          if delegation.status == :active do
+          if delegation.status == :active and
+               (delegation.role != :responsible or not is_nil(delegation.runtime_lease)) do
             updated = %{delegation | status: :blocked, blocked_on: :restart_reconciliation}
             {Map.put(acc, id, updated), [%{type: :restart_blocked, delegation_id: id} | event_acc]}
           else
