@@ -62,6 +62,60 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
     refute Map.has_key?(session, :closure)
   end
 
+  test "matching worker runtime information persists its exact head" do
+    admission = admission()
+    {:ok, fence_state, token} = ExecutionFence.admit(ExecutionFence.new(), admission, 100)
+    {:ok, fence_state, :registered} = ExecutionFence.register(fence_state, token, :worker, session(), 100)
+
+    entry = %{
+      execution_token: token,
+      execution_session_id: "worker-1",
+      worker_host: nil,
+      workspace_path: admission.worktree,
+      accepted_head: nil
+    }
+
+    state = %Orchestrator.State{
+      execution_fence: fence_state,
+      running: %{"HGS-294" => entry}
+    }
+
+    runtime_info = %{
+      execution_token: token,
+      execution_session_id: "worker-1",
+      worker_host: nil,
+      workspace_path: admission.worktree,
+      head: "def456"
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, "HGS-294", runtime_info},
+               state
+             )
+
+    assert updated_state.running["HGS-294"].accepted_head == "def456"
+    assert updated_state.execution_fence.sessions["worker-1"].head == "def456"
+  end
+
+  test "runtime information from another generation is ignored" do
+    admission = admission()
+    {:ok, fence_state, token} = ExecutionFence.admit(ExecutionFence.new(), admission, 100)
+    {:ok, fence_state, :registered} = ExecutionFence.register(fence_state, token, :worker, session(), 100)
+
+    entry = %{execution_token: token, execution_session_id: "worker-1", accepted_head: nil}
+    state = %Orchestrator.State{execution_fence: fence_state, running: %{"HGS-294" => entry}}
+
+    stale_info = %{
+      execution_token: %{issue_id: "HGS-294", generation: 99},
+      execution_session_id: "worker-1",
+      head: "def456"
+    }
+
+    assert {:noreply, ^state} =
+             Orchestrator.handle_info({:worker_runtime_info, "HGS-294", stale_info}, state)
+  end
+
   test "reconciliation call applies blocked ownership and returns its evidence" do
     admission = admission()
     {:ok, fence_state, token} = ExecutionFence.admit(ExecutionFence.new(), admission, 100)

@@ -7,7 +7,12 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
   @issue "HGS-294"
 
   setup do
-    root = Path.join(System.tmp_dir!(), "symphony-execution-fence-#{System.unique_integer([:positive])}")
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-execution-fence-#{System.unique_integer([:positive])}"
+      )
+
     path = Path.join(root, "state.json")
     File.mkdir_p!(root)
 
@@ -17,8 +22,12 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
 
   test "persists and rehydrates the complete generation and lease registry", %{path: path} do
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1"), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :reviewer, session("reviewer-1"), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1"), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :reviewer, session("reviewer-1"), 100)
 
     assert :ok = Persistence.save(path, state)
     assert {:ok, restored} = Persistence.load(path)
@@ -43,6 +52,16 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
     assert :ok = Persistence.save(path, next_state)
     assert {:ok, restored} = Persistence.load(path)
     assert Map.has_key?(restored.executions, "next")
+  end
+
+  test "recovers a valid snapshot left beside a missing primary file", %{path: path} do
+    {:ok, state, _token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    assert :ok = Persistence.save(path, state)
+
+    recovery_path = "#{path}.previous-recovery"
+    assert :ok = File.rename(path, recovery_path)
+
+    assert {:ok, ^state} = Persistence.load(path)
   end
 
   defp admission(issue_id \\ @issue) do

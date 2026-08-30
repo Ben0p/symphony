@@ -18,17 +18,10 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
   def load(path) when is_binary(path) do
     case File.read(path) do
       {:ok, contents} ->
-        with {:ok, payload} <- Jason.decode(contents),
-             {:ok, state} <- decode_state(payload),
-             :ok <- ExecutionFence.validate(state) do
-          {:ok, state}
-        else
-          {:error, reason} -> {:error, {:invalid_snapshot, reason}}
-          other -> {:error, {:invalid_snapshot, other}}
-        end
+        decode_snapshot(contents)
 
       {:error, :enoent} ->
-        :missing
+        recover_missing_snapshot(path)
 
       {:error, reason} ->
         {:error, {:read_failed, reason}}
@@ -51,10 +44,72 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
   defp encode_state(state) do
     Jason.encode(%{
       "schema_version" => @schema_version,
-      "executions" => Map.new(state.executions, fn {issue_id, execution} -> {issue_id, encode_execution(execution)} end),
-      "sessions" => Map.new(state.sessions, fn {session_id, session} -> {session_id, encode_lease(session)} end),
+      "executions" =>
+        Map.new(state.executions, fn {issue_id, execution} ->
+          {issue_id, encode_execution(execution)}
+        end),
+      "sessions" =>
+        Map.new(state.sessions, fn {session_id, session} ->
+          {session_id, encode_lease(session)}
+        end),
       "history" => Enum.map(state.history, &encode_execution/1)
     })
+  end
+
+  defp decode_snapshot(contents) do
+    with {:ok, payload} <- Jason.decode(contents),
+         {:ok, state} <- decode_state(payload),
+         :ok <- ExecutionFence.validate(state) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:error, {:invalid_snapshot, reason}}
+      other -> {:error, {:invalid_snapshot, other}}
+    end
+  end
+
+  defp recover_missing_snapshot(path) do
+    case recovery_candidates(path) do
+      [] ->
+        :missing
+
+      [candidate | _] ->
+        case File.read(candidate) do
+          {:ok, contents} ->
+            case decode_snapshot(contents) do
+              {:ok, state} -> {:ok, state}
+              {:error, reason} -> {:error, {:invalid_recovery_snapshot, candidate, reason}}
+            end
+
+          {:error, reason} ->
+            {:error, {:recovery_read_failed, candidate, reason}}
+        end
+    end
+  end
+
+  defp recovery_candidates(path) do
+    directory = Path.dirname(path)
+    basename = Path.basename(path)
+
+    case File.ls(directory) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(fn entry ->
+          String.starts_with?(entry, basename <> ".tmp-") or
+            String.starts_with?(entry, basename <> ".previous-")
+        end)
+        |> Enum.map(&Path.join(directory, &1))
+        |> Enum.sort_by(&recovery_mtime/1, :desc)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp recovery_mtime(path) do
+    case File.stat(path, time: :posix) do
+      {:ok, %{mtime: mtime}} -> mtime
+      _ -> 0
+    end
   end
 
   defp encode_execution(execution) do
@@ -105,12 +160,23 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
     }
   end
 
-  defp decode_state(%{"schema_version" => @schema_version, "executions" => executions, "sessions" => sessions, "history" => history})
+  defp decode_state(%{
+         "schema_version" => @schema_version,
+         "executions" => executions,
+         "sessions" => sessions,
+         "history" => history
+       })
        when is_map(executions) and is_map(sessions) and is_list(history) do
     with {:ok, decoded_executions} <- decode_map(executions, &decode_execution/1),
          {:ok, decoded_sessions} <- decode_map(sessions, &decode_lease/1),
          {:ok, decoded_history} <- decode_list(history, &decode_execution/1) do
-      {:ok, %{schema_version: @schema_version, executions: decoded_executions, sessions: decoded_sessions, history: decoded_history}}
+      {:ok,
+       %{
+         schema_version: @schema_version,
+         executions: decoded_executions,
+         sessions: decoded_sessions,
+         history: decoded_history
+       }}
     end
   end
 
@@ -123,7 +189,8 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
          {:ok, branch} <- required(payload, "branch"),
          {:ok, worktree} <- required(payload, "worktree"),
          {:ok, status} <- decode_status(Map.get(payload, "status"), [:active, :terminal]),
-         {:ok, ownership} <- decode_status(Map.get(payload, "ownership"), [:reconciled, :unknown, :contradictory]),
+         {:ok, ownership} <-
+           decode_status(Map.get(payload, "ownership"), [:reconciled, :unknown, :contradictory]),
          {:ok, leases} <- decode_map(Map.get(payload, "leases"), &decode_lease/1),
          {:ok, terminal} <- decode_terminal(Map.get(payload, "terminal")),
          {:ok, cleanup} <- decode_status(Map.get(payload, "cleanup"), [:pending, :cleaned]),
@@ -157,7 +224,8 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
          {:ok, process_id} <- required(payload, "process_id"),
          {:ok, branch} <- required(payload, "branch"),
          {:ok, worktree} <- required(payload, "worktree"),
-         {:ok, status} <- decode_status(Map.get(payload, "status"), [:active, :released, :expired]),
+         {:ok, status} <-
+           decode_status(Map.get(payload, "status"), [:active, :released, :expired]),
          {:ok, registered_at_ms} <- required(payload, "registered_at_ms"),
          {:ok, last_heartbeat_at} <- required(payload, "last_heartbeat_at"),
          {:ok, linear_state} <- required(payload, "linear_state"),
@@ -289,12 +357,41 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
         :ok
 
       {:error, :eexist} ->
-        with :ok <- File.rm(path), :ok <- File.rename(temporary_path, path) do
-          :ok
-        end
+        replace_existing_file(temporary_path, path)
 
       {:error, reason} ->
         {:error, {:rename_failed, reason}}
     end
+  end
+
+  defp replace_existing_file(temporary_path, path) do
+    backup_path = "#{path}.previous-#{System.unique_integer([:positive])}"
+
+    with :ok <- File.rename(path, backup_path),
+         :ok <- File.rename(temporary_path, path) do
+      cleanup_recovery_candidates(path)
+      :ok
+    else
+      {:error, reason} ->
+        restore_previous_snapshot(path, backup_path, reason)
+    end
+  end
+
+  defp restore_previous_snapshot(path, backup_path, reason) do
+    _ = File.rm(path)
+
+    case File.rename(backup_path, path) do
+      :ok ->
+        {:error, {:replace_failed, reason}}
+
+      {:error, restore_reason} ->
+        {:error, {:replace_failed, reason, {:restore_failed, restore_reason}}}
+    end
+  end
+
+  defp cleanup_recovery_candidates(path) do
+    path
+    |> recovery_candidates()
+    |> Enum.each(fn candidate -> _ = File.rm(candidate) end)
   end
 end

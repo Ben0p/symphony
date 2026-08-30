@@ -239,13 +239,21 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        updated_running_entry =
-          running_entry
-          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+        if runtime_info_belongs_to_entry?(runtime_info, running_entry) do
+          {state, observed_head} = observe_worker_runtime_head(state, running_entry, runtime_info)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          updated_running_entry =
+            running_entry
+            |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+            |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+            |> maybe_put_runtime_value(:accepted_head, observed_head)
+
+          notify_dashboard()
+          {:noreply, %{state | running: Map.put(state.running, issue_id, updated_running_entry)}}
+        else
+          Logger.warning("Ignoring stale worker runtime information for issue_id=#{issue_id}")
+          {:noreply, state}
+        end
     end
   end
 
@@ -1212,6 +1220,8 @@ defmodule SymphonyElixir.Orchestrator do
            AgentRunner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
+             execution_token: token,
+             execution_session_id: session_id,
              execution_fence_guard: fn ->
                GenServer.call(recipient, {:execution_fence_authorize, token, :state_mutation})
              end
@@ -1286,7 +1296,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host)
        when is_binary(issue_id) do
-    now_ms = max(0, System.monotonic_time(:millisecond))
+    now_ms = execution_fence_now_ms()
     attrs = execution_attributes(issue, worker_host)
 
     with {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),
@@ -1381,32 +1391,23 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_fenced_workspace_or_legacy(%State{} = state, issue_or_identifier, %{execution_token: token} = entry) do
     case Map.get(entry, :accepted_head) do
       head when is_binary(head) and head != "" and head != "unobserved" ->
-        now_ms = execution_fence_now_ms()
+        case execution_workspace_path(state.execution_fence, token, entry) do
+          {:ok, workspace_path} ->
+            case Workspace.current_head(workspace_path, Map.get(entry, :worker_host)) do
+              {:ok, ^head} ->
+                cleanup_fenced_execution(state, issue_or_identifier, Map.put(entry, :workspace_path, workspace_path), token, head)
 
-        case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
-          {:ok, fence_state, :cleaned} ->
-            case persist_execution_fence(state, fence_state) do
-              {:ok, next_state} ->
-                cleanup_issue_workspace(issue_or_identifier, entry)
-                next_state
-
-              {:error, persist_reason} ->
-                Logger.error("Execution-fence cleanup was not persisted: #{inspect(persist_reason)}")
+              {:ok, observed_head} ->
+                Logger.warning("Preserving fenced workspace after head divergence expected=#{head} observed=#{observed_head}")
                 state
-            end
 
-          {:ok, fence_state, :already_cleaned} ->
-            case persist_execution_fence(state, fence_state) do
-              {:ok, next_state} ->
-                next_state
-
-              {:error, persist_reason} ->
-                Logger.error("Execution-fence cleanup state was not persisted: #{inspect(persist_reason)}")
+              {:error, reason} ->
+                Logger.warning("Preserving fenced workspace because exact head could not be observed: #{inspect(reason)}")
                 state
             end
 
           {:error, reason} ->
-            Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
+            Logger.warning("Preserving fenced workspace because its path could not be resolved: #{inspect(reason)}")
             state
         end
 
@@ -1419,6 +1420,91 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_fenced_workspace_or_legacy(state, issue_or_identifier, entry) do
     cleanup_issue_workspace(issue_or_identifier, entry)
     state
+  end
+
+  defp cleanup_fenced_execution(state, issue_or_identifier, entry, token, head) do
+    now_ms = execution_fence_now_ms()
+
+    case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
+      {:ok, fence_state, :cleaned} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            cleanup_issue_workspace(issue_or_identifier, entry)
+            next_state
+
+          {:error, persist_reason} ->
+            Logger.error("Execution-fence cleanup was not persisted: #{inspect(persist_reason)}")
+            state
+        end
+
+      {:ok, fence_state, :already_cleaned} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, persist_reason} ->
+            Logger.error("Execution-fence cleanup state was not persisted: #{inspect(persist_reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp execution_workspace_path(fence_state, %{issue_id: issue_id, generation: generation}, entry) do
+    case Map.get(entry, :workspace_path) do
+      path when is_binary(path) and path != "" ->
+        {:ok, path}
+
+      _ ->
+        case Map.get(fence_state.executions, issue_id) do
+          %{generation: ^generation, worktree: worktree} when is_binary(worktree) -> {:ok, worktree}
+          _ -> {:error, :unknown_execution_workspace}
+        end
+    end
+  end
+
+  defp execution_workspace_path(_fence_state, _token, _entry),
+    do: {:error, :invalid_execution_token}
+
+  defp runtime_info_belongs_to_entry?(runtime_info, entry) do
+    Map.get(runtime_info, :execution_token) == Map.get(entry, :execution_token) and
+      Map.get(runtime_info, :execution_session_id) == Map.get(entry, :execution_session_id)
+  end
+
+  defp observe_worker_runtime_head(state, entry, runtime_info) do
+    case Map.get(runtime_info, :head) do
+      head when is_binary(head) ->
+        token = Map.get(entry, :execution_token)
+        session_id = Map.get(entry, :execution_session_id)
+
+        case ExecutionFence.observe_session_head(
+               state.execution_fence,
+               token,
+               session_id,
+               head,
+               execution_fence_now_ms()
+             ) do
+          {:ok, fence_state} ->
+            case persist_execution_fence(state, fence_state) do
+              {:ok, next_state} ->
+                {next_state, head}
+
+              {:error, reason} ->
+                Logger.error("Worker head observation was not persisted: #{inspect(reason)}")
+                {state, nil}
+            end
+
+          {:error, reason} ->
+            Logger.warning("Worker head observation rejected: #{inspect(reason)}")
+            {state, nil}
+        end
+
+      _ ->
+        {state, nil}
+    end
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)

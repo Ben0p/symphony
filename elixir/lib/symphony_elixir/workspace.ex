@@ -37,6 +37,50 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc "Reads the exact Git commit currently checked out in a workspace."
+  @spec current_head(Path.t()) :: {:ok, String.t()} | {:error, term()}
+  @spec current_head(Path.t(), worker_host()) :: {:ok, String.t()} | {:error, term()}
+  def current_head(workspace, worker_host \\ nil) do
+    cond do
+      is_binary(workspace) and is_nil(worker_host) -> current_local_head(workspace)
+      is_binary(workspace) and is_binary(worker_host) -> current_remote_head(workspace, worker_host)
+      true -> {:error, :invalid_workspace}
+    end
+  end
+
+  defp current_local_head(workspace) do
+    with :ok <- validate_workspace_path(workspace, nil) do
+      try do
+        case System.cmd("git", ["rev-parse", "--verify", "HEAD^{commit}"],
+               cd: workspace,
+               stderr_to_stdout: true
+             ) do
+          {output, 0} -> parse_git_head(output)
+          {_output, status} -> {:error, {:git_head_unavailable, status}}
+        end
+      rescue
+        error in [ArgumentError, ErlangError, File.Error] ->
+          {:error, {:git_head_unavailable, error}}
+      end
+    end
+  end
+
+  defp current_remote_head(workspace, worker_host) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, {output, 0}} <-
+           run_remote_command(
+             worker_host,
+             remote_shell_assign("workspace", workspace) <>
+               "\ncd \"$workspace\" && git rev-parse --verify HEAD^{commit}",
+             Config.settings!().hooks.timeout_ms
+           ) do
+      parse_git_head(output)
+    else
+      {:ok, {_output, status}} -> {:error, {:git_head_unavailable, status}}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp ensure_workspace(workspace, nil) do
     cond do
       File.dir?(workspace) ->
@@ -633,6 +677,16 @@ defmodule SymphonyElixir.Workspace do
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
+    end
+  end
+
+  defp parse_git_head(output) do
+    head = output |> IO.iodata_to_binary() |> String.trim()
+
+    if Regex.match?(~r/\A[0-9a-f]{40,64}\z/, head) do
+      {:ok, head}
+    else
+      {:error, :invalid_git_head}
     end
   end
 

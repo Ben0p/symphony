@@ -19,25 +19,57 @@ defmodule SymphonyElixir.ExecutionFenceTest do
 
     assert state.executions[@issue].generation == 1
     assert map_size(state.executions[@issue].leases) == 2
-    assert {:ok, %{generation: 1, action: :commit}} = ExecutionFence.authorize(state, token, :commit)
+
+    assert {:ok, %{generation: 1, action: :commit}} =
+             ExecutionFence.authorize(state, token, :commit)
+  end
+
+  test "persists an exact head observation on the generation-bound worker lease" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    assert {:ok, state} =
+             ExecutionFence.observe_session_head(state, token, "worker-1", "def456", 110)
+
+    assert state.executions[@issue].leases["worker-1"].head == "def456"
+    assert state.sessions["worker-1"].head == "def456"
+    assert state.sessions["worker-1"].last_heartbeat_at == 110
   end
 
   test "terminal fencing rejects stale mutation and waits for every lease before cleanup" do
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :reviewer, session("reviewer-1", 100), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :reviewer, session("reviewer-1", 100), 100)
 
     {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 200)
     assert {:ok, ^state, :already_fenced} = ExecutionFence.fence(state, token, terminal(), 201)
     assert {:error, :terminal_fenced} = ExecutionFence.authorize(state, token, :push)
-    assert {:error, {:leases_active, ["reviewer-1", "worker-1"]}} = ExecutionFence.cleanup(state, token, "abc123", 201)
+
+    assert {:error, {:leases_active, ["reviewer-1", "worker-1"]}} =
+             ExecutionFence.cleanup(state, token, "abc123", 201)
 
     {:ok, state, :released} = ExecutionFence.release(state, token, "worker-1", :worker_exit)
-    assert {:error, {:leases_active, ["reviewer-1"]}} = ExecutionFence.cleanup(state, token, "abc123", 202)
+
+    assert {:error, {:leases_active, ["reviewer-1"]}} =
+             ExecutionFence.cleanup(state, token, "abc123", 202)
+
     {:ok, state, :released} = ExecutionFence.release(state, token, "reviewer-1", :review_complete)
 
     assert {:ok, state, :cleaned} = ExecutionFence.cleanup(state, token, "abc123", 203)
     assert {:ok, ^state, :already_cleaned} = ExecutionFence.cleanup(state, token, "abc123", 204)
+  end
+
+  test "cleanup rejects a head that diverged after terminal fencing" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 110)
+
+    assert {:error, :head_diverged} = ExecutionFence.cleanup(state, token, "def456", 120)
   end
 
   test "stale generations fail closed and cannot clean a newer generation" do
@@ -49,7 +81,13 @@ defmodule SymphonyElixir.ExecutionFenceTest do
     assert next_token.generation == 2
 
     {:ok, state, :registered} =
-      ExecutionFence.register(state, next_token, :worker, Map.put(session("worker-2", 130), :generation, 2), 130)
+      ExecutionFence.register(
+        state,
+        next_token,
+        :worker,
+        Map.put(session("worker-2", 130), :generation, 2),
+        130
+      )
 
     assert {:error, :stale_generation} = ExecutionFence.authorize(state, token, :commit)
     assert {:error, :stale_generation} = ExecutionFence.cleanup(state, token, "abc123", 131)
@@ -58,7 +96,10 @@ defmodule SymphonyElixir.ExecutionFenceTest do
 
   test "a released generation is quiescent and the next admission gets a new generation" do
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
     {:ok, state, :released} = ExecutionFence.release(state, token, "worker-1", :worker_exit)
 
     assert {:ok, state, next_token} = ExecutionFence.admit(state, admission(), 110)
@@ -68,7 +109,9 @@ defmodule SymphonyElixir.ExecutionFenceTest do
 
   test "reconciliation blocks unknown and contradictory ownership, then expires a missing lease" do
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
 
     unknown = Map.put(session("unknown-1", 100), :issue_id, @issue)
 
@@ -88,7 +131,10 @@ defmodule SymphonyElixir.ExecutionFenceTest do
 
   test "terminal state dominates a stale non-terminal session observation" do
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
     {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 110)
 
     stale = session("worker-1", 111)
@@ -124,10 +170,31 @@ defmodule SymphonyElixir.ExecutionFenceTest do
              ExecutionFence.admit(malformed, admission(), 100)
 
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
-    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
 
     assert {:error, :invalid_session} = ExecutionFence.heartbeat(state, token, "worker-1", -1)
-    assert {:error, :invalid_session} = ExecutionFence.heartbeat(state, token, "worker-1", "later")
+
+    assert {:error, :invalid_session} =
+             ExecutionFence.heartbeat(state, token, "worker-1", "later")
+  end
+
+  test "state validation rejects a lease missing from the top-level registry" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    invalid = %{state | sessions: %{}}
+
+    assert {:error, :invalid_state} = ExecutionFence.validate(invalid)
+  end
+
+  test "state validation rejects malformed history" do
+    invalid = %{ExecutionFence.new() | history: [%{issue_id: "missing-execution-fields"}]}
+
+    assert {:error, :invalid_state} = ExecutionFence.validate(invalid)
   end
 
   defp admission do
