@@ -7,8 +7,19 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, ExecutionFence, StartupMaintenance, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    ExecutionFence,
+    ResponsibilityGraph,
+    StartupMaintenance,
+    StatusDashboard,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.ExecutionFence.Persistence
+  alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -46,6 +57,8 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       execution_fence: ExecutionFence.new(),
       execution_fence_path: nil,
+      responsibility_graph: ResponsibilityGraph.new(),
+      responsibility_graph_path: nil,
       stall_restarts: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
@@ -66,23 +79,33 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, config} ->
         case load_execution_fence(config.execution_fence.state_path) do
           {:ok, fence_state} ->
-            state = %State{
-              poll_interval_ms: config.polling.interval_ms,
-              max_concurrent_agents: config.agent.max_concurrent_agents,
-              next_poll_due_at_ms: nil,
-              poll_check_in_progress: false,
-              tick_timer_ref: nil,
-              tick_token: nil,
-              task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
-              execution_fence: fence_state,
-              execution_fence_path: config.execution_fence.state_path,
-              codex_totals: @empty_codex_totals,
-              codex_rate_limits: nil
-            }
+            graph_path = Config.responsibility_graph_state_path()
 
-            state = start_startup_maintenance(state, opts)
+            case load_responsibility_graph(graph_path) do
+              {:ok, responsibility_graph} ->
+                state = %State{
+                  poll_interval_ms: config.polling.interval_ms,
+                  max_concurrent_agents: config.agent.max_concurrent_agents,
+                  next_poll_due_at_ms: nil,
+                  poll_check_in_progress: false,
+                  tick_timer_ref: nil,
+                  tick_token: nil,
+                  task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+                  execution_fence: fence_state,
+                  execution_fence_path: config.execution_fence.state_path,
+                  responsibility_graph: responsibility_graph,
+                  responsibility_graph_path: graph_path,
+                  codex_totals: @empty_codex_totals,
+                  codex_rate_limits: nil
+                }
 
-            {:ok, state}
+                state = start_startup_maintenance(state, opts)
+
+                {:ok, state}
+
+              {:error, reason} ->
+                {:stop, {:responsibility_graph_unavailable, reason}}
+            end
 
           {:error, reason} ->
             {:stop, {:execution_fence_unavailable, reason}}
@@ -1920,6 +1943,121 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Returns the read-only responsibility/delegation projection."
+  @spec responsibility_snapshot() :: map() | :unavailable
+  def responsibility_snapshot, do: responsibility_snapshot(__MODULE__)
+
+  @spec responsibility_snapshot(GenServer.server()) :: map() | :unavailable
+  def responsibility_snapshot(server) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, :responsibility_snapshot)
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Registers a typed responsibility delegation and persists it."
+  @spec delegate_responsibility(map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def delegate_responsibility(attrs, now_ms), do: delegate_responsibility(__MODULE__, attrs, now_ms)
+
+  @spec delegate_responsibility(GenServer.server(), map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def delegate_responsibility(server, attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_delegate, attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Renews a responsibility lease heartbeat."
+  @spec heartbeat_responsibility(String.t(), non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def heartbeat_responsibility(delegation_id, now_ms),
+    do: heartbeat_responsibility(__MODULE__, delegation_id, now_ms)
+
+  @spec heartbeat_responsibility(GenServer.server(), String.t(), non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def heartbeat_responsibility(server, delegation_id, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_heartbeat, delegation_id, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Reconciles a restart-blocked delegation against its HGS-294 lease reference."
+  @spec reconcile_responsibility(String.t(), map() | nil, non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def reconcile_responsibility(delegation_id, runtime_lease, now_ms),
+    do: reconcile_responsibility(__MODULE__, delegation_id, runtime_lease, now_ms)
+
+  @spec reconcile_responsibility(GenServer.server(), String.t(), map() | nil, non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def reconcile_responsibility(server, delegation_id, runtime_lease, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_reconcile, delegation_id, runtime_lease, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Authorizes a graph action and its HGS-294 runtime lease together."
+  @spec authorize_responsibility(String.t(), atom()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def authorize_responsibility(delegation_id, action),
+    do: authorize_responsibility(__MODULE__, delegation_id, action)
+
+  @spec authorize_responsibility(GenServer.server(), String.t(), atom()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def authorize_responsibility(server, delegation_id, action) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_authorize, delegation_id, action})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Revokes a responsibility tree and fences its referenced HGS-294 generations."
+  @spec revoke_responsibility(String.t(), term(), map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def revoke_responsibility(delegation_id, reason, terminal_attrs, now_ms),
+    do: revoke_responsibility(__MODULE__, delegation_id, reason, terminal_attrs, now_ms)
+
+  @spec revoke_responsibility(GenServer.server(), String.t(), term(), map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def revoke_responsibility(server, delegation_id, reason, terminal_attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_revoke, delegation_id, reason, terminal_attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call({:execution_fence_authorize, token, action}, _from, %State{} = state) do
     {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
@@ -1998,6 +2136,97 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call(:responsibility_snapshot, _from, %State{} = state) do
+    {:reply, ResponsibilityGraph.snapshot(state.responsibility_graph), state}
+  end
+
+  def handle_call({:responsibility_delegate, attrs, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.delegate(state.responsibility_graph, attrs, now_ms) do
+      {:ok, graph_state, delegation} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, delegation}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:responsibility_heartbeat, delegation_id, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.heartbeat(state.responsibility_graph, delegation_id, now_ms) do
+      {:ok, graph_state} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, :persisted}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:responsibility_reconcile, delegation_id, runtime_lease, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.reconcile_delegation(
+           state.responsibility_graph,
+           delegation_id,
+           runtime_lease,
+           now_ms
+         ) do
+      {:ok, graph_state} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, :persisted}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:responsibility_authorize, delegation_id, action}, _from, %State{} = state) do
+    {:reply,
+     ResponsibilityGraph.authorize_with_execution_fence(
+       state.responsibility_graph,
+       delegation_id,
+       action,
+       state.execution_fence
+     ), state}
+  end
+
+  def handle_call(
+        {:responsibility_revoke, delegation_id, reason, terminal_attrs, now_ms},
+        _from,
+        %State{} = state
+      ) do
+    case ResponsibilityGraph.revoke_and_fence(
+           state.responsibility_graph,
+           state.execution_fence,
+           delegation_id,
+           reason,
+           terminal_attrs,
+           now_ms
+         ) do
+      {:ok, graph_state, fence_state, impact} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, fence_persisted_state} ->
+            case persist_responsibility_graph(fence_persisted_state, graph_state) do
+              {:ok, next_state} ->
+                {:reply, {:ok, impact}, next_state}
+
+              {:error, persist_reason} ->
+                {:reply, {:error, {:responsibility_persistence_failed, persist_reason}}, fence_persisted_state}
+            end
+
+          {:error, persist_reason} ->
+            {:reply, {:error, {:execution_fence_persistence_failed, persist_reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -2072,6 +2301,7 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        blocked: blocked,
        execution_fence: execution_fence_snapshot(state.execution_fence),
+       responsibility_graph: ResponsibilityGraph.snapshot(state.responsibility_graph),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        startup_maintenance: StartupMaintenance.snapshot(state.startup_maintenance),
@@ -2137,6 +2367,32 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp load_execution_fence(path), do: {:error, {:invalid_state_path, path}}
 
+  defp load_responsibility_graph(path) when is_binary(path) do
+    case ResponsibilityPersistence.load(path) do
+      :missing ->
+        graph_state = ResponsibilityGraph.new()
+
+        case ResponsibilityPersistence.save(path, graph_state) do
+          :ok -> {:ok, graph_state}
+          {:error, reason} -> {:error, {:initial_persistence_failed, reason}}
+        end
+
+      {:ok, graph_state} ->
+        with {:ok, restarted_state} <- ResponsibilityGraph.mark_unreconciled_after_restart(graph_state),
+             :ok <- ResponsibilityPersistence.save(path, restarted_state) do
+          {:ok, restarted_state}
+        else
+          {:error, reason} -> {:error, {:restart_reconciliation_persistence_failed, reason}}
+          other -> {:error, {:restart_reconciliation_persistence_failed, other}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp load_responsibility_graph(path), do: {:error, {:invalid_state_path, path}}
+
   defp persist_execution_fence(%State{execution_fence_path: nil} = state, fence_state) do
     {:ok, %{state | execution_fence: fence_state}}
   end
@@ -2150,6 +2406,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp persist_execution_fence(_state, _fence_state), do: {:error, :invalid_state_path}
+
+  defp persist_responsibility_graph(%State{responsibility_graph_path: nil} = state, graph_state) do
+    {:ok, %{state | responsibility_graph: graph_state}}
+  end
+
+  defp persist_responsibility_graph(%State{responsibility_graph_path: path} = state, graph_state)
+       when is_binary(path) do
+    case ResponsibilityPersistence.save(path, graph_state) do
+      :ok -> {:ok, %{state | responsibility_graph: graph_state}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_responsibility_graph(_state, _graph_state), do: {:error, :invalid_state_path}
 
   defp execution_fence_now_ms, do: max(0, System.system_time(:millisecond))
 
