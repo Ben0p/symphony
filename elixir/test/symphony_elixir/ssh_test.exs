@@ -2,6 +2,7 @@ defmodule SymphonyElixir.SSHTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.SSH
+  import SymphonyElixir.TestSupport, only: [path_env: 1, shell_path: 1, write_executable_script!: 2]
 
   test "run/3 keeps bracketed IPv6 host:port targets intact" do
     test_root = Path.join(System.tmp_dir!(), "symphony-ssh-ipv6-test-#{System.unique_integer([:positive])}")
@@ -116,7 +117,7 @@ defmodule SymphonyElixir.SSHTest do
 
     install_fake_ssh!(test_root, trace_file, """
     #!/bin/sh
-    printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
+    printf 'ARGV:%s\\n' "$*" >> "#{shell_path(trace_file)}"
     printf 'ready\\n'
     exit 0
     """)
@@ -144,7 +145,7 @@ defmodule SymphonyElixir.SSHTest do
 
     install_fake_ssh!(test_root, trace_file, """
     #!/bin/sh
-    printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
+    printf 'ARGV:%s\\n' "$*" >> "#{shell_path(trace_file)}"
     printf 'ready\\n'
     exit 0
     """)
@@ -165,21 +166,23 @@ defmodule SymphonyElixir.SSHTest do
   defp install_fake_ssh!(test_root, trace_file, script \\ nil) do
     fake_bin_dir = Path.join(test_root, "bin")
     fake_ssh = Path.join(fake_bin_dir, "ssh")
+    previous_shim = System.get_env("SYMPHONY_TEST_SSH_SHIM")
 
     File.mkdir_p!(fake_bin_dir)
 
-    File.write!(
+    write_executable_script!(
       fake_ssh,
       script ||
         """
         #!/bin/sh
-        printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
+        printf 'ARGV:%s\\n' "$*" >> "#{shell_path(trace_file)}"
         exit 0
         """
     )
 
-    File.chmod!(fake_ssh, 0o755)
-    System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
+    ExUnit.Callbacks.on_exit(fn -> restore_env("SYMPHONY_TEST_SSH_SHIM", previous_shim) end)
+    System.put_env("SYMPHONY_TEST_SSH_SHIM", shell_path(fake_ssh))
+    System.put_env("PATH", path_env([fake_bin_dir]))
   end
 
   defp wait_for_trace!(trace_file, attempts \\ 20)

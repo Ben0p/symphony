@@ -7,11 +7,27 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    ExecutionFence,
+    ResponsibilityGraph,
+    StartupMaintenance,
+    StatusDashboard,
+    Tracker,
+    Workspace
+  }
+
+  alias SymphonyElixir.ExecutionFence.Persistence
+  alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @execution_fence_lease_ttl_ms 300_000
+  # Terminal tracker states always dominate dynamic labels and local workflow
+  # configuration. A stale ready label must never re-admit completed work.
+  @mandatory_terminal_states ["closed", "cancelled", "canceled", "duplicate", "done"]
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -39,8 +55,14 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      execution_fence: ExecutionFence.new(),
+      execution_fence_path: nil,
+      responsibility_graph: ResponsibilityGraph.new(),
+      responsibility_graph_path: nil,
+      stall_restarts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      startup_maintenance: nil
     ]
   end
 
@@ -55,24 +77,39 @@ defmodule SymphonyElixir.Orchestrator do
   def init(opts) do
     case Config.settings() do
       {:ok, config} ->
-        now_ms = System.monotonic_time(:millisecond)
+        case load_execution_fence(config.execution_fence.state_path) do
+          {:ok, fence_state} ->
+            graph_path = Config.responsibility_graph_state_path()
 
-        state = %State{
-          poll_interval_ms: config.polling.interval_ms,
-          max_concurrent_agents: config.agent.max_concurrent_agents,
-          next_poll_due_at_ms: now_ms,
-          poll_check_in_progress: false,
-          tick_timer_ref: nil,
-          tick_token: nil,
-          task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
-          codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
-        }
+            case load_responsibility_graph(graph_path) do
+              {:ok, responsibility_graph} ->
+                state = %State{
+                  poll_interval_ms: config.polling.interval_ms,
+                  max_concurrent_agents: config.agent.max_concurrent_agents,
+                  next_poll_due_at_ms: nil,
+                  poll_check_in_progress: false,
+                  tick_timer_ref: nil,
+                  tick_token: nil,
+                  task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+                  execution_fence: fence_state,
+                  execution_fence_path: config.execution_fence.state_path,
+                  responsibility_graph: responsibility_graph,
+                  responsibility_graph_path: graph_path,
+                  codex_totals: @empty_codex_totals,
+                  codex_rate_limits: nil
+                }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+                state = start_startup_maintenance(state, opts)
 
-        {:ok, state}
+                {:ok, state}
+
+              {:error, reason} ->
+                {:stop, {:responsibility_graph_unavailable, reason}}
+            end
+
+          {:error, reason} ->
+            {:stop, {:execution_fence_unavailable, reason}}
+        end
 
       {:error, reason} ->
         {:stop, reason}
@@ -125,6 +162,53 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({:startup_maintenance_timeout, ref}, %{startup_maintenance: %{task_ref: ref}} = state)
+      when is_reference(ref) do
+    maintenance = state.startup_maintenance
+
+    if is_pid(maintenance[:task_pid]) and Process.alive?(maintenance.task_pid) do
+      Task.Supervisor.terminate_child(state.task_supervisor, maintenance.task_pid)
+    end
+
+    Logger.warning("Startup terminal workspace cleanup timed out; scheduler and dashboard remain healthy")
+
+    state =
+      state
+      |> Map.put(:startup_maintenance, StartupMaintenance.timeout(maintenance))
+      |> schedule_tick(0)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:startup_maintenance_timeout, _ref}, state), do: {:noreply, state}
+
+  def handle_info({ref, {:ok, result}}, %{startup_maintenance: %{task_ref: ref}} = state)
+      when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+
+    state =
+      state
+      |> Map.put(:startup_maintenance, StartupMaintenance.complete(state.startup_maintenance, result))
+      |> schedule_tick(0)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{startup_maintenance: %{task_ref: ref}} = state)
+      when is_reference(ref) do
+    Logger.warning("Startup terminal workspace cleanup failed; scheduler and dashboard remain healthy")
+
+    state =
+      state
+      |> Map.put(:startup_maintenance, StartupMaintenance.fail(state.startup_maintenance, reason))
+      |> schedule_tick(0)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
@@ -137,6 +221,7 @@ defmodule SymphonyElixir.Orchestrator do
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
+        state = release_execution_lease(state, running_entry, reason)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
 
@@ -154,13 +239,21 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        updated_running_entry =
-          running_entry
-          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+        if runtime_info_belongs_to_entry?(runtime_info, running_entry) do
+          {state, observed_head} = observe_worker_runtime_head(state, running_entry, runtime_info)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          updated_running_entry =
+            running_entry
+            |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+            |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+            |> maybe_put_runtime_value(:accepted_head, observed_head)
+
+          notify_dashboard()
+          {:noreply, %{state | running: Map.put(state.running, issue_id, updated_running_entry)}}
+        else
+          Logger.warning("Ignoring stale worker runtime information for issue_id=#{issue_id}")
+          {:noreply, state}
+        end
     end
   end
 
@@ -218,7 +311,11 @@ defmodule SymphonyElixir.Orchestrator do
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
+        workspace_path: Map.get(running_entry, :workspace_path),
+        execution_token: Map.get(running_entry, :execution_token),
+        execution_session_id: Map.get(running_entry, :execution_session_id),
+        accepted_head: Map.get(running_entry, :accepted_head),
+        merge_identity: Map.get(running_entry, :merge_identity)
       })
     end
   end
@@ -249,7 +346,11 @@ defmodule SymphonyElixir.Orchestrator do
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
+      workspace_path: Map.get(running_entry, :workspace_path),
+      execution_token: Map.get(running_entry, :execution_token),
+      execution_session_id: Map.get(running_entry, :execution_session_id),
+      accepted_head: Map.get(running_entry, :accepted_head),
+      merge_identity: Map.get(running_entry, :merge_identity)
     })
   end
 
@@ -388,6 +489,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec admit_execution_for_test(term(), Issue.t(), String.t() | nil) ::
+          {:ok, term(), map(), String.t(), String.t() | nil, map()} | {:error, term()}
+  def admit_execution_for_test(%State{} = state, %Issue{} = issue, worker_host) do
+    admit_execution(state, issue, worker_host)
+  end
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -457,7 +565,9 @@ defmodule SymphonyElixir.Orchestrator do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
+        blocked_entry = Map.get(state.blocked, issue.id, %{})
+        state = maybe_fence_terminal_execution(state, Map.put(blocked_entry, :issue, issue), true)
+        state = cleanup_fenced_workspace_or_legacy(state, issue, blocked_entry)
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
@@ -558,12 +668,17 @@ defmodule SymphonyElixir.Orchestrator do
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+        state = maybe_fence_terminal_execution(state, running_entry, cleanup_workspace)
 
         stop_running_task(pid, ref, state.task_supervisor)
+        state = release_execution_lease(state, running_entry, :orchestrator_stop)
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
-        end
+        state =
+          if cleanup_workspace do
+            cleanup_fenced_workspace_or_legacy(state, Map.get(running_entry, :issue, identifier), running_entry)
+          else
+            state
+          end
 
         %{
           state
@@ -580,9 +695,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
+    max_no_progress_tokens = Config.settings!().codex.max_no_progress_tokens
 
     cond do
-      timeout_ms <= 0 ->
+      timeout_ms <= 0 and max_no_progress_tokens <= 0 ->
         state
 
       map_size(state.running) == 0 ->
@@ -590,27 +706,55 @@ defmodule SymphonyElixir.Orchestrator do
 
       true ->
         now = DateTime.utc_now()
+        now_ms = monotonic_now_ms()
 
         Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-          maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
+          maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, now_ms, timeout_ms)
         end)
     end
   end
 
-  defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
+  defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms) do
     if Map.has_key?(state.blocked, issue_id) do
       state
     else
-      restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
+      restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms)
     end
   end
 
-  defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
-    elapsed_ms = stall_elapsed_ms(running_entry, now)
+  defp restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms) do
+    elapsed_ms = stall_elapsed_ms(running_entry, now_ms)
+    max_no_progress_tokens = Config.settings!().codex.max_no_progress_tokens
+    no_progress_tokens = no_progress_token_count(running_entry)
+    no_durable_progress_tokens = no_durable_progress_token_count(running_entry)
+    time_stall? = timeout_ms > 0 and is_integer(elapsed_ms) and elapsed_ms > timeout_ms
 
-    if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
+    command_token_stall? =
+      max_no_progress_tokens > 0 and no_progress_tokens >= max_no_progress_tokens
+
+    durable_token_stall? =
+      max_no_progress_tokens > 0 and no_durable_progress_tokens >= max_no_progress_tokens
+
+    token_stall? = command_token_stall? or durable_token_stall?
+
+    if time_stall? or token_stall? do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
+      restart_count = Map.get(state.stall_restarts, issue_id, 0) + 1
+
+      diagnostic =
+        stall_diagnostic(
+          running_entry,
+          now,
+          elapsed_ms,
+          timeout_ms,
+          restart_count,
+          token_stall?,
+          durable_token_stall?,
+          no_progress_tokens,
+          no_durable_progress_tokens,
+          max_no_progress_tokens
+        )
 
       if input_required_blocker?(running_entry) do
         error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
@@ -621,40 +765,152 @@ defmodule SymphonyElixir.Orchestrator do
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, error)
       else
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+        max_retries = Config.settings!().codex.max_stall_retries
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+        if restart_count > max_retries do
+          error = "codex stalled #{restart_count} consecutive times; automatic recovery exhausted"
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+          Logger.warning("Issue stopped after repeated stalls: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} restart_count=#{restart_count} elapsed_ms=#{elapsed_ms}")
+
+          state
+          |> record_session_completion_totals(running_entry)
+          |> put_stall_restart_count(issue_id, restart_count)
+          |> stop_and_block_issue(
+            issue_id,
+            Map.put(running_entry, :stall_diagnostic, diagnostic),
+            error
+          )
+        else
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+
+          next_attempt = next_retry_attempt_from_running(running_entry)
+
+          state
+          |> put_stall_restart_count(issue_id, restart_count)
+          |> terminate_running_issue(issue_id, false)
+          |> reserve_issue_claim_for_retry(issue_id)
+          |> schedule_issue_retry(issue_id, next_attempt, %{
+            identifier: identifier,
+            issue_url: running_entry.issue.url,
+            error:
+              stall_retry_error(
+                elapsed_ms,
+                token_stall?,
+                no_progress_tokens,
+                no_durable_progress_tokens,
+                max_no_progress_tokens
+              ),
+            stall_diagnostic: diagnostic
+          })
+        end
       end
     else
       state
     end
   end
 
-  defp stall_elapsed_ms(running_entry, now) do
-    running_entry
-    |> last_activity_timestamp()
-    |> case do
-      %DateTime{} = timestamp ->
-        max(0, DateTime.diff(now, timestamp, :millisecond))
-
-      _ ->
-        nil
+  defp stall_elapsed_ms(running_entry, now_ms) when is_integer(now_ms) do
+    case last_activity_monotonic_ms(running_entry) do
+      timestamp_ms when is_integer(timestamp_ms) -> max(0, now_ms - timestamp_ms)
+      _ -> nil
     end
   end
 
-  defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+  defp last_activity_monotonic_ms(running_entry) when is_map(running_entry) do
+    Map.get(running_entry, :codex_last_activity_monotonic_ms) ||
+      Map.get(running_entry, :started_monotonic_ms)
   end
 
-  defp last_activity_timestamp(_running_entry), do: nil
+  defp last_activity_monotonic_ms(_running_entry), do: nil
+
+  defp stall_retry_error(
+         elapsed_ms,
+         true,
+         no_progress_tokens,
+         no_durable_progress_tokens,
+         threshold
+       ) do
+    "token progress guard reached #{threshold} tokens " <>
+      "(meaningful=#{no_progress_tokens}, durable=#{no_durable_progress_tokens}, " <>
+      "qualifying_activity_silence_ms=#{inspect(elapsed_ms)})"
+  end
+
+  defp stall_retry_error(elapsed_ms, false, _no_progress, _no_durable_progress, _threshold) do
+    "stalled for #{elapsed_ms}ms without qualifying codex activity"
+  end
+
+  defp no_progress_token_count(running_entry) do
+    max(
+      0,
+      Map.get(running_entry, :codex_total_tokens, 0) -
+        Map.get(running_entry, :codex_progress_token_baseline, 0)
+    )
+  end
+
+  defp no_durable_progress_token_count(running_entry) do
+    max(
+      0,
+      Map.get(running_entry, :codex_total_tokens, 0) -
+        Map.get(running_entry, :codex_durable_progress_token_baseline, 0)
+    )
+  end
+
+  defp stall_diagnostic(
+         running_entry,
+         now,
+         elapsed_ms,
+         timeout_ms,
+         restart_count,
+         token_stall?,
+         durable_token_stall?,
+         no_progress_tokens,
+         no_durable_progress_tokens,
+         max_no_progress_tokens
+       ) do
+    %{
+      reason:
+        if(token_stall?,
+          do: "codex_token_growth_without_meaningful_progress",
+          else: "codex_no_activity"
+        ),
+      observed_at: now,
+      elapsed_ms: elapsed_ms,
+      threshold_ms: timeout_ms,
+      restart_count: restart_count,
+      no_progress_tokens: no_progress_tokens,
+      no_durable_progress_tokens: no_durable_progress_tokens,
+      no_progress_token_threshold: max_no_progress_tokens,
+      durable_progress_token_threshold: max_no_progress_tokens,
+      durable_token_stall: durable_token_stall?,
+      last_progress_at: Map.get(running_entry, :codex_last_progress_timestamp),
+      last_progress_method: Map.get(running_entry, :codex_last_progress_method),
+      last_durable_progress_at: Map.get(running_entry, :codex_last_durable_progress_timestamp),
+      last_durable_progress_method: Map.get(running_entry, :codex_last_durable_progress_method),
+      session_id: running_entry_session_id(running_entry),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      last_event: Map.get(running_entry, :last_codex_event),
+      last_event_at: Map.get(running_entry, :last_codex_timestamp),
+      last_qualifying_activity_class: Map.get(running_entry, :codex_last_activity_method) || "worker_started",
+      worker_process_alive: worker_process_alive?(Map.get(running_entry, :pid)),
+      codex_app_server_pid: Map.get(running_entry, :codex_app_server_pid),
+      token_totals: %{
+        input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+        output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+        total_tokens: Map.get(running_entry, :codex_total_tokens, 0)
+      }
+    }
+  end
+
+  defp worker_process_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
+  defp worker_process_alive?(_pid), do: false
+
+  defp put_stall_restart_count(%State{} = state, issue_id, count) do
+    %{state | stall_restarts: Map.put(state.stall_restarts, issue_id, count)}
+  end
+
+  defp reserve_issue_claim_for_retry(%State{} = state, issue_id) do
+    %{state | claimed: MapSet.put(state.claimed, issue_id)}
+  end
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
@@ -766,7 +1022,12 @@ defmodule SymphonyElixir.Orchestrator do
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      execution_token: Map.get(running_entry, :execution_token),
+      execution_session_id: Map.get(running_entry, :execution_session_id),
+      accepted_head: Map.get(running_entry, :accepted_head),
+      merge_identity: Map.get(running_entry, :merge_identity),
+      stall_diagnostic: Map.get(running_entry, :stall_diagnostic)
     }
 
     %{
@@ -891,7 +1152,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminal_state_set do
-    Config.settings!().tracker.terminal_states
+    (@mandatory_terminal_states ++ Config.settings!().tracker.terminal_states)
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
@@ -951,8 +1212,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    case admit_execution(state, issue, worker_host) do
+      {:ok, state, token, session_id, responsibility_delegation_id, runtime_lease} ->
+        spawn_fenced_issue(
+          state,
+          issue,
+          attempt,
+          recipient,
+          worker_host,
+          token,
+          session_id,
+          responsibility_delegation_id,
+          runtime_lease
+        )
+
+      {:error, reason} ->
+        Logger.warning("Skipping fenced dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp spawn_fenced_issue(
+         %State{} = state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         token,
+         session_id,
+         responsibility_delegation_id,
+         runtime_lease
+       ) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             execution_token: token,
+             execution_session_id: session_id,
+             execution_fence_guard: fn ->
+               GenServer.call(
+                 recipient,
+                 {:execution_authorize, token, responsibility_delegation_id, :state_mutation}
+               )
+             end
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -968,6 +1271,10 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            execution_token: token,
+            execution_session_id: session_id,
+            responsibility_delegation_id: responsibility_delegation_id,
+            responsibility_runtime_lease: runtime_lease,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -978,9 +1285,16 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            codex_progress_token_baseline: 0,
+            codex_durable_progress_token_baseline: 0,
+            codex_last_progress_timestamp: nil,
+            codex_last_progress_method: nil,
+            codex_last_activity_monotonic_ms: nil,
+            codex_last_activity_method: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            started_monotonic_ms: monotonic_now_ms()
           })
 
         %{
@@ -994,12 +1308,364 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
+        state =
+          release_execution_lease(
+            state,
+            %{
+              execution_token: token,
+              execution_session_id: session_id,
+              responsibility_delegation_id: responsibility_delegation_id,
+              responsibility_runtime_lease: runtime_lease
+            },
+            :spawn_failed
+          )
+
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
           issue_url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          worker_host: worker_host,
+          execution_token: token,
+          execution_session_id: session_id
         })
+    end
+  end
+
+  defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host)
+       when is_binary(issue_id) do
+    now_ms = execution_fence_now_ms()
+    attrs = execution_attributes(issue, worker_host)
+    session_id_for_generation = fn generation -> execution_session_id(issue_id, generation) end
+
+    with {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),
+         session_id = session_id_for_generation.(token.generation),
+         runtime_lease = execution_runtime_lease(issue_id, token, session_id),
+         {:ok, fence_state, _result} <-
+           ExecutionFence.register(
+             fence_state,
+             token,
+             :worker,
+             execution_session_attributes(attrs, session_id),
+             now_ms
+           ),
+         {:ok, next_state, responsibility_delegation_id} <-
+           bind_execution_responsibility(state, issue, runtime_lease, now_ms),
+         {:ok, next_state} <- persist_execution_fence(next_state, fence_state) do
+      {:ok, next_state, token, session_id, responsibility_delegation_id, runtime_lease}
+    end
+  end
+
+  defp admit_execution(_state, _issue, _worker_host), do: {:error, :invalid_issue}
+
+  defp execution_attributes(%Issue{id: issue_id, identifier: identifier, branch_name: branch_name}, _worker_host) do
+    workspace = Path.join(Config.settings!().workspace.root, Workspace.workspace_key(identifier || issue_id))
+
+    %{
+      issue_id: issue_id,
+      repository: "openai/symphony",
+      branch: branch_name || "codex/#{Workspace.workspace_key(identifier || issue_id)}",
+      worktree: workspace
+    }
+  end
+
+  defp execution_session_attributes(attrs, session_id) do
+    Map.merge(attrs, %{
+      session_id: session_id,
+      process_id: session_id,
+      role: :worker,
+      linear_state: "admitted",
+      pr_state: "unopened",
+      head: "unobserved",
+      last_heartbeat_at: 0
+    })
+  end
+
+  defp execution_session_id(issue_id, generation), do: "worker:#{issue_id}:#{generation}"
+
+  defp execution_runtime_lease(issue_id, %{generation: generation}, session_id) do
+    %{
+      issue_id: issue_id,
+      repository: "openai/symphony",
+      generation: generation,
+      session_id: session_id,
+      process_id: session_id
+    }
+  end
+
+  defp bind_execution_responsibility(%State{} = state, %Issue{} = issue, runtime_lease, now_ms) do
+    if ResponsibilityGraph.enforced?(state.responsibility_graph) do
+      with {:ok, delegation} <-
+             ResponsibilityGraph.admission_delegation(
+               state.responsibility_graph,
+               issue.id,
+               issue.identifier,
+               runtime_lease.repository
+             ),
+           {:ok, graph_state} <-
+             ResponsibilityGraph.bind_runtime_lease(
+               state.responsibility_graph,
+               delegation.id,
+               runtime_lease,
+               now_ms
+             ),
+           {:ok, next_state} <- persist_responsibility_graph(state, graph_state) do
+        {:ok, next_state, delegation.id}
+      end
+    else
+      {:ok, state, nil}
+    end
+  end
+
+  defp release_execution_lease(%State{} = state, running_entry, reason) do
+    with %{execution_token: token, execution_session_id: session_id} <- running_entry,
+         {:ok, fence_state, _result} <-
+           ExecutionFence.release(state.execution_fence, token, session_id, normalize_release_reason(reason)) do
+      case persist_execution_fence(state, fence_state) do
+        {:ok, next_state} ->
+          release_responsibility_lease(next_state, running_entry)
+
+        {:error, persist_reason} ->
+          Logger.error("Execution-fence lease release was not persisted: #{inspect(persist_reason)}")
+          state
+      end
+    else
+      _ ->
+        state
+    end
+  end
+
+  defp release_responsibility_lease(
+         %State{} = state,
+         %{responsibility_delegation_id: delegation_id, responsibility_runtime_lease: runtime_lease}
+       )
+       when is_binary(delegation_id) and is_map(runtime_lease) do
+    case ResponsibilityGraph.release_runtime_lease(
+           state.responsibility_graph,
+           delegation_id,
+           runtime_lease,
+           execution_fence_now_ms()
+         ) do
+      {:ok, graph_state, _result} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Responsibility runtime-lease release was not persisted: #{inspect(reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.error("Responsibility runtime-lease release was rejected: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp release_responsibility_lease(state, _running_entry), do: state
+
+  defp normalize_release_reason(reason) when is_atom(reason), do: reason
+  defp normalize_release_reason(_reason), do: :worker_exit
+
+  defp maybe_fence_terminal_execution(state, _running_entry, false), do: state
+
+  defp maybe_fence_terminal_execution(state, %{execution_token: token, issue: %Issue{state: issue_state} = issue} = entry, true)
+       when is_binary(issue_state) do
+    terminal_head = Map.get(entry, :accepted_head, "unobserved")
+    terminal_attrs = %{terminal_state: issue_state, accepted_head: terminal_head, merge_identity: Map.get(entry, :merge_identity)}
+
+    case ExecutionFence.fence(state.execution_fence, token, terminal_attrs, execution_fence_now_ms()) do
+      {:ok, fence_state, _result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            complete_responsibility_execution(next_state, entry, terminal_attrs)
+
+          {:error, persist_reason} ->
+            Logger.error("Terminal execution fence was not persisted: #{inspect(persist_reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning("Terminal execution fence rejected for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp maybe_fence_terminal_execution(state, _running_entry, _cleanup_workspace), do: state
+
+  defp complete_responsibility_execution(
+         %State{} = state,
+         %{responsibility_delegation_id: delegation_id},
+         terminal_attrs
+       )
+       when is_binary(delegation_id) and is_map(terminal_attrs) do
+    case ResponsibilityGraph.complete(
+           state.responsibility_graph,
+           delegation_id,
+           terminal_attrs,
+           execution_fence_now_ms()
+         ) do
+      {:ok, graph_state, _impact} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Terminal responsibility completion was not persisted: #{inspect(reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning("Terminal responsibility completion rejected: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp complete_responsibility_execution(state, _entry, _terminal_attrs), do: state
+
+  defp cleanup_fenced_workspace_or_legacy(%State{} = state, issue_or_identifier, %{execution_token: token} = entry) do
+    case Map.get(entry, :accepted_head) do
+      head when is_binary(head) and head != "" and head != "unobserved" ->
+        case execution_workspace_path(state.execution_fence, token, entry) do
+          {:ok, workspace_path} ->
+            case Workspace.current_head(workspace_path, Map.get(entry, :worker_host)) do
+              {:ok, ^head} ->
+                cleanup_fenced_execution(state, issue_or_identifier, Map.put(entry, :workspace_path, workspace_path), token, head)
+
+              {:ok, observed_head} ->
+                record_head_divergence(state, token, head, observed_head)
+
+              {:error, reason} ->
+                Logger.warning("Preserving fenced workspace because exact head could not be observed: #{inspect(reason)}")
+                state
+            end
+
+          {:error, reason} ->
+            Logger.warning("Preserving fenced workspace because its path could not be resolved: #{inspect(reason)}")
+            state
+        end
+
+      _ ->
+        Logger.warning("Preserving fenced workspace until an exact terminal head is observed")
+        state
+    end
+  end
+
+  defp cleanup_fenced_workspace_or_legacy(state, issue_or_identifier, entry) do
+    cleanup_issue_workspace(issue_or_identifier, entry)
+    state
+  end
+
+  defp cleanup_fenced_execution(state, issue_or_identifier, entry, token, head) do
+    now_ms = execution_fence_now_ms()
+
+    case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
+      {:ok, fence_state, :cleaned} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            cleanup_issue_workspace(issue_or_identifier, entry)
+            next_state
+
+          {:error, persist_reason} ->
+            Logger.error("Execution-fence cleanup was not persisted: #{inspect(persist_reason)}")
+            state
+        end
+
+      {:ok, fence_state, :already_cleaned} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, persist_reason} ->
+            Logger.error("Execution-fence cleanup state was not persisted: #{inspect(persist_reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp record_head_divergence(state, token, expected_head, observed_head) do
+    case ExecutionFence.record_head_divergence(
+           state.execution_fence,
+           token,
+           expected_head,
+           observed_head,
+           execution_fence_now_ms()
+         ) do
+      {:ok, fence_state, :recorded} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            Logger.warning("Preserving fenced workspace after head divergence expected=#{expected_head} observed=#{observed_head}; triage recorded")
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Head-divergence triage was not persisted: #{inspect(reason)}")
+            state
+        end
+
+      {:ok, _fence_state, :already_recorded} ->
+        Logger.warning("Preserving fenced workspace after previously recorded head divergence expected=#{expected_head} observed=#{observed_head}")
+        state
+
+      {:error, reason} ->
+        Logger.error("Head-divergence triage was rejected: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp execution_workspace_path(fence_state, %{issue_id: issue_id, generation: generation}, entry) do
+    case Map.get(entry, :workspace_path) do
+      path when is_binary(path) and path != "" ->
+        {:ok, path}
+
+      _ ->
+        case Map.get(fence_state.executions, issue_id) do
+          %{generation: ^generation, worktree: worktree} when is_binary(worktree) -> {:ok, worktree}
+          _ -> {:error, :unknown_execution_workspace}
+        end
+    end
+  end
+
+  defp execution_workspace_path(_fence_state, _token, _entry),
+    do: {:error, :invalid_execution_token}
+
+  defp runtime_info_belongs_to_entry?(runtime_info, entry) do
+    Map.get(runtime_info, :execution_token) == Map.get(entry, :execution_token) and
+      Map.get(runtime_info, :execution_session_id) == Map.get(entry, :execution_session_id)
+  end
+
+  defp observe_worker_runtime_head(state, entry, runtime_info) do
+    case Map.get(runtime_info, :head) do
+      head when is_binary(head) ->
+        token = Map.get(entry, :execution_token)
+        session_id = Map.get(entry, :execution_session_id)
+
+        case ExecutionFence.observe_session_head(
+               state.execution_fence,
+               token,
+               session_id,
+               head,
+               execution_fence_now_ms()
+             ) do
+          {:ok, fence_state} ->
+            case persist_execution_fence(state, fence_state) do
+              {:ok, next_state} ->
+                {next_state, head}
+
+              {:error, reason} ->
+                Logger.error("Worker head observation was not persisted: #{inspect(reason)}")
+                {state, nil}
+            end
+
+          {:error, reason} ->
+            Logger.warning("Worker head observation rejected: #{inspect(reason)}")
+            {state, nil}
+        end
+
+      _ ->
+        {state, nil}
     end
   end
 
@@ -1027,7 +1693,8 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        stall_restarts: Map.delete(state.stall_restarts, issue_id)
     }
   end
 
@@ -1044,6 +1711,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    stall_diagnostic = metadata[:stall_diagnostic] || Map.get(previous_retry, :stall_diagnostic)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1067,7 +1735,12 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            execution_token: Map.get(metadata, :execution_token),
+            execution_session_id: Map.get(metadata, :execution_session_id),
+            accepted_head: Map.get(metadata, :accepted_head),
+            merge_identity: Map.get(metadata, :merge_identity),
+            stall_diagnostic: stall_diagnostic
           })
     }
   end
@@ -1080,7 +1753,12 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          execution_token: Map.get(retry_entry, :execution_token),
+          execution_session_id: Map.get(retry_entry, :execution_session_id),
+          accepted_head: Map.get(retry_entry, :accepted_head),
+          merge_identity: Map.get(retry_entry, :merge_identity),
+          stall_diagnostic: Map.get(retry_entry, :stall_diagnostic)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1117,7 +1795,8 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue, metadata)
+        state = maybe_fence_terminal_execution(state, Map.put(metadata, :issue, issue), true)
+        state = cleanup_fenced_workspace_or_legacy(state, issue, metadata)
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
@@ -1135,7 +1814,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(identifier, worker_host)
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     case Map.get(metadata, :workspace_path) do
@@ -1157,21 +1836,39 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
-      {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
+  defp start_startup_maintenance(%State{} = state, opts) do
+    metadata = StartupMaintenance.start()
+    task_supervisor = state.task_supervisor
+    startup_cleanup_fun = Keyword.get(opts, :startup_cleanup_fun, &defer_startup_workspace_cleanup/1)
 
-          _ ->
-            :ok
-        end)
+    maintenance_fun =
+      Keyword.get_lazy(opts, :startup_maintenance_fun, fn ->
+        fn ->
+          StartupMaintenance.run(
+            &Tracker.fetch_issues_by_states/1,
+            startup_cleanup_fun,
+            Config.settings!().tracker
+          )
+        end
+      end)
 
-      {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
-    end
+    task =
+      Task.Supervisor.async_nolink(task_supervisor, maintenance_fun)
+
+    Process.send_after(self(), {:startup_maintenance_timeout, task.ref}, StartupMaintenance.timeout_ms())
+
+    %{
+      state
+      | startup_maintenance:
+          metadata
+          |> Map.put(:task_ref, task.ref)
+          |> Map.put(:task_pid, task.pid)
+    }
+  end
+
+  defp defer_startup_workspace_cleanup(%Issue{} = issue) do
+    Logger.info("Deferring startup cleanup for terminal issue #{issue_context(issue)} until its persisted execution fence is reconciled")
+    {:error, :execution_fence_reconciliation_required}
   end
 
   defp notify_dashboard do
@@ -1225,7 +1922,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        stall_restarts: Map.delete(state.stall_restarts, issue_id)
     }
   end
 
@@ -1405,7 +2103,473 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Reconciles an explicit sanitized execution-session observation snapshot."
+  @spec reconcile_execution_fence([map()], non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def reconcile_execution_fence(observations, now_ms) when is_list(observations) do
+    reconcile_execution_fence(__MODULE__, observations, now_ms, @execution_fence_lease_ttl_ms)
+  end
+
+  @spec reconcile_execution_fence([map()], non_neg_integer(), pos_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def reconcile_execution_fence(observations, now_ms, ttl_ms) when is_list(observations) do
+    reconcile_execution_fence(__MODULE__, observations, now_ms, ttl_ms)
+  end
+
+  @spec reconcile_execution_fence(GenServer.server(), [map()], non_neg_integer(), pos_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def reconcile_execution_fence(server, observations, now_ms, ttl_ms)
+      when is_list(observations) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_reconcile, observations, now_ms, ttl_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec register_execution_session(GenServer.server(), map(), :worker | :reviewer, map(), non_neg_integer()) ::
+          {:ok, :registered | :already_registered} | {:error, term()} | :unavailable
+  def register_execution_session(server, token, role, attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_register, token, role, attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec heartbeat_execution_session(GenServer.server(), map(), String.t(), non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def heartbeat_execution_session(server, token, session_id, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_heartbeat, token, session_id, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec release_execution_session(GenServer.server(), map(), String.t(), atom()) ::
+          {:ok, :released | :already_released} | {:error, term()} | :unavailable
+  def release_execution_session(server, token, session_id, reason \\ :released) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_release, token, session_id, reason})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec fence_execution(GenServer.server(), map(), map(), non_neg_integer()) ::
+          {:ok, :fenced | :already_fenced} | {:error, term()} | :unavailable
+  def fence_execution(server, token, attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_terminal, token, attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Returns the read-only responsibility/delegation projection."
+  @spec responsibility_snapshot() :: map() | :unavailable
+  def responsibility_snapshot, do: responsibility_snapshot(__MODULE__)
+
+  @spec responsibility_snapshot(GenServer.server()) :: map() | :unavailable
+  def responsibility_snapshot(server) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, :responsibility_snapshot)
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Activates machine-enforced responsibility admission after the graph is proven."
+  @spec activate_responsibility_graph(non_neg_integer()) ::
+          {:ok, :activated | :already_activated} | {:error, term()} | :unavailable
+  def activate_responsibility_graph(now_ms),
+    do: activate_responsibility_graph(__MODULE__, now_ms)
+
+  @spec activate_responsibility_graph(GenServer.server(), non_neg_integer()) ::
+          {:ok, :activated | :already_activated} | {:error, term()} | :unavailable
+  def activate_responsibility_graph(server, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_activate, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Registers a typed responsibility delegation and persists it."
+  @spec delegate_responsibility(map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def delegate_responsibility(attrs, now_ms), do: delegate_responsibility(__MODULE__, attrs, now_ms)
+
+  @spec delegate_responsibility(GenServer.server(), map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def delegate_responsibility(server, attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_delegate, attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Renews a responsibility lease heartbeat."
+  @spec heartbeat_responsibility(String.t(), non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def heartbeat_responsibility(delegation_id, now_ms),
+    do: heartbeat_responsibility(__MODULE__, delegation_id, now_ms)
+
+  @spec heartbeat_responsibility(GenServer.server(), String.t(), non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def heartbeat_responsibility(server, delegation_id, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_heartbeat, delegation_id, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Reconciles a restart-blocked delegation against its HGS-294 lease reference."
+  @spec reconcile_responsibility(String.t(), map() | nil, non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def reconcile_responsibility(delegation_id, runtime_lease, now_ms),
+    do: reconcile_responsibility(__MODULE__, delegation_id, runtime_lease, now_ms)
+
+  @spec reconcile_responsibility(GenServer.server(), String.t(), map() | nil, non_neg_integer()) ::
+          {:ok, :persisted} | {:error, term()} | :unavailable
+  def reconcile_responsibility(server, delegation_id, runtime_lease, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_reconcile, delegation_id, runtime_lease, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Authorizes a graph action and its HGS-294 runtime lease together."
+  @spec authorize_responsibility(String.t(), atom()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def authorize_responsibility(delegation_id, action),
+    do: authorize_responsibility(__MODULE__, delegation_id, action)
+
+  @spec authorize_responsibility(GenServer.server(), String.t(), atom()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def authorize_responsibility(server, delegation_id, action) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_authorize, delegation_id, action})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Revokes a responsibility tree and fences its referenced HGS-294 generations."
+  @spec revoke_responsibility(String.t(), term(), map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def revoke_responsibility(delegation_id, reason, terminal_attrs, now_ms),
+    do: revoke_responsibility(__MODULE__, delegation_id, reason, terminal_attrs, now_ms)
+
+  @spec revoke_responsibility(GenServer.server(), String.t(), term(), map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def revoke_responsibility(server, delegation_id, reason, terminal_attrs, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:responsibility_revoke, delegation_id, reason, terminal_attrs, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
+  @spec record_execution_head_divergence(GenServer.server(), map(), String.t(), String.t(), non_neg_integer()) ::
+          {:ok, :recorded | :already_recorded} | {:error, term()} | :unavailable
+  def record_execution_head_divergence(server, token, expected_head, observed_head, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(
+          server,
+          {:execution_fence_head_divergence, token, expected_head, observed_head, now_ms}
+        )
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
+  def handle_call({:execution_fence_authorize, token, action}, _from, %State{} = state) do
+    {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
+  end
+
+  def handle_call({:execution_authorize, token, nil, action}, _from, %State{} = state) do
+    {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
+  end
+
+  def handle_call({:execution_authorize, token, delegation_id, action}, _from, %State{} = state)
+      when is_binary(delegation_id) do
+    reply =
+      if ResponsibilityGraph.enforced?(state.responsibility_graph) do
+        ResponsibilityGraph.authorize_with_execution_fence(
+          state.responsibility_graph,
+          delegation_id,
+          action,
+          state.execution_fence
+        )
+      else
+        ExecutionFence.authorize(state.execution_fence, token, action)
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:execution_fence_register, token, role, attrs, now_ms}, _from, %State{} = state) do
+    case ExecutionFence.register(state.execution_fence, token, role, attrs, now_ms) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_heartbeat, token, session_id, now_ms}, _from, %State{} = state) do
+    case ExecutionFence.heartbeat(state.execution_fence, token, session_id, now_ms) do
+      {:ok, fence_state} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, :persisted}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_release, token, session_id, reason}, _from, %State{} = state) do
+    case ExecutionFence.release(state.execution_fence, token, session_id, reason) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            {:reply, {:ok, result}, next_state}
+
+          {:error, persist_reason} ->
+            {:reply, {:error, {:execution_fence_persistence_failed, persist_reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_terminal, token, attrs, now_ms}, _from, %State{} = state) do
+    case ExecutionFence.fence(state.execution_fence, token, attrs, now_ms) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call(
+        {:execution_fence_head_divergence, token, expected_head, observed_head, now_ms},
+        _from,
+        %State{} = state
+      ) do
+    case ExecutionFence.record_head_divergence(
+           state.execution_fence,
+           token,
+           expected_head,
+           observed_head,
+           now_ms
+         ) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_reconcile, observations, now_ms, ttl_ms}, _from, %State{} = state) do
+    case ExecutionFence.reconcile_sessions(state.execution_fence, observations, now_ms, ttl_ms) do
+      {:ok, fence_state, summary} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            reply = {:ok, %{summary: summary, execution_fence: execution_fence_snapshot(fence_state)}}
+            {:reply, reply, next_state}
+
+          {:error, reason} ->
+            {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, reason} = error ->
+        Logger.warning("Execution-fence reconciliation rejected: #{inspect(reason)}")
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call(:responsibility_snapshot, _from, %State{} = state) do
+    {:reply, ResponsibilityGraph.snapshot(state.responsibility_graph), state}
+  end
+
+  def handle_call({:responsibility_activate, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.activate(state.responsibility_graph, now_ms) do
+      {:ok, graph_state, result} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:responsibility_delegate, attrs, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.delegate(state.responsibility_graph, attrs, now_ms) do
+      {:ok, graph_state, delegation} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, delegation}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:responsibility_heartbeat, delegation_id, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.heartbeat(state.responsibility_graph, delegation_id, now_ms) do
+      {:ok, graph_state} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, :persisted}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:responsibility_reconcile, delegation_id, runtime_lease, now_ms}, _from, %State{} = state) do
+    case ResponsibilityGraph.reconcile_delegation(
+           state.responsibility_graph,
+           delegation_id,
+           runtime_lease,
+           now_ms
+         ) do
+      {:ok, graph_state} ->
+        case persist_responsibility_graph(state, graph_state) do
+          {:ok, next_state} -> {:reply, {:ok, :persisted}, next_state}
+          {:error, reason} -> {:reply, {:error, {:responsibility_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:responsibility_authorize, delegation_id, action}, _from, %State{} = state) do
+    {:reply,
+     ResponsibilityGraph.authorize_with_execution_fence(
+       state.responsibility_graph,
+       delegation_id,
+       action,
+       state.execution_fence
+     ), state}
+  end
+
+  def handle_call(
+        {:responsibility_revoke, delegation_id, reason, terminal_attrs, now_ms},
+        _from,
+        %State{} = state
+      ) do
+    case ResponsibilityGraph.revoke_and_fence(
+           state.responsibility_graph,
+           state.execution_fence,
+           delegation_id,
+           reason,
+           terminal_attrs,
+           now_ms
+         ) do
+      {:ok, graph_state, fence_state, impact} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, fence_persisted_state} ->
+            case persist_responsibility_graph(fence_persisted_state, graph_state) do
+              {:ok, next_state} ->
+                {:reply, {:ok, impact}, next_state}
+
+              {:error, persist_reason} ->
+                {:reply, {:error, {:responsibility_persistence_failed, persist_reason}}, fence_persisted_state}
+            end
+
+          {:error, persist_reason} ->
+            {:reply, {:error, {:execution_fence_persistence_failed, persist_reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -1431,6 +2595,9 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          configured_stall_timeout_ms: Config.settings!().codex.stall_timeout_ms,
+          qualifying_activity_silence_ms: stall_elapsed_ms(metadata, now_ms),
+          last_qualifying_activity_class: Map.get(metadata, :codex_last_activity_method) || "worker_started",
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1446,7 +2613,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry, :issue_url),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          stall_diagnostic: Map.get(retry, :stall_diagnostic)
         }
       end)
 
@@ -1465,7 +2633,8 @@ defmodule SymphonyElixir.Orchestrator do
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          stall_diagnostic: Map.get(metadata, :stall_diagnostic)
         }
       end)
 
@@ -1474,8 +2643,11 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       execution_fence: execution_fence_snapshot(state.execution_fence),
+       responsibility_graph: ResponsibilityGraph.snapshot(state.responsibility_graph),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       startup_maintenance: StartupMaintenance.snapshot(state.startup_maintenance),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1505,6 +2677,99 @@ defmodule SymphonyElixir.Orchestrator do
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(_metadata), do: nil
 
+  defp execution_fence_snapshot(fence_state) do
+    case ExecutionFence.snapshot(fence_state) do
+      snapshot when is_map(snapshot) -> snapshot
+      {:error, reason} -> %{schema_version: 1, status: :invalid, error: reason}
+    end
+  end
+
+  defp load_execution_fence(path) when is_binary(path) do
+    case Persistence.load(path) do
+      :missing ->
+        fence_state = ExecutionFence.new()
+
+        case Persistence.save(path, fence_state) do
+          :ok -> {:ok, fence_state}
+          {:error, reason} -> {:error, {:initial_persistence_failed, reason}}
+        end
+
+      {:ok, fence_state} ->
+        with {:ok, restarted_state} <- ExecutionFence.mark_unreconciled_after_restart(fence_state),
+             :ok <- Persistence.save(path, restarted_state) do
+          {:ok, restarted_state}
+        else
+          {:error, reason} -> {:error, {:restart_reconciliation_persistence_failed, reason}}
+          other -> {:error, {:restart_reconciliation_persistence_failed, other}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp load_execution_fence(path), do: {:error, {:invalid_state_path, path}}
+
+  defp load_responsibility_graph(path) when is_binary(path) do
+    case ResponsibilityPersistence.load(path) do
+      :missing ->
+        graph_state = ResponsibilityGraph.new()
+
+        case ResponsibilityPersistence.save(path, graph_state) do
+          :ok -> {:ok, graph_state}
+          {:error, reason} -> {:error, {:initial_persistence_failed, reason}}
+        end
+
+      {:ok, graph_state} ->
+        with {:ok, restarted_state} <- ResponsibilityGraph.mark_unreconciled_after_restart(graph_state),
+             :ok <- ResponsibilityPersistence.save(path, restarted_state) do
+          {:ok, restarted_state}
+        else
+          {:error, reason} -> {:error, {:restart_reconciliation_persistence_failed, reason}}
+          other -> {:error, {:restart_reconciliation_persistence_failed, other}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp load_responsibility_graph(path), do: {:error, {:invalid_state_path, path}}
+
+  defp persist_execution_fence(%State{execution_fence_path: nil} = state, fence_state) do
+    {:ok, %{state | execution_fence: fence_state}}
+  end
+
+  defp persist_execution_fence(%State{execution_fence_path: path} = state, fence_state)
+       when is_binary(path) do
+    case Persistence.save(path, fence_state) do
+      :ok -> {:ok, %{state | execution_fence: fence_state}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_execution_fence(_state, _fence_state), do: {:error, :invalid_state_path}
+
+  defp persist_responsibility_graph(%State{responsibility_graph_path: nil} = state, graph_state) do
+    {:ok, %{state | responsibility_graph: graph_state}}
+  end
+
+  defp persist_responsibility_graph(%State{responsibility_graph_path: path} = state, graph_state)
+       when is_binary(path) do
+    case ResponsibilityPersistence.save(path, graph_state) do
+      :ok -> {:ok, %{state | responsibility_graph: graph_state}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_responsibility_graph(_state, _graph_state), do: {:error, :invalid_state_path}
+
+  defp execution_fence_now_ms, do: max(0, System.system_time(:millisecond))
+
+  defp server_available?(server) when is_pid(server), do: Process.alive?(server)
+  defp server_available?(server) when is_atom(server), do: is_pid(Process.whereis(server))
+  defp server_available?(_server), do: false
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
@@ -1516,7 +2781,7 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
+    updated_running_entry =
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
@@ -1530,9 +2795,109 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
-    }
+      })
+
+    updated_running_entry =
+      if meaningful_progress_update?(update) do
+        updated_running_entry
+        |> Map.put(:codex_progress_token_baseline, updated_running_entry.codex_total_tokens)
+        |> Map.put(:codex_last_progress_timestamp, timestamp)
+        |> Map.put(:codex_last_progress_method, codex_update_method(update))
+      else
+        updated_running_entry
+      end
+
+    updated_running_entry =
+      if qualifying_liveness_update?(update) do
+        updated_running_entry
+        |> Map.put(:codex_last_activity_monotonic_ms, monotonic_now_ms())
+        |> Map.put(:codex_last_activity_method, codex_update_method(update))
+      else
+        updated_running_entry
+      end
+
+    updated_running_entry =
+      if durable_progress_update?(update) do
+        updated_running_entry
+        |> Map.put(:codex_durable_progress_token_baseline, updated_running_entry.codex_total_tokens)
+        |> Map.put(:codex_last_durable_progress_timestamp, timestamp)
+        |> Map.put(:codex_last_durable_progress_method, codex_update_method(update))
+      else
+        updated_running_entry
+      end
+
+    {updated_running_entry, token_delta}
+  end
+
+  defp meaningful_progress_update?(%{event: event})
+       when event in [
+              :session_started,
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :tool_call_completed
+            ],
+       do: true
+
+  defp meaningful_progress_update?(update) do
+    case codex_update_method(update) do
+      method when is_binary(method) ->
+        String.contains?(method, "commandExecution") or
+          String.contains?(method, "/tool/") or
+          String.contains?(method, "fileChange")
+
+      _ ->
+        false
+    end
+  end
+
+  defp qualifying_liveness_update?(%{event: event})
+       when event in [
+              :session_started,
+              :turn_completed,
+              :turn_failed,
+              :turn_cancelled,
+              :tool_call_completed,
+              :turn_input_required,
+              :approval_required
+            ],
+       do: true
+
+  defp qualifying_liveness_update?(update) do
+    case codex_update_method(update) do
+      method when is_binary(method) ->
+        String.starts_with?(method, "item/") or
+          String.contains?(method, "commandExecution") or
+          String.contains?(method, "/tool/") or
+          String.contains?(method, "fileChange") or
+          method == "mcpServer/elicitation/request"
+
+      _ ->
+        false
+    end
+  end
+
+  defp durable_progress_update?(%{event: event})
+       when event in [:session_started, :turn_completed, :turn_failed, :turn_cancelled],
+       do: true
+
+  defp durable_progress_update?(update) do
+    case codex_update_method(update) do
+      method when is_binary(method) -> String.contains?(method, "fileChange")
+      _ -> false
+    end
+  end
+
+  defp codex_update_method(%{payload: %{"method" => method}}) when is_binary(method), do: method
+  defp codex_update_method(%{payload: %{method: method}}) when is_binary(method), do: method
+  defp codex_update_method(%{event: event}) when is_atom(event), do: Atom.to_string(event)
+  defp codex_update_method(_update), do: nil
+
+  defp monotonic_now_ms do
+    case Application.get_env(:symphony_elixir, :monotonic_now_ms) do
+      now_ms when is_integer(now_ms) -> now_ms
+      _ -> System.monotonic_time(:millisecond)
+    end
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})

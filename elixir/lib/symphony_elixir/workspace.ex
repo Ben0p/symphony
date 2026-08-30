@@ -37,6 +37,50 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc "Reads the exact Git commit currently checked out in a workspace."
+  @spec current_head(Path.t()) :: {:ok, String.t()} | {:error, term()}
+  @spec current_head(Path.t(), worker_host()) :: {:ok, String.t()} | {:error, term()}
+  def current_head(workspace, worker_host \\ nil) do
+    cond do
+      is_binary(workspace) and is_nil(worker_host) -> current_local_head(workspace)
+      is_binary(workspace) and is_binary(worker_host) -> current_remote_head(workspace, worker_host)
+      true -> {:error, :invalid_workspace}
+    end
+  end
+
+  defp current_local_head(workspace) do
+    with :ok <- validate_workspace_path(workspace, nil) do
+      try do
+        case System.cmd("git", ["rev-parse", "--verify", "HEAD^{commit}"],
+               cd: workspace,
+               stderr_to_stdout: true
+             ) do
+          {output, 0} -> parse_git_head(output)
+          {_output, status} -> {:error, {:git_head_unavailable, status}}
+        end
+      rescue
+        error in [ArgumentError, ErlangError, File.Error] ->
+          {:error, {:git_head_unavailable, error}}
+      end
+    end
+  end
+
+  defp current_remote_head(workspace, worker_host) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, {output, 0}} <-
+           run_remote_command(
+             worker_host,
+             remote_shell_assign("workspace", workspace) <>
+               "\ncd \"$workspace\" && git rev-parse --verify HEAD^{commit}",
+             Config.settings!().hooks.timeout_ms
+           ) do
+      parse_git_head(output)
+    else
+      {:ok, {_output, status}} -> {:error, {:git_head_unavailable, status}}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp ensure_workspace(workspace, nil) do
     cond do
       File.dir?(workspace) ->
@@ -161,6 +205,56 @@ defmodule SymphonyElixir.Workspace do
     File.rm_rf(workspace)
   end
 
+  defp remove_startup_workspace(workspace, nil) do
+    if File.exists?(workspace) do
+      with :ok <- validate_workspace_path(workspace, nil) do
+        maybe_run_before_remove_hook(workspace, nil)
+        remove_local_workspace_out_of_process(workspace)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp remove_startup_workspace(workspace, worker_host) when is_binary(worker_host) do
+    case remove(workspace, worker_host) do
+      {:ok, _removed} -> :ok
+      {:error, reason, path} -> {:error, {reason, path}}
+    end
+  end
+
+  defp remove_local_workspace_out_of_process(workspace) do
+    {executable, arguments} =
+      case :os.type() do
+        {:win32, _name} ->
+          {"cmd.exe",
+           [
+             "/d",
+             "/s",
+             "/c",
+             "rmdir",
+             "/s",
+             "/q",
+             String.replace(workspace, "/", "\\")
+           ]}
+
+        _other ->
+          {"rm", ["-rf", "--", workspace]}
+      end
+
+    case System.cmd(executable, arguments, stderr_to_stdout: true) do
+      {_output, 0} ->
+        if File.exists?(workspace),
+          do: {:error, {:workspace_remove_incomplete, Path.basename(workspace)}},
+          else: :ok
+
+      {_output, status} ->
+        {:error, {:workspace_remove_failed, status}}
+    end
+  rescue
+    error -> {:error, {:workspace_remove_failed, error.__struct__}}
+  end
+
   @spec remove_issue_workspaces(term()) :: :ok
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 
@@ -215,6 +309,48 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
+
+  @doc false
+  @spec remove_issue_workspaces_for_startup(term()) :: :ok | {:error, term()}
+  def remove_issue_workspaces_for_startup(issue_or_identifier) do
+    remove_issue_workspaces_for_startup(issue_or_identifier, nil)
+  end
+
+  @doc false
+  @spec remove_issue_workspaces_for_startup(term(), worker_host()) :: :ok | {:error, term()}
+  def remove_issue_workspaces_for_startup(issue_or_identifier, worker_host)
+      when is_binary(worker_host) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue_or_identifier), worker_host) do
+      remove_startup_workspace(workspace, worker_host)
+    end
+  end
+
+  def remove_issue_workspaces_for_startup(%{identifier: identifier} = issue, nil)
+      when is_binary(identifier),
+      do: remove_valid_issue_workspaces_for_startup(issue)
+
+  def remove_issue_workspaces_for_startup(identifier, nil) when is_binary(identifier),
+    do: remove_valid_issue_workspaces_for_startup(identifier)
+
+  def remove_issue_workspaces_for_startup(_issue_or_identifier, _worker_host),
+    do: {:error, :invalid_issue_identifier}
+
+  defp remove_valid_issue_workspaces_for_startup(issue_or_identifier) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue_or_identifier), nil) do
+          remove_startup_workspace(workspace, nil)
+        end
+
+      worker_hosts ->
+        Enum.reduce_while(worker_hosts, :ok, fn worker_host, :ok ->
+          case remove_issue_workspaces_for_startup(issue_or_identifier, worker_host) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+    end
+  end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
@@ -541,6 +677,16 @@ defmodule SymphonyElixir.Workspace do
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
+    end
+  end
+
+  defp parse_git_head(output) do
+    head = output |> IO.iodata_to_binary() |> String.trim()
+
+    if Regex.match?(~r/\A[0-9a-f]{40,64}\z/, head) do
+      {:ok, head}
+    else
+      {:error, :invalid_git_head}
     end
   end
 

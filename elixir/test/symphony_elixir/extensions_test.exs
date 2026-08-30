@@ -314,7 +314,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "startup_maintenance" => %{
+               "status" => "succeeded",
+               "cleaned_count" => 2,
+               "skipped_active_count" => 1
+             }
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
@@ -703,7 +708,8 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      startup_maintenance: %{status: "succeeded", cleaned_count: 2, skipped_active_count: 1}
     }
   end
 
