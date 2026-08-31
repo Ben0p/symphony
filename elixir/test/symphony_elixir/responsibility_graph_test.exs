@@ -211,6 +211,31 @@ defmodule SymphonyElixir.ResponsibilityGraphTest do
     assert {:ok, _} = ResponsibilityGraph.authorize(restored, "worker", :commit)
   end
 
+  test "restart preserves an unbound responsible delegation for first admission" do
+    {:ok, graph, _owner} =
+      ResponsibilityGraph.delegate(
+        ResponsibilityGraph.new(),
+        delegation("owner", :accountable, scope: Map.merge(@scope, %{issue_id: :any, repository: :any})),
+        0
+      )
+
+    {:ok, graph1, _worker} =
+      ResponsibilityGraph.delegate(
+        graph,
+        delegation("worker", :responsible, parent_delegation_id: "owner")
+        |> Map.put(:scope, Map.merge(@scope, %{issue_id: "HGS-295", repository: "asgard"})),
+        1
+      )
+
+    assert {:ok, restarted} = ResponsibilityGraph.mark_unreconciled_after_restart(graph1)
+    assert restarted.delegations["owner"].status == :blocked
+    assert restarted.delegations["worker"].status == :active
+
+    assert {:ok, reconciled} = ResponsibilityGraph.reconcile_delegation(restarted, "owner", nil, 2)
+    assert {:ok, admitted} = ResponsibilityGraph.admission_delegation(reconciled, "HGS-295", nil, "asgard")
+    assert admitted.id == "worker"
+  end
+
   test "revocation fences descendants through the HGS-294 generation" do
     {:ok, graph, _owner} = ResponsibilityGraph.delegate(ResponsibilityGraph.new(), delegation("owner", :accountable), 0)
     {:ok, graph1, _} = ResponsibilityGraph.delegate(graph, delegation("worker", :responsible, parent_delegation_id: "owner", runtime_lease: runtime_lease()), 1)
