@@ -52,6 +52,7 @@ defmodule SymphonyElixir.ResponsibilityGraphPersistenceTest do
     assert restored.schema_version == 1
     assert restored.enforcement == :manual
     assert restored.delegations["owner"].role == :accountable
+    assert restored.delegations["worker"].scope.repository == "orchestrator"
     assert restored.delegations["worker"].runtime_lease.session_id == "worker"
     assert restored.delegations["worker"].budget.max_tokens == 10_000
   end

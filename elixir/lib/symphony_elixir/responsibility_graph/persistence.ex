@@ -16,7 +16,7 @@ defmodule SymphonyElixir.ResponsibilityGraph.Persistence do
   @actions [:read, :observe, :delegate, :reconcile, :edit, :commit, :push, :state_mutation, :cleanup, :review, :report]
   @efforts [:none, :minimal, :low, :medium, :high, :xhigh, :max, :ultra]
   @classes [:routine_engineering, :coordination, :read_only, :exception]
-  @scope_identifiers [:company_id, :objective_id, :initiative_id, :project_id, :work_package_id, :issue_id]
+  @scope_identifiers [:company_id, :objective_id, :initiative_id, :project_id, :work_package_id, :issue_id, :repository]
   @scope_collections [:paths, :modules, :environments, :actions]
 
   @type load_result :: {:ok, ResponsibilityGraph.state()} | :missing | {:error, term()}
