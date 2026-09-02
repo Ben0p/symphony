@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.RateLimiter
   alias SymphonyElixir.Tracker.Issue
 
   @issue_page_size 50
@@ -148,22 +149,47 @@ defmodule SymphonyElixir.Linear.Client do
       end)
 
     with {:ok, headers} <- graphql_headers(tracker_settings),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
-      {:ok, body}
+         {:ok, response} <- rate_limited_request(request_fun, payload, headers, tracker_settings) do
+      case response do
+        %{status: 200, body: body} ->
+          {:ok, body}
+
+        response ->
+          Logger.error(
+            "Linear GraphQL request failed status=#{response.status}" <>
+              linear_error_context(payload, response)
+          )
+
+          {:error, {:linear_api_status, response.status}}
+      end
     else
-      {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
-
-        {:error, {:linear_api_status, response.status}}
-
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
         {:error, {:linear_api_request, reason}}
     end
   end
+
+  defp rate_limited_request(request_fun, payload, headers, tracker_settings) do
+    case RateLimiter.await(tracker_settings) do
+      :ok ->
+        response = request_fun.(payload, headers)
+        observe_rate_limited_response(tracker_settings, response)
+        response
+
+      {:error, reason} ->
+        {:error, {:linear_rate_limit, reason}}
+    end
+  end
+
+  defp observe_rate_limited_response(tracker_settings, {:ok, response}) do
+    RateLimiter.observe_response(tracker_settings, response)
+  end
+
+  defp observe_rate_limited_response(tracker_settings, response) when is_map(response) do
+    RateLimiter.observe_response(tracker_settings, response)
+  end
+
+  defp observe_rate_limited_response(_tracker_settings, _response), do: :ok
 
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
