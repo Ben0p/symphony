@@ -112,6 +112,26 @@ Optional flags:
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
+### Private runner call-home
+
+The runtime can report a fixed, sanitized Symphony posture projection to a private Dahlia provider
+endpoint. The reporter is disabled when any required setting is absent or invalid. Configure these
+values in the runner host environment, not in a repository-owned `WORKFLOW.md`:
+
+```text
+DAHLIA_RUNNER_CALL_HOME_URL=https://provider.example/runner/v1/symphony/observations
+DAHLIA_RUNNER_CALL_HOME_TOKEN=<host-injected secret>
+DAHLIA_RUNNER_ID=<scoped runner identity>
+DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
+DAHLIA_SYMPHONY_POOL_KEY=<registered pool key>
+```
+
+`DAHLIA_RESPONSIBLE_DELEGATION_ID` and `DAHLIA_EXECUTION_FENCE_ID` are required for active-run
+observations. `DAHLIA_RUNNER_OBSERVATION_INTERVAL_MS` defaults to 5 seconds and is capped at 60
+seconds; `DAHLIA_RUNNER_OBSERVATION_STATE_PATH` can override the local sequence state file. Each
+observation contains only the versioned contract fields and the reporter persists its sequence
+before sending, so the provider can reject replayed or out-of-order observations.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
