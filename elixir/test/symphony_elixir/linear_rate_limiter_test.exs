@@ -118,6 +118,20 @@ defmodule SymphonyElixir.Linear.RateLimiterTest do
     assert_receive {:advisory_lock_killed, ^port}, 2_000
   end
 
+  test "times out while a holder is alive and reacquires after release", %{tracker_settings: tracker_settings} do
+    tracker_settings =
+      put_in(tracker_settings, [:provider, "rate_limit_max_wait_ms"], 75)
+      |> put_in([:provider, "rate_limit_min_interval_ms"], 0)
+
+    port = start_advisory_lock(tracker_settings, self(), 250, "-KILL")
+    started_at = System.monotonic_time(:millisecond)
+
+    assert {:error, :linear_rate_limit_lock_timeout} = RateLimiter.await(tracker_settings)
+    assert System.monotonic_time(:millisecond) - started_at < 220
+    assert_receive {:advisory_lock_killed, ^port}, 2_000
+    assert :ok = RateLimiter.await(tracker_settings)
+  end
+
   test "honors a bounded retry-after cooldown", %{tracker_settings: tracker_settings} do
     assert :ok = RateLimiter.observe_response(tracker_settings, %{status: 429, headers: [{"retry-after", "1"}]})
 
@@ -243,7 +257,7 @@ defmodule SymphonyElixir.Linear.RateLimiterTest do
     }
 
     result = SymphonyElixir.Linear.RateLimiter.await(settings)
-    File.write!(result_path, inspect(result) <> "\n" <> Integer.to_string(System.monotonic_time(:millisecond)))
+    File.write!(result_path, inspect(result) <> "\n" <> Integer.to_string(System.system_time(:millisecond)))
     """
 
     Port.open(

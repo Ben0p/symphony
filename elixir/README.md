@@ -315,6 +315,9 @@ codex:
   HTTP `Retry-After` headers and Linear GraphQL rate-limit bodies both persist a bounded cooldown;
   a one-hour provider window therefore fails closed locally instead of being retried against the
   exhausted API bucket.
+  Managed Linux requires the util-linux `flock` executable for this lock. Hosts without that
+  kernel primitive, including Windows hosts, fail closed rather than using an unverified stale-lock
+  fallback.
 - Identity and normalization: `issue.id` is the Linear issue ID and `issue.native_ref` is currently
   `nil`. Records missing a nonblank ID, identifier, title, or state are dropped from candidate
   pages and fail ID refreshes. State keeps Linear's spelling; integer priorities are preserved and
