@@ -6,8 +6,10 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
+  alias SymphonyElixir.WorkPackageRuntime
 
   @endpoint SymphonyElixirWeb.Endpoint
+  @runtime_source_head String.duplicate("a", 40)
 
   defmodule FakeLinearClient do
     def fetch_issues_by_states(states) do
@@ -437,7 +439,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           repository_ref: "openai/symphony",
           workspace_root: "/srv/symphony/workspaces",
           global_pause_file: "/run/symphony/pause",
-          accepted_source_head: "source-head-1",
+          accepted_source_head: @runtime_source_head,
           status: "configured",
           source_head_status: "verified"
         },
@@ -458,7 +460,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     response = json_response(get(build_conn(), "/api/v1/state"), 200)
 
     assert response["runtime_identity"]["pool_key"] == "pool-engineering"
-    assert response["runtime_identity"]["accepted_source_head"] == "source-head-1"
+    assert response["runtime_identity"]["accepted_source_head"] == @runtime_source_head
 
     assert response["execution_authority"] == %{
              "fence" => "hgs294",
@@ -475,6 +477,119 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
 
     assert response["readiness"] == %{"ready?" => true, "status" => "ready", "reasons" => []}
+  end
+
+  test "phoenix state reports live managed readiness after responsibility activation" do
+    orchestrator_name = Module.concat(__MODULE__, :LiveRuntimeIdentityOrchestrator)
+    state_root = Path.join(System.tmp_dir!(), "symphony-live-runtime-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(state_root)
+
+    pause_path = Path.join(state_root, "global-pause")
+    journal_path = Path.join(state_root, "work-package.json")
+    archive_root = Path.join(state_root, "cleanup-archives")
+    File.write!(pause_path, "paused\n")
+
+    source_head = @runtime_source_head
+
+    environment = %{
+      "SYMPHONY_POOL_KEY" => "pool-engineering",
+      "SYMPHONY_REPOSITORY_REF" => "openai/symphony",
+      "SYMPHONY_ACCEPTED_SOURCE_HEAD" => source_head,
+      "SYMPHONY_CURRENT_SOURCE_HEAD" => source_head,
+      "SYMPHONY_GLOBAL_PAUSE_FILE" => pause_path,
+      "DAHLIA_WORK_PACKAGE_PROVIDER_URL" => "https://provider.example",
+      "DAHLIA_WORK_PACKAGE_RUNNER_TOKEN" => "public-test-runner-token",
+      "DAHLIA_WORK_PACKAGE_ATTESTATION_KEY" => "public-test-attestation-key",
+      "DAHLIA_RUNNER_ID" => "runner-live-test",
+      "DAHLIA_MANAGED_PROJECT_PROFILE_ID" => "profile-live-test",
+      "DAHLIA_WORK_PACKAGE_JOURNAL_PATH" => journal_path,
+      "DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT" => archive_root
+    }
+
+    environment_keys = Map.keys(environment)
+
+    previous_environment =
+      Map.new(environment_keys, fn key -> {key, System.get_env(key)} end)
+
+    Enum.each(environment, fn {key, value} -> System.put_env(key, value) end)
+
+    on_exit(fn ->
+      Enum.each(previous_environment, fn {key, value} -> restore_env(key, value) end)
+      File.rm_rf(state_root)
+    end)
+
+    assert {:ok, runtime} = WorkPackageRuntime.configuration(env: environment)
+
+    start_supervised!(
+      {SymphonyElixir.Orchestrator,
+       [
+         name: orchestrator_name,
+         execution_supervisor: :systemd_user,
+         work_package_runtime: runtime,
+         startup_maintenance_fun: fn ->
+           {:ok,
+            %{
+              status: "succeeded",
+              cleaned_count: 0,
+              skipped_active_count: 0,
+              failure_count: 0,
+              duration_ms: 0
+            }}
+         end
+       ]}
+    )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 500)
+
+    before_activation = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert before_activation["runtime_identity"] == %{
+             "pool_key" => "pool-engineering",
+             "repository_ref" => "openai/symphony",
+             "workspace_root" => Path.expand(Config.local_workspace_root()),
+             "global_pause_file" => Path.expand(pause_path),
+             "accepted_source_head" => source_head,
+             "status" => "configured",
+             "source_head_status" => "verified"
+           }
+
+    assert before_activation["execution_authority"]["fence"] == "hgs294"
+    assert before_activation["execution_authority"]["delegation"] == "hgs300"
+    assert before_activation["execution_authority"]["delegation_posture"] == "manual"
+    assert before_activation["execution_authority"]["status"] == "unknown"
+
+    assert before_activation["managed_work_package"] == %{
+             "required?" => true,
+             "configured?" => true,
+             "state" => "configured"
+           }
+
+    assert before_activation["readiness"]["status"] == "not_ready"
+    assert before_activation["readiness"]["ready?"] == false
+    assert "execution_authority_unavailable" in before_activation["readiness"]["reasons"]
+    assert before_activation["pause_gate"]["state"] == "paused"
+
+    assert {:ok, :activated} =
+             SymphonyElixir.Orchestrator.activate_responsibility_graph(
+               orchestrator_name,
+               System.system_time(:millisecond)
+             )
+
+    after_activation = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert after_activation["execution_authority"] == %{
+             "fence" => "hgs294",
+             "delegation" => "hgs300",
+             "fence_posture" => "quiescent",
+             "delegation_posture" => "quiescent",
+             "status" => "ready"
+           }
+
+    assert after_activation["readiness"] == %{
+             "ready?" => true,
+             "status" => "ready",
+             "reasons" => []
+           }
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
