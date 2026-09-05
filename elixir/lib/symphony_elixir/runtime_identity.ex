@@ -160,11 +160,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
   defp delegation_posture(responsibility_state) do
     case ResponsibilityGraph.snapshot(responsibility_state) do
       %{enforcement: :enforced, delegations: delegations} when is_list(delegations) ->
-        cond do
-          Enum.any?(delegations, &active_responsible?/1) -> "active"
-          Enum.any?(delegations, &active_delegation?/1) -> "missing"
-          true -> "quiescent"
-        end
+        if Enum.any?(delegations, &active_responsible?/1), do: "active", else: "quiescent"
 
       %{enforcement: :manual} ->
         "manual"
@@ -176,8 +172,6 @@ defmodule SymphonyElixir.RuntimeIdentity do
 
   defp active_responsible?(delegation),
     do: delegation.role == :responsible and delegation.status == :active
-
-  defp active_delegation?(delegation), do: delegation.status == :active
 
   defp readiness_reasons(managed_pool?, managed_runtime_configured?, missing, source_head_status, authority) do
     required? = managed_pool? or managed_runtime_configured?

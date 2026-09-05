@@ -115,9 +115,16 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
     assert "accepted_source_head_invalid" in observed_invalid.readiness.reasons
   end
 
-  test "an enforced graph with no active delegation reports quiescent authority" do
+  test "an enforced graph without active responsible execution reports quiescent authority" do
+    graph = enforced_graph()
+
+    observer_only_graph = %{
+      graph
+      | delegations: Map.update!(graph.delegations, "delegation-runtime", &Map.put(&1, :role, :observer))
+    }
+
     snapshot =
-      RuntimeIdentity.snapshot(ExecutionFence.new(), %{enforced_graph() | delegations: %{}},
+      RuntimeIdentity.snapshot(ExecutionFence.new(), observer_only_graph,
         env: @env,
         workspace_root: "/srv/symphony/workspaces",
         pause_snapshot: @pause,
