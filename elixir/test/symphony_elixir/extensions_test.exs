@@ -513,6 +513,12 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Enum.each(environment, fn {key, value} -> System.put_env(key, value) end)
 
+    # Keep the durable execution-fence and responsibility-graph state beside
+    # the other per-test artifacts. The default workspace root is shared by
+    # test runs, so a graph activated by an earlier run would otherwise make
+    # the pre-activation response appear quiescent.
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: state_root)
+
     on_exit(fn ->
       Enum.each(previous_environment, fn {key, value} -> restore_env(key, value) end)
       File.rm_rf(state_root)
