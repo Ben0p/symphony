@@ -50,10 +50,14 @@ defmodule SymphonyElixir.ExecutionFence do
       executions =
         Map.new(state.executions, fn {issue_id, execution} ->
           next_execution =
-            if execution.cleanup == :cleaned or active_lease_ids(execution) == [] do
-              %{execution | ownership: :reconciled}
-            else
+            if termination_unconfirmed?(execution) do
               %{execution | ownership: :unknown}
+            else
+              if execution.cleanup == :cleaned or active_lease_ids(execution) == [] do
+                %{execution | ownership: :reconciled}
+              else
+                %{execution | ownership: :unknown}
+              end
             end
 
           {issue_id, next_execution}
@@ -115,6 +119,7 @@ defmodule SymphonyElixir.ExecutionFence do
         leases: %{},
         terminal: nil,
         cleanup: :pending,
+        termination_unconfirmed: false,
         admitted_at_ms: now_ms
       }
 
@@ -353,16 +358,11 @@ defmodule SymphonyElixir.ExecutionFence do
   Approves generation-bound cleanup only after terminal fencing, quiescence,
   exact-head reconciliation, and released/expired leases.
   """
-  @spec cleanup(state(), token(), String.t(), non_neg_integer()) ::
-          {:ok, state(), :cleaned | :already_cleaned} | {:error, term()}
-  def cleanup(state, token, expected_head, now_ms)
-      when is_binary(expected_head) and is_integer(now_ms) and now_ms >= 0 do
+  @spec validate_cleanup(state(), token(), String.t()) :: :ok | {:error, term()}
+  def validate_cleanup(state, token, expected_head) when is_binary(expected_head) do
     with :ok <- validate_state(state),
          {:ok, execution} <- current_execution(state, token) do
       cond do
-        execution.cleanup == :cleaned ->
-          {:ok, state, :already_cleaned}
-
         execution.status != :terminal ->
           {:error, :not_terminal}
 
@@ -376,8 +376,27 @@ defmodule SymphonyElixir.ExecutionFence do
           {:error, :head_diverged}
 
         true ->
-          updated = execution |> Map.put(:cleanup, :cleaned) |> Map.put(:cleaned_at_ms, now_ms)
-          {:ok, put_execution(state, updated), :cleaned}
+          :ok
+      end
+    end
+  end
+
+  def validate_cleanup(_state, _token, _expected_head), do: {:error, :invalid_cleanup}
+
+  @doc """
+  Persists a terminal cleanup marker after its filesystem postconditions are verified.
+  """
+  @spec cleanup(state(), token(), String.t(), non_neg_integer()) ::
+          {:ok, state(), :cleaned | :already_cleaned} | {:error, term()}
+  def cleanup(state, token, expected_head, now_ms)
+      when is_binary(expected_head) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_cleanup(state, token, expected_head),
+         {:ok, execution} <- current_execution(state, token) do
+      if execution.cleanup == :cleaned do
+        {:ok, state, :already_cleaned}
+      else
+        updated = execution |> Map.put(:cleanup, :cleaned) |> Map.put(:cleaned_at_ms, now_ms)
+        {:ok, put_execution(state, updated), :cleaned}
       end
     end
   end
@@ -408,7 +427,7 @@ defmodule SymphonyElixir.ExecutionFence do
       {final_state, final_summary} =
         expire_or_block_missing_leases(reconciled_state, summary, seen, now_ms, ttl_ms)
 
-      {:ok, final_state, finalize_summary(final_summary)}
+      {:ok, final_state, final_summary |> add_unconfirmed_reasons(final_state) |> finalize_summary()}
     end
   end
 
@@ -472,7 +491,8 @@ defmodule SymphonyElixir.ExecutionFence do
       present_string?(Map.get(execution, :branch)) and
       present_string?(Map.get(execution, :worktree)) and
       non_negative_integer?(Map.get(execution, :admitted_at_ms)) and
-      optional_non_negative_integer?(Map.get(execution, :cleaned_at_ms))
+      optional_non_negative_integer?(Map.get(execution, :cleaned_at_ms)) and
+      Map.get(execution, :termination_unconfirmed, false) in [true, false]
   end
 
   defp valid_history_execution?(execution) when is_map(execution) do
@@ -924,7 +944,25 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp reset_ownership(executions) do
     Map.new(executions, fn {issue_id, execution} ->
-      {issue_id, %{execution | ownership: :reconciled}}
+      ownership = if termination_unconfirmed?(execution), do: :unknown, else: :reconciled
+      {issue_id, %{execution | ownership: ownership}}
+    end)
+  end
+
+  defp termination_unconfirmed?(execution),
+    do: Map.get(execution, :termination_unconfirmed, false) == true
+
+  defp add_unconfirmed_reasons(summary, state) do
+    Enum.reduce(state.executions, summary, fn {_issue_id, execution}, summary_acc ->
+      if termination_unconfirmed?(execution) do
+        Enum.reduce(execution.leases, summary_acc, fn {session_id, lease}, inner_summary ->
+          if lease.status == :expired,
+            do: add_reason(inner_summary, :unknown, session_id),
+            else: inner_summary
+        end)
+      else
+        summary_acc
+      end
     end)
   end
 
@@ -1017,8 +1055,9 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp expire_observed_lease(state, summary, seen, execution, observation) do
     expired_state = expire_lease(state, execution, observation.session_id)
+    blocked_state = mark_termination_unconfirmed(expired_state, execution.issue_id)
     expired_summary = add_reason(summary, :expired, observation.session_id)
-    {expired_state, expired_summary, seen}
+    {blocked_state, add_reason(expired_summary, :unknown, observation.session_id), seen}
   end
 
   defp stale_observed_lease(state, summary, seen, execution, observation) do
@@ -1071,7 +1110,10 @@ defmodule SymphonyElixir.ExecutionFence do
 
       now_ms - lease.last_heartbeat_at >= ttl_ms ->
         expired_state = expire_lease(state, execution, session_id)
-        blocked_state = mark_ownership(expired_state, issue_id, :unknown)
+        blocked_state =
+          expired_state
+          |> mark_termination_unconfirmed(issue_id)
+          |> mark_ownership(issue_id, :unknown)
         blocked_summary = add_reason(summary, :unknown, session_id)
         {blocked_state, add_reason(blocked_summary, :expired, session_id)}
 
@@ -1086,6 +1128,9 @@ defmodule SymphonyElixir.ExecutionFence do
     |> put_in([:executions, execution.issue_id, :leases, session_id, :status], :expired)
     |> put_in([:sessions, session_id, :status], :expired)
   end
+
+  defp mark_termination_unconfirmed(state, issue_id),
+    do: put_in(state, [:executions, issue_id, :termination_unconfirmed], true)
 
   defp mark_ownership(state, issue_id, :contradictory),
     do: put_in(state, [:executions, issue_id, :ownership], :contradictory)

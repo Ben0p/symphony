@@ -1013,7 +1013,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace remove continues when before_remove hook fails" do
+  test "workspace remove preserves the workspace when before_remove hook fails" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1031,14 +1031,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
-      refute File.exists?(workspace)
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, _}, ^workspace} =
+               Workspace.remove(workspace)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook fails with large output" do
+  test "workspace remove preserves the workspace when before_remove hook fails with large output" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1056,14 +1058,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
-      refute File.exists?(workspace)
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, _}, ^workspace} =
+               Workspace.remove(workspace)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook times out" do
+  test "workspace remove preserves the workspace when before_remove hook times out" do
     previous_timeout = Application.get_env(:symphony_elixir, :workspace_hook_timeout_ms)
 
     on_exit(fn ->
@@ -1093,8 +1097,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
-      refute File.exists?(workspace)
+      assert {:error, {:workspace_hook_timeout, "before_remove", _}, ^workspace} =
+               Workspace.remove(workspace)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end

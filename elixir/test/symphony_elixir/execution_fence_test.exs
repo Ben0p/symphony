@@ -157,6 +157,11 @@ defmodule SymphonyElixir.ExecutionFenceTest do
     assert state.executions[@issue].leases["worker-1"].status == :expired
     assert state.executions[@issue].ownership == :unknown
 
+    assert {:ok, state, %{status: :blocked, expired: [], unknown: ["worker-1"]}} =
+             ExecutionFence.reconcile_sessions(state, [], 201, 50)
+
+    assert state.executions[@issue].ownership == :unknown
+
     {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 210)
     assert {:error, :ownership_unreconciled} = ExecutionFence.cleanup(state, token, "abc123", 220)
   end

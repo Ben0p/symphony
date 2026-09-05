@@ -1671,19 +1671,26 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_fenced_execution(state, issue_or_identifier, entry, token, head) do
     now_ms = execution_fence_now_ms()
 
-    case cleanup_issue_workspace(issue_or_identifier, entry) do
-      cleanup_result when cleanup_result in [:ok] ->
-        persist_fenced_cleanup(state, token, head, now_ms)
+    case ExecutionFence.validate_cleanup(state.execution_fence, token, head) do
+      :ok ->
+        case cleanup_issue_workspace(issue_or_identifier, entry) do
+          cleanup_result when cleanup_result in [:ok] ->
+            persist_fenced_cleanup(state, token, head, now_ms)
 
-      {:ok, _removed} ->
-        persist_fenced_cleanup(state, token, head, now_ms)
+          {:ok, _removed} ->
+            persist_fenced_cleanup(state, token, head, now_ms)
 
-      {:error, reason, _path} ->
-        Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
-        state
+          {:error, reason, _path} ->
+            Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+            state
+
+          {:error, reason} ->
+            Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+            state
+        end
 
       {:error, reason} ->
-        Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+        Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
         state
     end
   end

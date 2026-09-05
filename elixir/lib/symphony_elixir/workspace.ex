@@ -157,24 +157,12 @@ defmodule SymphonyElixir.Workspace do
   def remove(workspace, worker_host) when is_binary(worker_host) do
     case validate_remote_workspace_path(workspace) do
       :ok ->
-        maybe_run_before_remove_hook(workspace, worker_host)
-
-        script =
-          [
-            remote_shell_assign("workspace", workspace),
-            "rm -rf -- \"$workspace\""
-          ]
-          |> Enum.join("\n")
-
-        case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-          {:ok, {_output, 0}} ->
-            {:ok, []}
-
-          {:ok, {output, status}} ->
-            {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+        case maybe_run_before_remove_hook(workspace, worker_host) do
+          :ok ->
+            remove_remote_workspace(workspace, worker_host)
 
           {:error, reason} ->
-            {:error, reason, ""}
+            {:error, reason, workspace}
         end
 
       {:error, reason} ->
@@ -207,15 +195,40 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
-    File.rm_rf(workspace)
+    case maybe_run_before_remove_hook(workspace, nil) do
+      :ok -> File.rm_rf(workspace)
+      {:error, reason} -> {:error, reason, workspace}
+    end
+  end
+
+  defp remove_remote_workspace(workspace, worker_host) do
+    root = Config.settings!().workspace.root
+
+    script =
+      [
+        remote_shell_assign("root", root),
+        remote_shell_assign("workspace", workspace),
+        "canonical_root=$(realpath -m -- \"$root\")",
+        "canonical_workspace=$(realpath -m -- \"$workspace\")",
+        "case \"$canonical_workspace/\" in \"$canonical_root/\"*) ;; *) exit 73 ;; esac",
+        "[ \"$canonical_workspace\" != \"$canonical_root\" ]",
+        "rm -rf -- \"$workspace\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> {:ok, []}
+      {:ok, {output, status}} -> {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+      {:error, reason} -> {:error, reason, ""}
+    end
   end
 
   defp remove_startup_workspace(workspace, nil) do
     if File.exists?(workspace) do
       with :ok <- validate_workspace_path(workspace, nil) do
-        maybe_run_before_remove_hook(workspace, nil)
-        remove_local_workspace_out_of_process(workspace)
+        with :ok <- maybe_run_before_remove_hook(workspace, nil) do
+          remove_local_workspace_out_of_process(workspace)
+        end
       end
     else
       :ok
@@ -487,7 +500,7 @@ defmodule SymphonyElixir.Workspace do
               "before_remove",
               nil
             )
-            |> ignore_hook_failure()
+            
         end
 
       false ->
@@ -529,7 +542,7 @@ defmodule SymphonyElixir.Workspace do
           {:error, reason} ->
             {:error, reason}
         end
-        |> ignore_hook_failure()
+        
     end
   end
 
@@ -627,6 +640,8 @@ defmodule SymphonyElixir.Workspace do
 
     with :ok <- validate_remote_path_text(workspace),
          :ok <- validate_remote_path_text(root),
+         :ok <- validate_remote_absolute_path(workspace),
+         :ok <- validate_remote_absolute_path(root),
          {:ok, root_segments} <- remote_path_segments(root),
          {:ok, workspace_segments} <- remote_path_segments(workspace) do
       if length(workspace_segments) > length(root_segments) and
@@ -635,6 +650,14 @@ defmodule SymphonyElixir.Workspace do
       else
         {:error, {:workspace_outside_root, workspace, root}}
       end
+    end
+  end
+
+  defp validate_remote_absolute_path(path) do
+    if String.starts_with?(path, ["/", "~/", "\\"]) or Regex.match?(~r/\A[A-Za-z]:\//, path) do
+      :ok
+    else
+      {:error, {:workspace_path_unreadable, path, :not_absolute}}
     end
   end
 
