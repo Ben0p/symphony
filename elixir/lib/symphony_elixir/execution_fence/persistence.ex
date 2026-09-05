@@ -155,7 +155,23 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
       "termination_required" => Map.get(lease, :termination_required, lease.status == :expired),
       "termination_confirmed_at_ms" => Map.get(lease, :termination_confirmed_at_ms),
       "termination_evidence_ref" => Map.get(lease, :termination_evidence_ref),
+      "termination_evidence" => encode_termination_evidence(Map.get(lease, :termination_evidence)),
+      "supervisor_identity" => encode_supervisor_identity(Map.get(lease, :supervisor_identity)),
       "release_reason" => encode_optional_reason(Map.get(lease, :release_reason))
+    }
+  end
+
+  defp encode_supervisor_identity(nil), do: nil
+
+  defp encode_supervisor_identity(identity) do
+    %{
+      "supervisor" => Atom.to_string(identity.supervisor),
+      "unit" => identity.unit,
+      "issue_id" => identity.issue_id,
+      "generation" => identity.generation,
+      "session_id" => identity.session_id,
+      "process_id" => identity.process_id,
+      "launched_at_ms" => identity.launched_at_ms
     }
   end
 
@@ -293,6 +309,8 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
           lease
           |> maybe_put_decoded(:termination_confirmed_at_ms, Map.get(payload, "termination_confirmed_at_ms"))
           |> maybe_put_decoded(:termination_evidence_ref, Map.get(payload, "termination_evidence_ref"))
+          |> maybe_put_decoded(:termination_evidence, decode_termination_evidence(Map.get(payload, "termination_evidence")))
+          |> maybe_put_decoded(:supervisor_identity, decode_supervisor_identity(Map.get(payload, "supervisor_identity")))
 
         {:ok, maybe_put_decoded(lease, :release_reason, Map.get(payload, "release_reason"))}
       end
@@ -300,6 +318,88 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
   end
 
   defp decode_lease(_payload), do: {:error, :invalid_lease}
+
+  defp decode_supervisor_identity(nil), do: nil
+
+  defp decode_supervisor_identity(%{
+         "supervisor" => "systemd_user",
+         "unit" => unit,
+         "issue_id" => issue_id,
+         "generation" => generation,
+         "session_id" => session_id,
+         "process_id" => process_id,
+         "launched_at_ms" => launched_at_ms
+       })
+       when is_binary(unit) and is_binary(issue_id) and is_integer(generation) and
+              is_binary(session_id) and is_binary(process_id) and is_integer(launched_at_ms) do
+    %{
+      supervisor: :systemd_user,
+      unit: unit,
+      issue_id: issue_id,
+      generation: generation,
+      session_id: session_id,
+      process_id: process_id,
+      launched_at_ms: launched_at_ms
+    }
+  end
+
+  defp decode_supervisor_identity(_identity), do: :invalid
+
+  defp encode_termination_evidence(nil), do: nil
+
+  defp encode_termination_evidence(evidence) when is_map(evidence) do
+    Map.new(evidence, fn
+      {:process_tree, value} -> {"process_tree", encode_optional_atom(value)}
+      {:supervisor, value} -> {"supervisor", encode_optional_atom(value)}
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp encode_termination_evidence(_evidence), do: nil
+
+  defp decode_termination_evidence(nil), do: nil
+
+  defp decode_termination_evidence(payload) when is_map(payload) do
+    Enum.reduce(payload, %{}, fn
+      {"process_tree", value}, acc ->
+        Map.put(acc, :process_tree, decode_optional_atom(value))
+
+      {"supervisor", value}, acc ->
+        Map.put(acc, :supervisor, decode_optional_atom(value))
+
+      {key, value}, acc
+      when key in [
+             "session_id",
+             "process_id",
+             "unit",
+             "pre_active_state",
+             "pre_control_group",
+             "pre_processes",
+             "main_pid",
+             "active_state",
+             "control_group",
+             "remaining_processes",
+             "observed_at_ms",
+             "evidence_ref"
+           ] ->
+        Map.put(acc, String.to_existing_atom(key), value)
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp decode_termination_evidence(_payload), do: :invalid
+
+  defp encode_optional_atom(nil), do: nil
+  defp encode_optional_atom(value) when is_atom(value), do: Atom.to_string(value)
+  defp encode_optional_atom(value), do: value
+
+  defp decode_optional_atom(nil), do: nil
+  defp decode_optional_atom("terminated"), do: :terminated
+  defp decode_optional_atom("systemd_user"), do: :systemd_user
+  defp decode_optional_atom(value), do: value
 
   defp decode_terminal(nil), do: {:ok, nil}
 

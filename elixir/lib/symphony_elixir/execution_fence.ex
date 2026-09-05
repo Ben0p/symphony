@@ -167,6 +167,26 @@ defmodule SymphonyElixir.ExecutionFence do
     end
   end
 
+  @doc "Persists the OS supervisor identity after a process is admitted."
+  @spec record_supervisor(state(), token(), String.t(), map()) ::
+          {:ok, state()} | {:error, term()}
+  def record_supervisor(state, token, session_id, identity)
+      when is_binary(session_id) and is_map(identity) do
+    with :ok <- validate_state(state),
+         {:ok, execution} <- current_execution(state, token),
+         %{status: :active} = lease <- Map.get(execution.leases, session_id),
+         :ok <- validate_supervisor_identity(identity, execution, lease) do
+      {:ok, put_lease(state, execution, Map.put(lease, :supervisor_identity, identity))}
+    else
+      nil -> {:error, :unknown_session}
+      {:error, _reason} = error -> error
+      _ -> {:error, :supervisor_registration_rejected}
+    end
+  end
+
+  def record_supervisor(_state, _token, _session_id, _identity),
+    do: {:error, :invalid_supervisor_identity}
+
   @doc "Renews a live lease; terminal or stale generations cannot renew."
   @spec heartbeat(state(), token(), String.t(), non_neg_integer()) ::
           {:ok, state()} | {:error, term()}
@@ -335,6 +355,7 @@ defmodule SymphonyElixir.ExecutionFence do
           lease
           |> Map.put(:termination_confirmed_at_ms, now_ms)
           |> Map.put(:termination_evidence_ref, evidence.evidence_ref)
+          |> Map.put(:termination_evidence, evidence)
 
         confirmed_state = put_lease(state, execution, confirmed_lease)
         confirmed_execution = get_in(confirmed_state, [:executions, execution.issue_id])
@@ -726,7 +747,62 @@ defmodule SymphonyElixir.ExecutionFence do
       non_negative_integer?(Map.get(lease, :registered_at_ms)) and
       Map.get(lease, :termination_required, false) in [true, false] and
       optional_non_negative_integer?(Map.get(lease, :termination_confirmed_at_ms)) and
-      optional_string?(Map.get(lease, :termination_evidence_ref))
+      optional_string?(Map.get(lease, :termination_evidence_ref)) and
+      valid_termination_evidence?(Map.get(lease, :termination_evidence)) and
+      valid_supervisor_identity?(Map.get(lease, :supervisor_identity))
+  end
+
+  defp valid_supervisor_identity?(nil), do: true
+
+  defp valid_supervisor_identity?(identity) when is_map(identity) do
+    Map.get(identity, :supervisor) == :systemd_user and
+      valid_supervisor_unit?(Map.get(identity, :unit)) and
+      present_string?(Map.get(identity, :issue_id)) and
+      positive_integer?(Map.get(identity, :generation)) and
+      present_string?(Map.get(identity, :session_id)) and
+      present_string?(Map.get(identity, :process_id)) and
+      non_negative_integer?(Map.get(identity, :launched_at_ms))
+  end
+
+  defp valid_supervisor_identity?(_identity), do: false
+
+  defp valid_termination_evidence?(nil), do: true
+
+  defp valid_termination_evidence?(evidence) when is_map(evidence) do
+    present_string?(Map.get(evidence, :session_id)) and
+      present_string?(Map.get(evidence, :process_id)) and
+      Map.get(evidence, :process_tree) == :terminated and
+      present_string?(Map.get(evidence, :evidence_ref)) and
+      non_negative_integer?(Map.get(evidence, :observed_at_ms)) and
+      optional_string?(Map.get(evidence, :active_state)) and
+      (is_nil(Map.get(evidence, :active_state)) or Map.get(evidence, :active_state) == "inactive") and
+      optional_non_negative_integer?(Map.get(evidence, :remaining_processes)) and
+      (is_nil(Map.get(evidence, :remaining_processes)) or Map.get(evidence, :remaining_processes) == 0) and
+      valid_termination_evidence_supervisor?(Map.get(evidence, :supervisor))
+  end
+
+  defp valid_termination_evidence?(_evidence), do: false
+
+  defp valid_termination_evidence_supervisor?(nil), do: true
+  defp valid_termination_evidence_supervisor?(:systemd_user), do: true
+  defp valid_termination_evidence_supervisor?(_supervisor), do: false
+
+  defp valid_supervisor_unit?(unit) when is_binary(unit) do
+    byte_size(unit) <= 180 and Regex.match?(~r/\Asymphony-exec-[a-f0-9]+\.scope\z/, unit)
+  end
+
+  defp valid_supervisor_unit?(_unit), do: false
+
+  defp validate_supervisor_identity(identity, execution, lease) do
+    if valid_supervisor_identity?(identity) and
+         identity.issue_id == execution.issue_id and
+         identity.generation == execution.generation and
+         identity.session_id == lease.session_id and
+         identity.process_id == lease.process_id do
+      :ok
+    else
+      {:error, :supervisor_identity_mismatch}
+    end
   end
 
   defp valid_cleanup_receipt?(nil), do: true
@@ -763,23 +839,40 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp validate_termination_evidence(lease, session_id, evidence, now_ms) do
     cond do
-      evidence.session_id != session_id ->
+      Map.get(evidence, :session_id) != session_id ->
         {:error, :termination_session_mismatch}
 
-      evidence.process_id != lease.process_id ->
+      Map.get(evidence, :process_id) != lease.process_id ->
         {:error, :termination_process_mismatch}
 
-      evidence.process_tree != :terminated ->
+      Map.get(evidence, :process_tree) != :terminated ->
         {:error, :termination_not_proven}
 
-      not present_string?(evidence.evidence_ref) ->
+      not present_string?(Map.get(evidence, :evidence_ref)) ->
         {:error, :termination_evidence_missing}
 
-      not non_negative_integer?(evidence.observed_at_ms) or evidence.observed_at_ms > now_ms ->
+      not non_negative_integer?(Map.get(evidence, :observed_at_ms)) or
+          Map.get(evidence, :observed_at_ms) > now_ms ->
         {:error, :invalid_termination_timestamp}
+
+      not supervised_evidence_matches?(lease, evidence) ->
+        {:error, :termination_supervisor_mismatch}
 
       true ->
         :ok
+    end
+  end
+
+  defp supervised_evidence_matches?(lease, evidence) do
+    case Map.get(lease, :supervisor_identity) do
+      nil ->
+        true
+
+      identity ->
+        Map.get(evidence, :supervisor) == :systemd_user and
+          Map.get(evidence, :unit) == Map.get(identity, :unit) and
+          Map.get(evidence, :active_state) == "inactive" and
+          Map.get(evidence, :remaining_processes) == 0
     end
   end
 
@@ -878,7 +971,9 @@ defmodule SymphonyElixir.ExecutionFence do
       :release_reason,
       :termination_required,
       :termination_confirmed_at_ms,
-      :termination_evidence_ref
+      :termination_evidence_ref,
+      :termination_evidence,
+      :supervisor_identity
     ])
   end
 

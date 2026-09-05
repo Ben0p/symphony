@@ -112,6 +112,7 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
     assert restored.executions[@issue].cleanup_receipt.phase == :removal_started
     assert restored.executions[@issue].leases["worker-1"].termination_confirmed_at_ms == 220
     assert restored.executions[@issue].leases["worker-1"].termination_evidence_ref == "process-tree-check-1"
+    assert restored.executions[@issue].leases["worker-1"].termination_evidence == evidence
   end
 
   test "persists released lease termination uncertainty through restart", %{path: path} do
