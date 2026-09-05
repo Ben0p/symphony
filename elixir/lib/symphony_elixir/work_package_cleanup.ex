@@ -198,9 +198,11 @@ defmodule SymphonyElixir.WorkPackageCleanup do
         with {:ok, manifest} <- read_json(manifest_path),
              :ok <- manifest_matches_target(manifest, target),
              :ok <- current_archive_state_matches?(manifest, target, opts),
-             :ok <- verify_archive_contents(manifest, archive_root, target, opts) do
+             :ok <- verify_archive_contents(manifest, archive_root, target, opts),
+             true <- is_binary(manifest["evidence_ref"]) and manifest["evidence_ref"] != "" do
           {:ok, manifest["evidence_ref"]}
         else
+          false -> {:error, :cleanup_evidence_missing}
           {:error, _reason} = error -> error
         end
 
@@ -361,9 +363,9 @@ defmodule SymphonyElixir.WorkPackageCleanup do
       {:ok, %File.Stat{type: :directory}} ->
         archive_content_entries(root, path, relative)
 
-      {:ok, %File.Stat{type: :regular}} ->
+      {:ok, %File.Stat{type: :regular} = stat} ->
         with {:ok, digest} <- file_digest(path) do
-          {:ok, [%{"path" => normalize_relative_path(relative), "type" => "regular", "size" => digest.size, "sha256" => digest.sha256}]}
+          {:ok, [%{"path" => normalize_relative_path(relative), "type" => "regular", "size" => digest.size, "sha256" => digest.sha256, "mode" => stat.mode}]}
         end
 
       {:ok, %File.Stat{type: :symlink}} ->
