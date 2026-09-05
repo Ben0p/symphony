@@ -245,6 +245,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+        running_entry = Map.put(running_entry, :terminal_outcome, terminal_outcome_for(running_entry, reason))
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
         state = release_execution_lease(state, running_entry, reason)
@@ -730,6 +731,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+        running_entry = Map.put(running_entry, :terminal_outcome, terminal_outcome_for(running_entry, :orchestrator_stop))
         state = record_session_completion_totals(state, running_entry)
         state = maybe_fence_terminal_execution(state, running_entry, cleanup_workspace)
 
@@ -1722,7 +1724,7 @@ defmodule SymphonyElixir.Orchestrator do
           fence_state: state.execution_fence
         })
 
-      attrs = %{terminal_outcome: :completed, accepted_head: accepted_head}
+      attrs = %{terminal_outcome: Map.get(entry, :terminal_outcome, :blocked), accepted_head: accepted_head}
       opts = [] |> maybe_claim_option(runtime, :request_fun) |> maybe_claim_option(runtime, :now_fun)
 
       case WorkPackageCleanupReceipt.termination_confirmed(input, attrs, opts) do
@@ -1772,6 +1774,46 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp normalize_release_reason(reason) when reason in [:spawn_failed, :global_pause], do: reason
   defp normalize_release_reason(_reason), do: :orchestrator_stop
+
+  defp terminal_outcome_for(entry, reason) do
+    terminal? =
+      case Map.get(entry, :issue) do
+        %{state: state} when is_binary(state) ->
+          try do
+            terminal_issue_state?(state, terminal_state_set())
+          rescue
+            _ -> MapSet.member?(MapSet.new(@mandatory_terminal_states), normalize_issue_state(state))
+          end
+
+        _ ->
+          false
+      end
+
+    cond do
+      terminal? and reason == :normal -> :completed
+      reason in [:orchestrator_stop, :global_pause] -> :blocked
+      true -> :failed
+    end
+  end
+
+  defp cleanup_terminal_outcome(state, token) do
+    case get_in(state.execution_fence, [:executions, token.issue_id]) do
+      %{cleanup_receipt: %{terminal_outcome: outcome}} when outcome in [:completed, :failed, :blocked] ->
+        outcome
+
+      %{terminal: %{state: terminal_state}} when is_binary(terminal_state) ->
+        try do
+          if terminal_issue_state?(terminal_state, terminal_state_set()), do: :completed, else: :blocked
+        rescue
+          _ -> :blocked
+        end
+
+      _ ->
+        :blocked
+    end
+  rescue
+    _ -> :blocked
+  end
 
   defp maybe_fence_terminal_execution(state, _running_entry, false), do: state
 
@@ -1838,7 +1880,7 @@ defmodule SymphonyElixir.Orchestrator do
               :removal_started ->
                 case Workspace.path_exists?(workspace_path, Map.get(entry, :worker_host)) do
                   {:ok, false} ->
-                    persist_fenced_cleanup(state, token, head, execution_fence_now_ms())
+                    persist_fenced_cleanup(state, token, head, execution_fence_now_ms(), Map.get(entry, :terminal_outcome))
 
                   {:ok, true} ->
                     verify_and_cleanup_fenced_workspace(
@@ -1908,16 +1950,22 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_fenced_execution(state, issue_or_identifier, entry, token, head) do
     now_ms = execution_fence_now_ms()
 
-    case ExecutionFence.prepare_cleanup(state.execution_fence, token, head, now_ms) do
+    case ExecutionFence.prepare_cleanup(
+           state.execution_fence,
+           token,
+           head,
+           now_ms,
+           Map.get(entry, :terminal_outcome, :blocked)
+         ) do
       {:ok, prepared_fence, _result} ->
         case persist_execution_fence(state, prepared_fence) do
           {:ok, prepared_state} ->
             case cleanup_issue_workspace(issue_or_identifier, entry) do
               :ok ->
-                persist_fenced_cleanup(prepared_state, token, head, now_ms)
+                persist_fenced_cleanup(prepared_state, token, head, now_ms, Map.get(entry, :terminal_outcome))
 
               {:ok, _removed} ->
-                persist_fenced_cleanup(prepared_state, token, head, now_ms)
+                persist_fenced_cleanup(prepared_state, token, head, now_ms, Map.get(entry, :terminal_outcome))
 
               {:error, reason, _path} ->
                 Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
@@ -1939,12 +1987,12 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp persist_fenced_cleanup(state, token, head, now_ms) do
+  defp persist_fenced_cleanup(state, token, head, now_ms, terminal_outcome) do
     case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
       {:ok, fence_state, result} when result in [:cleaned, :already_cleaned] ->
         case persist_execution_fence(state, fence_state) do
           {:ok, next_state} ->
-            submit_repository_cleanup_receipt(next_state, token, head)
+            submit_repository_cleanup_receipt(next_state, token, head, terminal_outcome || cleanup_terminal_outcome(next_state, token))
 
           {:error, reason} ->
             Logger.error("Execution-fence cleanup state was not persisted: #{inspect(reason)}")
@@ -1957,7 +2005,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp submit_repository_cleanup_receipt(%State{work_package_runtime: runtime} = state, token, head)
+  defp submit_repository_cleanup_receipt(%State{work_package_runtime: runtime} = state, token, head, terminal_outcome)
        when is_map(runtime) do
     case cleanup_evidence_ref(runtime, state, token, head) do
       {:ok, evidence_ref} ->
@@ -1971,7 +2019,7 @@ defmodule SymphonyElixir.Orchestrator do
             fence_state: state.execution_fence
           })
 
-        attrs = %{terminal_outcome: :completed, accepted_head: head, evidence_ref: evidence_ref}
+        attrs = %{terminal_outcome: terminal_outcome, accepted_head: head, evidence_ref: evidence_ref}
         opts = [] |> maybe_claim_option(runtime, :request_fun) |> maybe_claim_option(runtime, :now_fun)
 
         case WorkPackageCleanupReceipt.repository_cleanup_verified(input, attrs, opts) do
@@ -1989,7 +2037,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp submit_repository_cleanup_receipt(state, _token, _head), do: state
+  defp submit_repository_cleanup_receipt(state, _token, _head, _terminal_outcome), do: state
 
   defp cleanup_evidence_ref(runtime, state, token, head) do
     case Map.get(runtime, :cleanup_evidence_fun) do
@@ -2921,13 +2969,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:execution_fence_supervisor, token, session_id, identity}, _from, %State{} = state) do
-    case ExecutionFence.record_supervisor(state.execution_fence, token, session_id, identity) do
-      {:ok, fence_state} ->
-        case persist_execution_fence(state, fence_state) do
-          {:ok, next_state} -> {:reply, {:ok, :recorded}, next_state}
-          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
-        end
-
+    with {:ok, captured_identity} <- ExecutionSupervisor.capture(identity),
+         {:ok, fence_state} <- ExecutionFence.record_supervisor(state.execution_fence, token, session_id, captured_identity) do
+      case persist_execution_fence(state, fence_state) do
+        {:ok, next_state} -> {:reply, {:ok, :recorded}, next_state}
+        {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+      end
+    else
       {:error, _reason} = error ->
         {:reply, error, state}
     end
@@ -2968,7 +3016,7 @@ defmodule SymphonyElixir.Orchestrator do
         %State{} = state
       ) do
     case ExecutionFence.confirm_termination(
-           state.execution_fence,
+           state,
            token,
            session_id,
            evidence,
@@ -3276,8 +3324,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:ok, fence_state} ->
         with {:ok, restarted_state} <- ExecutionFence.mark_unreconciled_after_restart(fence_state),
-             :ok <- Persistence.save(path, restarted_state) do
-          {:ok, restarted_state}
+             {:ok, reconciled_state} <- reconcile_persisted_supervisors(restarted_state),
+             :ok <- Persistence.save(path, reconciled_state) do
+          {:ok, reconciled_state}
         else
           {:error, reason} -> {:error, {:restart_reconciliation_persistence_failed, reason}}
           other -> {:error, {:restart_reconciliation_persistence_failed, other}}
@@ -3289,6 +3338,81 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp load_execution_fence(path), do: {:error, {:invalid_state_path, path}}
+
+  @doc false
+  @spec reconcile_persisted_supervisors_for_test(map(), keyword()) :: {:ok, map()}
+  def reconcile_persisted_supervisors_for_test(state, opts \\ []) when is_map(state) and is_list(opts) do
+    reconcile_persisted_supervisors(state, opts)
+  end
+
+  defp reconcile_persisted_supervisors(state, opts \\ []) do
+    now_ms = Keyword.get(opts, :now_ms, execution_fence_now_ms())
+
+    reconciled_state =
+      Enum.reduce(state.executions, state, fn {issue_id, execution}, state_acc ->
+        token = %{issue_id: issue_id, generation: execution.generation}
+
+        Enum.reduce(execution.leases, state_acc, fn {session_id, lease}, lease_state ->
+          reconcile_persisted_supervisor(lease_state, token, session_id, lease, now_ms, opts)
+        end)
+      end)
+
+    {:ok, reconciled_state}
+  end
+
+  defp reconcile_persisted_supervisor(state, token, session_id, lease, now_ms, opts) do
+    case Map.get(lease, :supervisor_identity) do
+      identity when is_map(identity) ->
+        state = release_restarted_supervisor_lease(state, token, session_id)
+
+        if is_nil(Map.get(lease, :termination_confirmed_at_ms)) do
+          case ExecutionSupervisor.terminate(identity, opts) do
+            {:ok, evidence} ->
+              case ExecutionFence.confirm_termination(
+                     state,
+                     token,
+                     session_id,
+                     evidence,
+                     now_ms
+                   ) do
+                {:ok, fence_state, _result} ->
+                  case ExecutionFence.validate(fence_state) do
+                    :ok ->
+                      fence_state
+
+                    {:error, reason} ->
+                      Logger.error("Restart termination proof produced invalid fence state: #{inspect(reason)}")
+                      state
+                  end
+
+                {:error, reason} ->
+                  Logger.warning("Restart termination proof was rejected for session_id=#{session_id}: #{inspect(reason)}")
+                  state
+              end
+
+            {:error, reason} ->
+              Logger.warning("Restart termination could not be proven for session_id=#{session_id}: #{inspect(reason)}")
+              state
+          end
+        else
+          state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp release_restarted_supervisor_lease(state, token, session_id) do
+    case ExecutionFence.release(state, token, session_id, :orchestrator_stop) do
+      {:ok, fence_state, _result} ->
+        fence_state
+
+      {:error, reason} ->
+        Logger.warning("Restart supervisor lease could not be marked for termination session_id=#{session_id}: #{inspect(reason)}")
+        state
+    end
+  end
 
   defp load_responsibility_graph(path) when is_binary(path) do
     case ResponsibilityPersistence.load(path) do

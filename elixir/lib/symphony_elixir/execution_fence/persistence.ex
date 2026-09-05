@@ -171,7 +171,10 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
       "generation" => identity.generation,
       "session_id" => identity.session_id,
       "process_id" => identity.process_id,
-      "launched_at_ms" => identity.launched_at_ms
+      "launched_at_ms" => identity.launched_at_ms,
+      "control_group" => Map.get(identity, :control_group),
+      "launch_processes" => Map.get(identity, :launch_processes),
+      "main_pid" => Map.get(identity, :main_pid)
     }
   end
 
@@ -321,18 +324,20 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
 
   defp decode_supervisor_identity(nil), do: nil
 
-  defp decode_supervisor_identity(%{
-         "supervisor" => "systemd_user",
-         "unit" => unit,
-         "issue_id" => issue_id,
-         "generation" => generation,
-         "session_id" => session_id,
-         "process_id" => process_id,
-         "launched_at_ms" => launched_at_ms
-       })
+  defp decode_supervisor_identity(
+         identity_payload = %{
+           "supervisor" => "systemd_user",
+           "unit" => unit,
+           "issue_id" => issue_id,
+           "generation" => generation,
+           "session_id" => session_id,
+           "process_id" => process_id,
+           "launched_at_ms" => launched_at_ms
+         }
+       )
        when is_binary(unit) and is_binary(issue_id) and is_integer(generation) and
               is_binary(session_id) and is_binary(process_id) and is_integer(launched_at_ms) do
-    %{
+    identity = %{
       supervisor: :systemd_user,
       unit: unit,
       issue_id: issue_id,
@@ -341,9 +346,46 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
       process_id: process_id,
       launched_at_ms: launched_at_ms
     }
+
+    case decode_supervisor_identity_attestation(identity, identity_payload) do
+      {:ok, identity} -> identity
+      :invalid -> :invalid
+    end
   end
 
   defp decode_supervisor_identity(_identity), do: :invalid
+
+  defp decode_supervisor_identity_attestation(identity, payload) when is_map(payload) do
+    control_group = Map.get(payload, "control_group")
+    launch_processes = Map.get(payload, "launch_processes")
+    main_pid = Map.get(payload, "main_pid")
+
+    cond do
+      Enum.all?(["control_group", "launch_processes", "main_pid"], &(not Map.has_key?(payload, &1))) ->
+        {:ok, identity}
+
+      is_nil(control_group) and is_nil(launch_processes) and is_nil(main_pid) ->
+        {:ok,
+         identity
+         |> Map.put(:control_group, nil)
+         |> Map.put(:launch_processes, nil)
+         |> Map.put(:main_pid, nil)}
+
+      is_binary(control_group) and control_group != "" and
+        is_list(launch_processes) and Enum.all?(launch_processes, &(is_integer(&1) and &1 > 0)) and
+        is_integer(main_pid) and main_pid >= 0 ->
+        {:ok,
+         identity
+         |> Map.put(:control_group, control_group)
+         |> Map.put(:launch_processes, launch_processes)
+         |> Map.put(:main_pid, main_pid)}
+
+      true ->
+        :invalid
+    end
+  end
+
+  defp decode_supervisor_identity_attestation(_identity, _payload), do: :invalid
 
   defp encode_termination_evidence(nil), do: nil
 
@@ -422,12 +464,18 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
   defp encode_cleanup_receipt(nil), do: nil
 
   defp encode_cleanup_receipt(receipt) do
-    %{
+    encoded = %{
       "phase" => Atom.to_string(receipt.phase),
       "expected_head" => receipt.expected_head,
       "prepared_at_ms" => receipt.prepared_at_ms,
       "verified_at_ms" => Map.get(receipt, :verified_at_ms)
     }
+
+    if Map.has_key?(receipt, :terminal_outcome) do
+      Map.put(encoded, "terminal_outcome", encode_optional_atom(Map.get(receipt, :terminal_outcome)))
+    else
+      encoded
+    end
   end
 
   defp decode_cleanup_receipt(nil), do: {:ok, nil}
@@ -442,7 +490,18 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
         prepared_at_ms: prepared_at_ms
       }
 
-      {:ok, maybe_put_decoded(receipt, :verified_at_ms, Map.get(payload, "verified_at_ms"))}
+      receipt = maybe_put_decoded(receipt, :verified_at_ms, Map.get(payload, "verified_at_ms"))
+
+      case Map.get(payload, "terminal_outcome") do
+        nil ->
+          {:ok, receipt}
+
+        outcome when outcome in ["completed", "failed", "blocked"] ->
+          {:ok, Map.put(receipt, :terminal_outcome, String.to_existing_atom(outcome))}
+
+        _ ->
+          {:error, :invalid_cleanup_terminal_outcome}
+      end
     end
   end
 

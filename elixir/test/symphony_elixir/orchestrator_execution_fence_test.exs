@@ -1,8 +1,60 @@
 defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{ExecutionFence, Orchestrator}
+  alias SymphonyElixir.{ExecutionFence, ExecutionSupervisor, Orchestrator}
   alias SymphonyElixir.ExecutionFence.Persistence
+
+  test "restart reconciliation stops and confirms persisted supervisor ownership" do
+    admission = admission()
+    {:ok, fence_state, token} = ExecutionFence.admit(ExecutionFence.new(), admission, 100)
+    {:ok, fence_state, :registered} = ExecutionFence.register(fence_state, token, :worker, session(), 100)
+
+    identity =
+      ExecutionSupervisor.identity("HGS-294", 1, "worker-1", "logical-process-1", 100)
+      |> Map.merge(%{control_group: "/user.slice/symphony.scope", launch_processes: [111], main_pid: 111})
+
+    {:ok, fence_state} = ExecutionFence.record_supervisor(fence_state, token, "worker-1", identity)
+
+    runner = fn _executable, args, _opts ->
+      case args do
+        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
+          {"LoadState=loaded\nActiveState=active\nControlGroup=/user.slice/symphony.scope\nMainPID=111\n", 0}
+
+        ["--user", "stop", "--wait", _unit] ->
+          {"", 0}
+
+        ["--user", "show", "--property=ActiveState", _unit] ->
+          {"ActiveState=inactive\n", 0}
+
+        ["--user", "show", "--property=ControlGroup", _unit] ->
+          {"ControlGroup=/user.slice/symphony.scope\n", 0}
+      end
+    end
+
+    cgroup_reader = fn _path ->
+      case Process.get(:restart_cgroup_reads, 0) do
+        0 ->
+          Process.put(:restart_cgroup_reads, 1)
+          {:ok, [111]}
+
+        _ ->
+          {:ok, []}
+      end
+    end
+
+    {:ok, reconciled} =
+      Orchestrator.reconcile_persisted_supervisors_for_test(
+        fence_state,
+        command_runner: runner,
+        cgroup_reader: cgroup_reader,
+        now_ms: 200
+      )
+
+    lease = reconciled.executions["HGS-294"].leases["worker-1"]
+    assert lease.status == :released
+    assert lease.termination_confirmed_at_ms == 200
+    assert reconciled.executions["HGS-294"].termination_unconfirmed == false
+  end
 
   test "orchestrator mutation guard follows the current generation snapshot" do
     admission = %{

@@ -125,6 +125,27 @@ defmodule SymphonyElixir.ExecutionSupervisor do
     end
   end
 
+  @doc "Captures the live systemd cgroup identity immediately after launch."
+  @spec capture(identity(), keyword()) :: {:ok, identity()} | {:error, term()}
+  def capture(identity, opts \\ [])
+
+  def capture(identity, opts) when is_map(identity) and is_list(opts) do
+    with :ok <- validate_identity(identity),
+         {:ok, unit_state} <- show_unit(identity.unit, opts),
+         :ok <- active_unit_for_capture(unit_state),
+         {:ok, control_group} <- required_control_group(unit_state.control_group),
+         {:ok, processes} <- non_empty_control_group(control_group, opts),
+         {:ok, main_pid} <- required_main_pid(unit_state.main_pid) do
+      {:ok,
+       identity
+       |> Map.put(:control_group, control_group)
+       |> Map.put(:launch_processes, processes)
+       |> Map.put(:main_pid, main_pid)}
+    end
+  end
+
+  def capture(_identity, _opts), do: {:error, :invalid_supervisor_identity}
+
   @doc "Validates the identity persisted with an execution generation."
   @spec validate(identity()) :: :ok | {:error, term()}
   def validate(identity) when is_map(identity), do: validate_identity(identity)
@@ -140,6 +161,7 @@ defmodule SymphonyElixir.ExecutionSupervisor do
          true <- Map.get(evidence, :session_id) == identity.session_id,
          true <- Map.get(evidence, :process_id) == identity.process_id,
          true <- Map.get(evidence, :active_state) == "inactive",
+         true <- valid_identity_cgroup_evidence?(identity, evidence),
          true <- valid_pre_processes?(evidence),
          true <- Map.get(evidence, :remaining_processes) == 0,
          true <- is_binary(Map.get(evidence, :evidence_ref)),
@@ -152,6 +174,13 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   end
 
   def validate_evidence(_identity, _evidence), do: {:error, :invalid_termination_evidence}
+
+  defp valid_identity_cgroup_evidence?(identity, evidence) do
+    is_binary(Map.get(identity, :control_group)) and
+      Map.get(identity, :control_group) != "" and
+      Map.get(evidence, :pre_control_group) == Map.get(identity, :control_group) and
+      is_list(Map.get(evidence, :pre_processes))
+  end
 
   defp valid_pre_processes?(%{control_group: nil, pre_processes: nil}), do: true
 
@@ -221,14 +250,22 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   end
 
   defp absent_unit_evidence(identity, opts) do
-    with {:ok, now_ms} <- observed_at(opts) do
-      {:ok, termination_evidence(identity, "inactive", nil, now_ms, nil)}
+    with :ok <- verify_original_control_group(identity, nil, opts),
+         {:ok, now_ms} <- observed_at(opts) do
+      pre_state = %{
+        active_state: nil,
+        control_group: Map.get(identity, :control_group),
+        pre_processes: Map.get(identity, :launch_processes),
+        main_pid: Map.get(identity, :main_pid)
+      }
+
+      {:ok, termination_evidence(identity, "inactive", nil, now_ms, pre_state)}
     end
   end
 
   defp verify_inactive(identity, unit_state, opts) do
     with {:ok, control_group} <- control_group(identity.unit, opts),
-         :ok <- empty_control_group?(control_group, opts),
+         :ok <- verify_original_control_group(identity, control_group, opts),
          {:ok, now_ms} <- observed_at(opts) do
       pre_state = Map.merge(unit_state, %{control_group: control_group, pre_processes: []})
       {:ok, termination_evidence(identity, "inactive", control_group, now_ms, pre_state)}
@@ -238,28 +275,45 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   defp show_unit(unit, opts) do
     case systemctl(
            command_runner(opts),
-           ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", "--value", unit],
+           ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", unit],
            opts
          ) do
       {:ok, output} ->
-        case String.split(output, "\n", trim: false) do
-          [load_state, active_state, control_group, main_pid | _] ->
-            {:ok,
-             %{
-               load_state: String.trim(load_state),
-               active_state: String.trim(active_state),
-               control_group: blank_to_nil(control_group),
-               main_pid: parse_pid(main_pid)
-             }}
-
-          _ ->
-            {:error, :systemd_unit_state_missing}
-        end
+        parse_unit_properties(output)
 
       {:error, _reason} = error ->
         error
     end
   end
+
+  defp parse_unit_properties(output) when is_binary(output) do
+    properties =
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.reduce(%{}, fn line, acc ->
+        case String.split(line, "=", parts: 2) do
+          [key, value] when key in ["LoadState", "ActiveState", "ControlGroup", "MainPID"] ->
+            Map.put(acc, key, value)
+
+          _ ->
+            acc
+        end
+      end)
+
+    if Enum.all?(["LoadState", "ActiveState", "ControlGroup", "MainPID"], &Map.has_key?(properties, &1)) do
+      {:ok,
+       %{
+         load_state: String.trim(properties["LoadState"]),
+         active_state: String.trim(properties["ActiveState"]),
+         control_group: blank_to_nil(properties["ControlGroup"]),
+         main_pid: parse_pid(properties["MainPID"])
+       }}
+    else
+      {:error, :systemd_unit_state_missing}
+    end
+  end
+
+  defp parse_unit_properties(_output), do: {:error, :systemd_unit_state_missing}
 
   defp blank_to_nil(value) do
     case String.trim(value) do
@@ -278,6 +332,18 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   defp active_unit_for_stop(%{load_state: "loaded", active_state: "active"}), do: :ok
   defp active_unit_for_stop(%{load_state: "loaded", active_state: state}), do: {:error, {:systemd_unit_not_active, state}}
   defp active_unit_for_stop(%{load_state: load_state}), do: {:error, {:systemd_unit_not_loaded, load_state}}
+
+  defp active_unit_for_capture(%{load_state: "loaded", active_state: "active"}), do: :ok
+  defp active_unit_for_capture(%{load_state: "loaded", active_state: state}), do: {:error, {:systemd_unit_not_active, state}}
+  defp active_unit_for_capture(%{load_state: load_state}), do: {:error, {:systemd_unit_not_loaded, load_state}}
+
+  defp required_control_group(control_group) when is_binary(control_group) and control_group != "",
+    do: {:ok, control_group}
+
+  defp required_control_group(_control_group), do: {:error, :supervisor_cgroup_missing}
+
+  defp required_main_pid(main_pid) when is_integer(main_pid) and main_pid > 0, do: {:ok, main_pid}
+  defp required_main_pid(_main_pid), do: {:error, :supervisor_main_pid_missing}
 
   defp non_empty_control_group(nil, _opts), do: {:error, :supervisor_cgroup_missing}
 
@@ -334,7 +400,7 @@ defmodule SymphonyElixir.ExecutionSupervisor do
     with {:ok, active_state} <- active_state(identity.unit, opts),
          :ok <- inactive_state(active_state),
          {:ok, control_group} <- control_group(identity.unit, opts),
-         :ok <- empty_control_group?(control_group, opts),
+         :ok <- verify_original_control_group(identity, control_group, opts),
          {:ok, now_ms} <- observed_at(opts) do
       {:ok, termination_evidence(identity, active_state, control_group, now_ms, Map.put(unit_state, :pre_processes, pre_processes))}
     end
@@ -362,8 +428,8 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   end
 
   defp active_state(unit, opts) do
-    with {:ok, output} <- systemctl(command_runner(opts), ["--user", "show", "--property=ActiveState", "--value", unit], opts),
-         state when state != "" <- String.trim(output) do
+    with {:ok, output} <- systemctl(command_runner(opts), ["--user", "show", "--property=ActiveState", unit], opts),
+         state when state != "" <- property_value(output, "ActiveState") do
       {:ok, state}
     else
       "" -> {:error, :systemd_active_state_missing}
@@ -372,9 +438,9 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   end
 
   defp control_group(unit, opts) do
-    case systemctl(command_runner(opts), ["--user", "show", "--property=ControlGroup", "--value", unit], opts) do
+    case systemctl(command_runner(opts), ["--user", "show", "--property=ControlGroup", unit], opts) do
       {:ok, output} ->
-        case String.trim(output) do
+        case property_value(output, "ControlGroup") do
           "" -> {:ok, nil}
           value -> {:ok, value}
         end
@@ -383,6 +449,23 @@ defmodule SymphonyElixir.ExecutionSupervisor do
         error
     end
   end
+
+  defp property_value(output, property) when is_binary(output) and is_binary(property) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.find_value(fn line ->
+      case String.split(line, "=", parts: 2) do
+        [^property, value] -> String.trim(value)
+        _ -> nil
+      end
+    end)
+    |> case do
+      nil -> ""
+      value -> value
+    end
+  end
+
+  defp property_value(_output, _property), do: ""
 
   defp inactive_state("inactive"), do: :ok
   defp inactive_state(_state), do: {:error, :systemd_unit_still_active}
@@ -419,6 +502,22 @@ defmodule SymphonyElixir.ExecutionSupervisor do
     File.read(path)
   end
 
+  defp verify_original_control_group(identity, observed_control_group, opts) do
+    persisted_control_group = Map.get(identity, :control_group)
+
+    cond do
+      not is_binary(persisted_control_group) or persisted_control_group == "" ->
+        # Identities written before cgroup attestation remain unconfirmable.
+        {:error, :supervisor_cgroup_identity_missing}
+
+      is_binary(observed_control_group) and observed_control_group != persisted_control_group ->
+        {:error, :supervisor_cgroup_identity_mismatch}
+
+      true ->
+        empty_control_group?(persisted_control_group, opts)
+    end
+  end
+
   defp observed_at(opts) do
     case Keyword.get(opts, :now_ms, System.system_time(:millisecond)) do
       now_ms when is_integer(now_ms) and now_ms >= 0 -> {:ok, now_ms}
@@ -427,7 +526,12 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   end
 
   defp evidence_ref(identity, active_state, control_group) do
-    seed = Enum.join([identity.unit, active_state, control_group || "none", Integer.to_string(identity.generation)], "\u0000")
+    seed =
+      Enum.join(
+        [identity.unit, active_state, control_group || "none", Map.get(identity, :control_group) || "none", Integer.to_string(identity.generation)],
+        "\u0000"
+      )
+
     "systemd:" <> (:crypto.hash(:sha256, seed) |> Base.encode16(case: :lower))
   end
 

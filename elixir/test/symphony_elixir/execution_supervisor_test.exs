@@ -6,7 +6,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
   alias SymphonyElixir.ExecutionFence.Persistence
 
   test "launches each generation in an isolated systemd user scope" do
-    identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+    identity = supervisor_identity()
     assert identity.supervisor == :systemd_user
     assert String.starts_with?(identity.unit, "symphony-exec-")
 
@@ -43,7 +43,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
   end
 
   test "stops a unit and requires an inactive systemd boundary" do
-    identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+    identity = supervisor_identity()
     parent = self()
     {:ok, cgroup_reads} = Agent.start_link(fn -> 0 end)
 
@@ -54,14 +54,14 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
         ["--user", "stop", "--wait", _unit] ->
           {"", 0}
 
-        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", "--value", _unit] ->
-          {"loaded\nactive\n/user.slice/symphony.scope\n111\n", 0}
+        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
+          {"MainPID=111\nControlGroup=/user.slice/symphony.scope\nLoadState=loaded\nActiveState=active\n", 0}
 
-        ["--user", "show", "--property=ActiveState", "--value", _unit] ->
-          {"inactive\n", 0}
+        ["--user", "show", "--property=ActiveState", _unit] ->
+          {"ActiveState=inactive\n", 0}
 
-        ["--user", "show", "--property=ControlGroup", "--value", _unit] ->
-          {"/user.slice/symphony.scope\n", 0}
+        ["--user", "show", "--property=ControlGroup", _unit] ->
+          {"ControlGroup=/user.slice/symphony.scope\n", 0}
       end
     end
 
@@ -90,19 +90,39 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
     assert_received {:command, "systemctl", ["--user", "stop", "--wait", _]}
   end
 
-  test "leaves termination unconfirmed while the unit remains active" do
+  test "captures the active cgroup and process identity before recording a lease" do
     identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+
+    runner = fn _executable, args, _opts ->
+      assert args == ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", identity.unit]
+      {"ActiveState=active\nMainPID=111\nLoadState=loaded\nControlGroup=/user.slice/symphony.scope\n", 0}
+    end
+
+    assert {:ok, captured} =
+             ExecutionSupervisor.capture(
+               identity,
+               command_runner: runner,
+               cgroup_reader: fn "/user.slice/symphony.scope" -> {:ok, [111, 222]} end
+             )
+
+    assert captured.control_group == "/user.slice/symphony.scope"
+    assert captured.launch_processes == [111, 222]
+    assert captured.main_pid == 111
+  end
+
+  test "leaves termination unconfirmed while the unit remains active" do
+    identity = supervisor_identity()
 
     runner = fn _executable, args, _opts ->
       case args do
         ["--user", "stop", "--wait", _unit] ->
           {"", 0}
 
-        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", "--value", _unit] ->
-          {"loaded\nactive\n/user.slice/symphony.scope\n111\n", 0}
+        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
+          {"MainPID=111\nControlGroup=/user.slice/symphony.scope\nLoadState=loaded\nActiveState=active\n", 0}
 
-        ["--user", "show", "--property=ActiveState", "--value", _unit] ->
-          {"active\n", 0}
+        ["--user", "show", "--property=ActiveState", _unit] ->
+          {"ActiveState=active\n", 0}
       end
     end
 
@@ -111,12 +131,12 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
   end
 
   test "reconciles a retained scope that disappeared with the user manager" do
-    identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+    identity = supervisor_identity()
 
     runner = fn _executable, args, _opts ->
       case args do
         ["--user", "stop", "--wait", _unit] -> {"not-found\n", 5}
-        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", "--value", _unit] -> {"not-found\ninactive\n\n0\n", 0}
+        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] -> {"MainPID=0\nControlGroup=\nLoadState=not-found\nActiveState=inactive\n", 0}
       end
     end
 
@@ -130,15 +150,15 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
   end
 
   test "reconciles an already inactive retained scope after normal completion" do
-    identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+    identity = supervisor_identity()
 
     runner = fn _executable, args, _opts ->
       case args do
-        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", "--value", _unit] ->
-          {"loaded\ninactive\n/user.slice/symphony.scope\n0\n", 0}
+        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
+          {"MainPID=0\nControlGroup=/user.slice/symphony.scope\nLoadState=loaded\nActiveState=inactive\n", 0}
 
-        ["--user", "show", "--property=ControlGroup", "--value", _unit] ->
-          {"/user.slice/symphony.scope\n", 0}
+        ["--user", "show", "--property=ControlGroup", _unit] ->
+          {"ControlGroup=/user.slice/symphony.scope\n", 0}
       end
     end
 
@@ -151,7 +171,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
   end
 
   test "does not treat a failed or deactivating scope as terminated" do
-    identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+    identity = supervisor_identity()
 
     for active_state <- ["failed", "deactivating"] do
       runner = fn _executable, args, _opts ->
@@ -159,11 +179,11 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
           ["--user", "stop", "--wait", _unit] ->
             {"", 0}
 
-          ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", "--value", _unit] ->
-            {"loaded\n#{active_state}\n/user.slice/symphony.scope\n111\n", 0}
+          ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
+            {"MainPID=111\nControlGroup=/user.slice/symphony.scope\nLoadState=loaded\nActiveState=#{active_state}\n", 0}
 
-          ["--user", "show", "--property=ActiveState", "--value", _unit] ->
-            {active_state <> "\n", 0}
+          ["--user", "show", "--property=ActiveState", _unit] ->
+            {"ActiveState=" <> active_state <> "\n", 0}
         end
       end
 
@@ -191,7 +211,11 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
     }
 
     {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, lease_attrs, 0)
-    identity = ExecutionSupervisor.identity("issue-350", 1, "worker-350", "process-350", 1)
+
+    identity =
+      ExecutionSupervisor.identity("issue-350", 1, "worker-350", "process-350", 1)
+      |> Map.merge(%{control_group: "/user.slice/symphony.scope", launch_processes: [111], main_pid: 111})
+
     assert {:ok, state} = ExecutionFence.record_supervisor(state, token, "worker-350", identity)
     assert :ok = Persistence.save(path, state)
     assert {:ok, state} = Persistence.load(path)
@@ -220,6 +244,8 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
       process_tree: :terminated,
       supervisor: :systemd_user,
       unit: identity.unit,
+      pre_control_group: identity.control_group,
+      pre_processes: identity.launch_processes,
       active_state: "inactive",
       remaining_processes: 0,
       evidence_ref: "systemd:proof-350",
@@ -254,6 +280,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
           end)
 
           Process.sleep(500)
+          assert {:ok, identity} = ExecutionSupervisor.capture(identity)
           assert {:ok, evidence} = ExecutionSupervisor.terminate(identity, now_ms: 500)
           assert evidence.process_tree == :terminated
           assert :ok = ExecutionSupervisor.validate_evidence(identity, evidence)
@@ -264,5 +291,10 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
     else
       :ok
     end
+  end
+
+  defp supervisor_identity do
+    ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+    |> Map.merge(%{control_group: "/user.slice/symphony.scope", launch_processes: [111], main_pid: 111})
   end
 end
