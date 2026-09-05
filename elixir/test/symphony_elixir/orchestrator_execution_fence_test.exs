@@ -1,8 +1,202 @@
 defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{ExecutionFence, ExecutionSupervisor, Orchestrator}
+  alias SymphonyElixir.{ExecutionFence, ExecutionSupervisor, Orchestrator, WorkPackageCleanupReceipt}
   alias SymphonyElixir.ExecutionFence.Persistence
+  alias SymphonyElixir.WorkPackageClaim.Journal
+
+  test "an ordinary poll retries a failed cleanup receipt and permits the next generation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_concurrent_agents: 0
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_issues) end)
+
+    issue_id = "HGS-350-retry"
+    repository = "openai/symphony"
+    profile = "profile-350-retry"
+    journal_path = Path.join(System.tmp_dir!(), "symphony-cleanup-retry-#{System.unique_integer([:positive])}.json")
+    on_exit(fn -> File.rm(journal_path) end)
+
+    admission = %{
+      issue_id: issue_id,
+      repository: repository,
+      branch: "codex/hgs-350-retry",
+      worktree: Path.join(System.tmp_dir!(), "symphony-hgs-350-retry")
+    }
+
+    {:ok, fence_state, token} = ExecutionFence.admit(ExecutionFence.new(), admission, 100)
+
+    session =
+      Map.merge(admission, %{
+        generation: 1,
+        role: :worker,
+        session_id: "worker-350-retry",
+        process_id: "process-350-retry",
+        linear_state: "In Progress",
+        pr_state: "OPEN",
+        head: "abc123",
+        last_heartbeat_at: 100
+      })
+
+    {:ok, fence_state, :registered} = ExecutionFence.register(fence_state, token, :worker, session, 100)
+    {:ok, fence_state, :released} = ExecutionFence.release(fence_state, token, session.session_id, :orchestrator_stop)
+
+    evidence = %{
+      session_id: session.session_id,
+      process_id: session.process_id,
+      process_tree: :terminated,
+      evidence_ref: "process-tree-check-350-retry",
+      observed_at_ms: 110
+    }
+
+    {:ok, fence_state, :confirmed} =
+      ExecutionFence.confirm_termination(fence_state, token, session.session_id, evidence, 110)
+
+    {:ok, fence_state, :fenced} =
+      ExecutionFence.fence(fence_state, token, %{terminal_state: "Done", accepted_head: "abc123"}, 120)
+
+    {:ok, fence_state, :prepared} = ExecutionFence.prepare_cleanup(fence_state, token, "abc123", 121)
+
+    {:ok, fence_state} =
+      ExecutionFence.record_cleanup_evidence(fence_state, token, "abc123", "sha256:cleanup-350-retry", 122)
+
+    {:ok, fence_state, :cleaned} = ExecutionFence.cleanup(fence_state, token, "abc123", 123)
+
+    reservation_key = Journal.reservation_key(issue_id, profile, repository, 1)
+
+    reservation = %{
+      issue_id: issue_id,
+      managed_project_profile_id: profile,
+      repository_ref: repository,
+      projection_id: "projection-350-retry",
+      reservation_id: "reservation-350-retry",
+      reservation_nonce: "nonce-350-retry",
+      scope_keys: ["repo:#{repository}", "work:350-retry"],
+      runner_id: "runner-350-retry",
+      generation: 1,
+      session_id: session.session_id,
+      process_id: session.process_id,
+      responsible_delegation_id: "delegation-350-retry",
+      execution_fence_token: "#{issue_id}:1",
+      runtime_lease_id: session.session_id
+    }
+
+    {:ok, journal} = Journal.put(Journal.new(), reservation_key, reservation)
+    assert :ok = Journal.save(journal_path, journal)
+
+    input = %{
+      base_url: "http://provider.test",
+      runner_token: "runner-token",
+      attestation_key: "attestation-key",
+      runner_id: reservation.runner_id,
+      managed_project_profile_id: profile,
+      issue_id: issue_id,
+      repository_ref: repository,
+      fence_state: fence_state,
+      journal_path: journal_path
+    }
+
+    termination_request = fn _url, options ->
+      payload = Keyword.fetch!(options, :json)
+
+      {:ok,
+       provider_response(%{
+         "projectionId" => reservation.projection_id,
+         "reservationId" => reservation.reservation_id,
+         "receiptId" => payload["receiptId"],
+         "receiptKind" => "termination_confirmed",
+         "executionCapacityState" => "released",
+         "scopeState" => "held",
+         "reservationState" => "claimed",
+         "generation" => 1,
+         "evidenceRef" => payload["evidenceRef"],
+         "acceptedHead" => payload["acceptedHead"],
+         "replayed" => false
+       })}
+    end
+
+    assert {:ok, _termination_result} =
+             WorkPackageCleanupReceipt.termination_confirmed(
+               input,
+               %{terminal_outcome: :completed, accepted_head: "abc123"},
+               request_fun: termination_request,
+               now_fun: fn -> ~U[2026-09-06 10:00:00.000Z] end
+             )
+
+    Process.put(:repository_receipt_attempts, 0)
+
+    repository_request = fn _url, options ->
+      attempt = Process.get(:repository_receipt_attempts) + 1
+      Process.put(:repository_receipt_attempts, attempt)
+
+      if attempt == 1 do
+        {:error, :provider_temporarily_unavailable}
+      else
+        payload = Keyword.fetch!(options, :json)
+
+        {:ok,
+         provider_response(%{
+           "projectionId" => reservation.projection_id,
+           "reservationId" => reservation.reservation_id,
+           "receiptId" => payload["receiptId"],
+           "receiptKind" => "repository_cleanup_verified",
+           "executionCapacityState" => "released",
+           "scopeState" => "released",
+           "reservationState" => "released",
+           "generation" => 1,
+           "evidenceRef" => payload["evidenceRef"],
+           "acceptedHead" => payload["acceptedHead"],
+           "replayed" => false
+         })}
+      end
+    end
+
+    runtime = %{
+      base_url: input.base_url,
+      runner_token: input.runner_token,
+      attestation_key: input.attestation_key,
+      runner_id: input.runner_id,
+      managed_project_profile_id: input.managed_project_profile_id,
+      journal_path: journal_path,
+      request_fun: repository_request,
+      now_fun: fn -> ~U[2026-09-06 10:01:00.000Z] end,
+      cleanup_evidence_fun: fn _state, _token, _head -> {:ok, "sha256:cleanup-350-retry"} end
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 0,
+      execution_fence: fence_state,
+      work_package_runtime: runtime,
+      running: %{},
+      blocked: %{},
+      claimed: MapSet.new()
+    }
+
+    assert {:noreply, after_failed_poll} = Orchestrator.handle_info(:run_poll_cycle, state)
+    assert Process.get(:repository_receipt_attempts) == 1
+    assert {:ok, journal_after_failure} = Journal.load(journal_path)
+    assert :missing = Journal.cleanup_receipt_ack(journal_after_failure, reservation_key, "repository_cleanup_verified")
+
+    assert {:noreply, after_successful_poll} = Orchestrator.handle_info(:run_poll_cycle, after_failed_poll)
+    assert Process.get(:repository_receipt_attempts) == 2
+    assert {:ok, journal_after_success} = Journal.load(journal_path)
+
+    assert {:ok, acknowledgement} =
+             Journal.cleanup_receipt_ack(
+               journal_after_success,
+               reservation_key,
+               "repository_cleanup_verified"
+             )
+
+    assert acknowledgement.scope_state == "released"
+    assert acknowledgement.reservation_state == "released"
+    assert {:ok, _next_fence, next_token} = ExecutionFence.admit(after_successful_poll.execution_fence, admission, 130)
+    assert next_token.generation == 2
+  end
 
   test "restart reconciliation stops and confirms persisted supervisor ownership" do
     admission = admission()
@@ -356,4 +550,6 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
       last_heartbeat_at: 100
     })
   end
+
+  defp provider_response(data), do: %Req.Response{status: 200, body: %{"data" => data}}
 end

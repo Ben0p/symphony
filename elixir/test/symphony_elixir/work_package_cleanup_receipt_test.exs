@@ -98,6 +98,20 @@ defmodule SymphonyElixir.WorkPackageCleanupReceiptTest do
     assert payload["executionFenceToken"] == "#{@issue}:1"
     assert payload["runtimeLeaseId"] == payload["sessionId"]
     assert payload["scopeKeys"] == ["repo:#{@repository}", "work:350"]
+
+    assert {:ok, replayed_result} =
+             WorkPackageCleanupReceipt.termination_confirmed(
+               input,
+               %{terminal_outcome: :completed, accepted_head: "abc123"},
+               request_fun: fn _url, _options -> flunk("an acknowledged receipt must not be resent") end,
+               now_fun: fn -> ~U[2026-09-06 10:01:00.000Z] end
+             )
+
+    assert replayed_result == result
+    assert {:ok, journal} = Journal.load(input.journal_path)
+    assert {:ok, acknowledgement} = Journal.cleanup_receipt_ack(journal, @reservation_key, "termination_confirmed")
+    assert acknowledgement.receipt_id == result.receipt_id
+    assert acknowledgement.scope_state == "held"
   end
 
   test "journals the semantic receipt before a lost response and refreshes only freshness fields" do
@@ -162,6 +176,16 @@ defmodule SymphonyElixir.WorkPackageCleanupReceiptTest do
     assert second_payload["acceptedHead"] == first_payload["acceptedHead"]
     refute second_payload["attestedAt"] == first_payload["attestedAt"]
     refute second_payload["signature"] == first_payload["signature"]
+
+    assert {:ok, %{replayed: true} = replayed_result} =
+             WorkPackageCleanupReceipt.termination_confirmed(
+               input,
+               %{terminal_outcome: :completed, accepted_head: "abc123"},
+               request_fun: fn _url, _options -> flunk("the persisted provider acknowledgement must be reused") end,
+               now_fun: fn -> ~U[2026-09-06 10:02:00.000Z] end
+             )
+
+    assert replayed_result.receipt_id == second_payload["receiptId"]
   end
 
   test "rejects cleanup receipts before local termination and filesystem verification" do

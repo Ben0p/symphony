@@ -100,6 +100,46 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
 
   def cleanup_receipt(_state, _key, _receipt_kind), do: :missing
 
+  @doc "Persists the last provider acknowledgement for a journaled cleanup receipt."
+  @spec put_cleanup_receipt_ack(state(), String.t(), String.t(), map()) ::
+          {:ok, state()} | {:error, term()}
+  def put_cleanup_receipt_ack(
+        %{schema_version: @schema_version, reservations: reservations} = state,
+        key,
+        receipt_kind,
+        acknowledgement
+      )
+      when is_binary(key) and is_binary(receipt_kind) and is_map(acknowledgement) do
+    case get_in(reservations, [key, :cleanup_receipts, receipt_kind]) do
+      receipt when is_map(receipt) ->
+        reservation = Map.fetch!(reservations, key)
+        next_receipt = Map.put(receipt, :acknowledgement, acknowledgement)
+        next_reservation = put_in(reservation, [:cleanup_receipts, receipt_kind], next_receipt)
+        {:ok, %{state | reservations: Map.put(reservations, key, next_reservation)}}
+
+      _ ->
+        {:error, :cleanup_receipt_missing}
+    end
+  end
+
+  def put_cleanup_receipt_ack(_state, _key, _receipt_kind, _acknowledgement),
+    do: {:error, :invalid_cleanup_acknowledgement}
+
+  @spec cleanup_receipt_ack(state(), String.t(), String.t()) :: {:ok, map()} | :missing
+  def cleanup_receipt_ack(
+        %{schema_version: @schema_version, reservations: reservations},
+        key,
+        receipt_kind
+      )
+      when is_binary(key) and is_binary(receipt_kind) do
+    case get_in(reservations, [key, :cleanup_receipts, receipt_kind, :acknowledgement]) do
+      acknowledgement when is_map(acknowledgement) -> {:ok, acknowledgement}
+      _ -> :missing
+    end
+  end
+
+  def cleanup_receipt_ack(_state, _key, _receipt_kind), do: :missing
+
   @spec new() :: state()
   def new, do: %{schema_version: @schema_version, reservations: %{}}
 
@@ -244,20 +284,55 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
       :repository_ref,
       :scope_keys,
       :attested_at,
-      :signature
+      :signature,
+      :acknowledgement
     ]
 
     if Enum.all?(receipt, fn {key, _value} -> key in Enum.map(keys, &Atom.to_string/1) end) do
-      {:ok,
-       Map.new(receipt, fn {key, value} ->
-         {String.to_existing_atom(key), value}
-       end)}
+      with {:ok, acknowledgement} <- decode_cleanup_acknowledgement(Map.get(receipt, "acknowledgement")) do
+        decoded =
+          Map.new(receipt, fn {key, value} ->
+            {String.to_existing_atom(key), value}
+          end)
+
+        {:ok, maybe_put_decoded(decoded, :acknowledgement, acknowledgement)}
+      end
     else
       {:error, :invalid_cleanup_receipt}
     end
   end
 
   defp decode_cleanup_receipt(_receipt), do: {:error, :invalid_cleanup_receipt}
+
+  defp decode_cleanup_acknowledgement(nil), do: {:ok, nil}
+
+  defp decode_cleanup_acknowledgement(acknowledgement) when is_map(acknowledgement) do
+    keys = [
+      :projection_id,
+      :reservation_id,
+      :receipt_id,
+      :receipt_kind,
+      :execution_capacity_state,
+      :scope_state,
+      :reservation_state,
+      :generation,
+      :evidence_ref,
+      :accepted_head,
+      :replayed
+    ]
+
+    if Enum.all?(acknowledgement, fn {key, _value} -> key in Enum.map(keys, &Atom.to_string/1) end) do
+      {:ok,
+       Map.new(acknowledgement, fn {key, value} ->
+         {String.to_existing_atom(key), value}
+       end)}
+    else
+      {:error, :invalid_cleanup_acknowledgement}
+    end
+  end
+
+  defp decode_cleanup_acknowledgement(_acknowledgement),
+    do: {:error, :invalid_cleanup_acknowledgement}
 
   defp required_fields(payload, fields) do
     Enum.reduce_while(fields, {:ok, %{}}, fn {key, json_key}, {:ok, acc} ->

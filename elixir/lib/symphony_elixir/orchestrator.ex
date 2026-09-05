@@ -38,6 +38,10 @@ defmodule SymphonyElixir.Orchestrator do
   @mandatory_terminal_states ["closed", "cancelled", "canceled", "duplicate", "done"]
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  # A poll may retry a bounded number of durable cleanup receipts. The
+  # GenServer serializes this reconciliation with dispatch, so this remains a
+  # singleflight retry path without introducing another timer or scheduler.
+  @cleanup_receipt_replay_limit 8
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -168,6 +172,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    state = replay_persisted_cleanup_receipts(state)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
@@ -2435,51 +2440,60 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp replay_persisted_cleanup_receipts(%State{work_package_runtime: nil}), do: :ok
+  defp replay_persisted_cleanup_receipts(%State{work_package_runtime: nil} = state), do: state
 
   defp replay_persisted_cleanup_receipts(%State{work_package_runtime: runtime} = state)
        when is_map(runtime) do
-    Enum.each(state.execution_fence.executions, fn {issue_id, execution} ->
-      token = %{issue_id: issue_id, generation: execution.generation}
+    actions =
+      Enum.flat_map(state.execution_fence.executions, fn {issue_id, execution} ->
+        token = %{issue_id: issue_id, generation: execution.generation}
 
-      Enum.each(execution.leases, fn {_session_id, lease} ->
-        case {Map.get(lease, :termination_confirmed_at_ms), Map.get(lease, :termination_evidence)} do
-          {confirmed_at_ms, evidence} when is_integer(confirmed_at_ms) and is_map(evidence) ->
-            submit_termination_cleanup_receipt(
-              state,
-              %{
-                execution_token: token,
-                execution_session_id: lease.session_id,
-                issue: %Issue{id: issue_id, identifier: issue_id},
-                terminal_outcome: cleanup_terminal_outcome(state, token)
-              },
-              evidence
-            )
+        termination_actions =
+          Enum.flat_map(execution.leases, fn {_session_id, lease} ->
+            case {Map.get(lease, :termination_confirmed_at_ms), Map.get(lease, :termination_evidence)} do
+              {confirmed_at_ms, evidence} when is_integer(confirmed_at_ms) and is_map(evidence) ->
+                [
+                  {:termination, token, lease.session_id, evidence, %Issue{id: issue_id, identifier: issue_id}, cleanup_terminal_outcome(state, token)}
+                ]
 
-          _ ->
-            :ok
-        end
+              _ ->
+                []
+            end
+          end)
+
+        repository_actions =
+          if execution.cleanup == :cleaned do
+            case {get_in(execution, [:terminal, :accepted_head]), cleanup_terminal_outcome(state, token)} do
+              {head, outcome} when is_binary(head) and head != "" -> [{:repository, token, head, outcome}]
+              _ -> []
+            end
+          else
+            []
+          end
+
+        termination_actions ++ repository_actions
       end)
 
-      if execution.cleanup == :cleaned do
-        case {get_in(execution, [:terminal, :accepted_head]), cleanup_terminal_outcome(state, token)} do
-          {head, outcome} when is_binary(head) and head != "" ->
-            submit_repository_cleanup_receipt(state, token, head, outcome)
+    actions
+    |> Enum.take(@cleanup_receipt_replay_limit)
+    |> Enum.reduce(state, fn
+      {:termination, token, session_id, evidence, issue, outcome}, current_state ->
+        submit_termination_cleanup_receipt(
+          current_state,
+          %{execution_token: token, execution_session_id: session_id, issue: issue, terminal_outcome: outcome},
+          evidence
+        )
 
-          _ ->
-            :ok
-        end
-      end
+      {:repository, token, head, outcome}, current_state ->
+        submit_repository_cleanup_receipt(current_state, token, head, outcome)
     end)
-
-    :ok
   rescue
     error ->
       Logger.warning("Persisted cleanup receipt replay failed: #{inspect(error)}")
-      :ok
+      state
   end
 
-  defp replay_persisted_cleanup_receipts(_state), do: :ok
+  defp replay_persisted_cleanup_receipts(state), do: state
 
   defp defer_startup_workspace_cleanup(%Issue{} = issue) do
     Logger.info("Deferring startup cleanup for terminal issue #{issue_context(issue)} until its persisted execution fence is reconciled")

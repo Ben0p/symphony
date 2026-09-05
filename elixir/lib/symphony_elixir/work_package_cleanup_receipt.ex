@@ -38,12 +38,18 @@ defmodule SymphonyElixir.WorkPackageCleanupReceipt do
          {:ok, journal} <- load_journal(input.journal_path),
          {:ok, reservation} <- reservation_for(input, journal),
          {:ok, authority} <- authority(input, reservation, kind),
-         {:ok, semantic, next_journal} <- semantic_receipt(journal, authority, kind, outcome, attrs, now),
-         :ok <- persist_semantic_receipt(input.journal_path, journal, next_journal),
-         {:ok, receipt} <- attest(semantic, now, input.attestation_key),
-         {:ok, response} <- request_receipt(authority.base_url, reservation.projection_id, input.runner_token, receipt, request_fun),
-         {:ok, body} <- response_data(response),
-         {:ok, result} <- validate_result(body, authority, reservation, receipt) do
+         {:ok, result} <-
+           submit_or_replay(
+             input,
+             journal,
+             reservation,
+             authority,
+             kind,
+             outcome,
+             attrs,
+             now,
+             request_fun
+           ) do
       {:ok, result}
     end
   end
@@ -58,6 +64,175 @@ defmodule SymphonyElixir.WorkPackageCleanupReceipt do
   @spec repository_cleanup_verified(input(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def repository_cleanup_verified(input, attrs, opts \\ []) when is_map(input) and is_map(attrs) do
     submit(input, :repository_cleanup_verified, attrs, opts)
+  end
+
+  defp submit_or_replay(
+         input,
+         journal,
+         reservation,
+         authority,
+         kind,
+         outcome,
+         attrs,
+         now,
+         request_fun
+       ) do
+    key = journal_key(authority)
+    receipt_kind = Atom.to_string(kind)
+
+    case Journal.cleanup_receipt(journal, key, receipt_kind) do
+      {:ok, semantic} ->
+        with :ok <- immutable_request_matches(semantic, kind, outcome, attrs),
+             :ok <- valid_stored_semantic(semantic, authority, kind) do
+          case stored_acknowledgement(semantic, authority, reservation, kind) do
+            {:ok, result} ->
+              {:ok, result}
+
+            :missing ->
+              submit_unacknowledged(
+                input,
+                journal,
+                reservation,
+                authority,
+                kind,
+                outcome,
+                attrs,
+                now,
+                request_fun
+              )
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end
+
+      :missing ->
+        submit_unacknowledged(
+          input,
+          journal,
+          reservation,
+          authority,
+          kind,
+          outcome,
+          attrs,
+          now,
+          request_fun
+        )
+    end
+  end
+
+  defp submit_unacknowledged(
+         input,
+         journal,
+         reservation,
+         authority,
+         kind,
+         outcome,
+         attrs,
+         now,
+         request_fun
+       ) do
+    key = journal_key(authority)
+    receipt_kind = Atom.to_string(kind)
+
+    with {:ok, semantic, next_journal} <- semantic_receipt(journal, authority, kind, outcome, attrs, now),
+         :ok <- persist_semantic_receipt(input.journal_path, journal, next_journal),
+         {:ok, receipt} <- attest(semantic, now, input.attestation_key),
+         {:ok, response} <-
+           request_receipt(
+             authority.base_url,
+             reservation.projection_id,
+             input.runner_token,
+             receipt,
+             request_fun
+           ),
+         {:ok, body} <- response_data(response),
+         {:ok, result} <- validate_result(body, authority, reservation, receipt),
+         {:ok, acknowledged_journal} <- Journal.put_cleanup_receipt_ack(next_journal, key, receipt_kind, result),
+         :ok <- Journal.save(input.journal_path, acknowledged_journal) do
+      {:ok, result}
+    end
+  end
+
+  defp stored_acknowledgement(semantic, authority, reservation, kind) do
+    case Map.get(semantic, :acknowledgement, Map.get(semantic, "acknowledgement")) do
+      nil ->
+        :missing
+
+      acknowledgement when is_map(acknowledgement) ->
+        with {:ok, normalized} <- normalize_acknowledgement(acknowledgement),
+             {:ok, result} <-
+               validate_result(acknowledgement_wire(normalized), authority, reservation, semantic),
+             true <- result.receipt_kind == Atom.to_string(kind) do
+          {:ok, result}
+        else
+          false -> {:error, :invalid_cleanup_acknowledgement}
+          {:error, _reason} -> {:error, :invalid_cleanup_acknowledgement}
+        end
+
+      _ ->
+        {:error, :invalid_cleanup_acknowledgement}
+    end
+  end
+
+  @acknowledgement_fields [
+    :projection_id,
+    :reservation_id,
+    :receipt_id,
+    :receipt_kind,
+    :execution_capacity_state,
+    :scope_state,
+    :reservation_state,
+    :generation,
+    :evidence_ref,
+    :accepted_head,
+    :replayed
+  ]
+
+  defp normalize_acknowledgement(acknowledgement) do
+    Enum.reduce_while(acknowledgement, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      case acknowledgement_key(key) do
+        nil -> {:halt, {:error, :invalid_cleanup_acknowledgement}}
+        normalized -> {:cont, {:ok, Map.put(acc, normalized, value)}}
+      end
+    end)
+  end
+
+  defp acknowledgement_key(key) when key in @acknowledgement_fields, do: key
+
+  defp acknowledgement_key(key) when is_binary(key) do
+    case key do
+      "projectionId" -> :projection_id
+      "reservationId" -> :reservation_id
+      "receiptId" -> :receipt_id
+      "receiptKind" -> :receipt_kind
+      "executionCapacityState" -> :execution_capacity_state
+      "scopeState" -> :scope_state
+      "reservationState" -> :reservation_state
+      "generation" -> :generation
+      "evidenceRef" -> :evidence_ref
+      "acceptedHead" -> :accepted_head
+      "replayed" -> :replayed
+      _ -> nil
+    end
+  end
+
+  defp acknowledgement_key(_key), do: nil
+
+  defp acknowledgement_wire(acknowledgement) do
+    %{
+      "projectionId" => acknowledgement.projection_id,
+      "reservationId" => acknowledgement.reservation_id,
+      "receiptId" => acknowledgement.receipt_id,
+      "receiptKind" => acknowledgement.receipt_kind,
+      "executionCapacityState" => acknowledgement.execution_capacity_state,
+      "scopeState" => acknowledgement.scope_state,
+      "reservationState" => acknowledgement.reservation_state,
+      "generation" => acknowledgement.generation,
+      "evidenceRef" => acknowledgement.evidence_ref,
+      "acceptedHead" => acknowledgement.accepted_head,
+      "replayed" => acknowledgement.replayed
+    }
   end
 
   @doc "Builds the provider HMAC canonical JSON in the frozen wire-field order."
@@ -440,6 +615,8 @@ defmodule SymphonyElixir.WorkPackageCleanupReceipt do
       |> Map.delete(:receipt_id)
       |> Map.delete(:attested_at)
       |> Map.delete(:signature)
+      |> Map.delete(:acknowledgement)
+      |> Map.delete("acknowledgement")
       |> canonical_seed()
 
     "cleanup-" <> (:crypto.hash(:sha256, seed) |> Base.encode16(case: :lower))
