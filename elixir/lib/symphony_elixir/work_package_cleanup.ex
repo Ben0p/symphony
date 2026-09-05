@@ -244,12 +244,21 @@ defmodule SymphonyElixir.WorkPackageCleanup do
   end
 
   defp read_json(path) do
-    case File.read(path) do
-      {:ok, contents} ->
-        case Jason.decode(contents) do
-          {:ok, map} when is_map(map) -> {:ok, map}
-          _ -> {:error, :invalid_cleanup_manifest}
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        case File.read(path) do
+          {:ok, contents} ->
+            case Jason.decode(contents) do
+              {:ok, map} when is_map(map) -> {:ok, map}
+              _ -> {:error, :invalid_cleanup_manifest}
+            end
+
+          {:error, reason} ->
+            {:error, {:cleanup_manifest_unreadable, reason}}
         end
+
+      {:ok, _stat} ->
+        {:error, :invalid_cleanup_manifest}
 
       {:error, reason} ->
         {:error, {:cleanup_manifest_unreadable, reason}}
@@ -376,10 +385,21 @@ defmodule SymphonyElixir.WorkPackageCleanup do
   end
 
   defp file_digest(path) do
-    with {:ok, contents} <- File.read(path) do
-      {:ok, %{size: byte_size(contents), sha256: digest_bytes(contents)}}
-    else
-      {:error, reason} -> {:error, {:cleanup_archive_file_unreadable, path, reason}}
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        case File.read(path) do
+          {:ok, contents} ->
+            {:ok, %{size: byte_size(contents), sha256: digest_bytes(contents)}}
+
+          {:error, reason} ->
+            {:error, {:cleanup_archive_file_unreadable, path, reason}}
+        end
+
+      {:ok, _stat} ->
+        {:error, {:cleanup_archive_file_not_regular, path}}
+
+      {:error, reason} ->
+        {:error, {:cleanup_archive_file_unreadable, path, reason}}
     end
   end
 
