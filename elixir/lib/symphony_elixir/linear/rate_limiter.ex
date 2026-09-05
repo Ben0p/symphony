@@ -6,7 +6,9 @@ defmodule SymphonyElixir.Linear.RateLimiter do
   the shared Linear API key. A short-lived exclusive lock and a wall-clock
   reservation timestamp in a shared file provide a small host-local gate.
   Lock metadata records the owner OS process so stale cleanup cannot evict a
-  live lock when its BEAM owner is briefly descheduled.
+  live lock when its BEAM owner is briefly descheduled. Unix hosts with
+  `flock` use a kernel-held lock that is released when the lock owner exits;
+  the metadata protocol remains the fallback on other platforms.
   """
 
   require Logger
@@ -17,6 +19,8 @@ defmodule SymphonyElixir.Linear.RateLimiter do
   @default_max_retry_after_ms 3_600_000
   @lock_poll_ms 10
   @lock_metadata_version "symphony-linear-rate-lock-v1"
+  @flock_ready_marker "symphony-linear-rate-lock-ready"
+  @flock_unavailable_status 75
 
   @type settings :: %{
           state_path: Path.t(),
@@ -163,10 +167,116 @@ defmodule SymphonyElixir.Linear.RateLimiter do
 
   defp with_lock(settings, fun) when is_function(fun, 0) do
     started_at = System.monotonic_time(:millisecond)
-    acquire_lock(settings, fun, started_at)
+
+    case advisory_lock_executable() do
+      executable when is_binary(executable) ->
+        acquire_advisory_lock(settings, fun, executable, started_at)
+
+      _missing ->
+        acquire_token_lock(settings, fun, started_at)
+    end
   end
 
-  defp acquire_lock(settings, fun, started_at) do
+  defp advisory_lock_executable do
+    case :os.type() do
+      {:unix, _name} -> System.find_executable("flock")
+      _other -> nil
+    end
+  end
+
+  defp acquire_advisory_lock(settings, fun, executable, started_at) do
+    case open_advisory_lock(executable, settings.lock_path) do
+      {:ok, port} ->
+        case await_advisory_lock(port, started_at, settings.max_wait_ms, <<>>) do
+          :ok ->
+            result =
+              try do
+                fun.()
+              after
+                close_advisory_lock(port)
+              end
+
+            normalize_lock_result(result)
+
+          {:error, :unavailable} ->
+            close_advisory_lock(port)
+            retry_advisory_lock(settings, fun, executable, started_at)
+
+          {:error, reason} ->
+            close_advisory_lock(port)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, {:linear_rate_limit_lock_open_failed, reason}}
+    end
+  end
+
+  defp open_advisory_lock(executable, path) do
+    command = "printf '#{@flock_ready_marker}'; cat"
+
+    try do
+      {:ok,
+       Port.open(
+         {:spawn_executable, executable},
+         [:binary, :exit_status, {:args, ["-xn", "-E", Integer.to_string(@flock_unavailable_status), path, "-c", command]}]
+       )}
+    rescue
+      error -> {:error, {:flock_unavailable, error}}
+    end
+  end
+
+  defp await_advisory_lock(port, started_at, max_wait_ms, buffer) do
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+
+    if elapsed_ms >= max_wait_ms do
+      {:error, :unavailable}
+    else
+      timeout_ms = min(@lock_poll_ms * 2, max(max_wait_ms - elapsed_ms, 1))
+
+      receive do
+        {^port, {:data, data}} when is_binary(data) ->
+          next_buffer = buffer <> data
+
+          if String.starts_with?(next_buffer, @flock_ready_marker) do
+            :ok
+          else
+            await_advisory_lock(port, started_at, max_wait_ms, next_buffer)
+          end
+
+        {^port, {:exit_status, @flock_unavailable_status}} ->
+          {:error, :unavailable}
+
+        {^port, {:exit_status, status}} ->
+          {:error, {:flock_exit, status}}
+      after
+        timeout_ms -> {:error, :unavailable}
+      end
+    end
+  end
+
+  defp retry_advisory_lock(settings, fun, executable, started_at) do
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+
+    if elapsed_ms >= settings.max_wait_ms do
+      {:error, :linear_rate_limit_lock_timeout}
+    else
+      Process.sleep(min(@lock_poll_ms, settings.max_wait_ms - elapsed_ms))
+      acquire_advisory_lock(settings, fun, executable, started_at)
+    end
+  end
+
+  defp close_advisory_lock(port) do
+    if Port.info(port), do: Port.close(port)
+  rescue
+    _error -> :ok
+  end
+
+  defp normalize_lock_result({:error, reason}), do: {:error, reason}
+  defp normalize_lock_result({:ok, value}), do: {:ok, value}
+  defp normalize_lock_result(value), do: {:ok, value}
+
+  defp acquire_token_lock(settings, fun, started_at) do
     case File.open(settings.lock_path, [:write, :exclusive, :binary]) do
       {:ok, io} ->
         lock_token = lock_token()
@@ -196,11 +306,11 @@ defmodule SymphonyElixir.Linear.RateLimiter do
 
           stale_lock?(settings.lock_path, settings.stale_lock_ms) ->
             File.rm(settings.lock_path)
-            acquire_lock(settings, fun, started_at)
+            acquire_token_lock(settings, fun, started_at)
 
           true ->
             Process.sleep(@lock_poll_ms)
-            acquire_lock(settings, fun, started_at)
+            acquire_token_lock(settings, fun, started_at)
         end
 
       {:error, reason} ->
