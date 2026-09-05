@@ -8,6 +8,13 @@ a private control plane. This call-home path is disabled until its runner identi
 profile, pool, and bearer token are all supplied; it never sends prompts, secrets, logs, worktree
 paths, or the raw orchestrator snapshot.
 
+Managed Linux pools can also enable the generation-bound work-package runtime. The host must
+provide the complete provider URL, runner token, attestation key, runner ID, and managed project
+profile ID tuple; partial configuration fails startup, while a declared `SYMPHONY_POOL_KEY` or
+`SYMPHONY_REPOSITORY_REF` without it fails startup as well. The Elixir runtime archives dirty and unmerged work, retains open PR
+candidates, and releases provider scope only after independently verified supervisor termination
+and workspace cleanup. See [elixir/README.md](elixir/README.md) for the host environment contract.
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
 _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._

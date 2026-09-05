@@ -397,10 +397,10 @@ defmodule SymphonyElixir.ExecutionFence do
   @doc "Begins a durable, replayable filesystem cleanup phase."
   @spec prepare_cleanup(state(), token(), String.t(), non_neg_integer()) ::
           {:ok, state(), :prepared | :already_prepared} | {:error, term()}
-  @spec prepare_cleanup(state(), token(), String.t(), non_neg_integer(), atom() | nil) ::
-          {:ok, state(), :prepared | :already_prepared} | {:error, term()}
   def prepare_cleanup(state, token, expected_head, now_ms), do: prepare_cleanup(state, token, expected_head, now_ms, nil)
 
+  @spec prepare_cleanup(state(), token(), String.t(), non_neg_integer(), atom() | nil) ::
+          {:ok, state(), :prepared | :already_prepared} | {:error, term()}
   def prepare_cleanup(state, token, expected_head, now_ms, terminal_outcome)
       when is_binary(expected_head) and is_integer(now_ms) and now_ms >= 0 and
              terminal_outcome in [nil, :completed, :failed, :blocked] do
@@ -437,6 +437,32 @@ defmodule SymphonyElixir.ExecutionFence do
 
   def prepare_cleanup(_state, _token, _expected_head, _now_ms, _terminal_outcome),
     do: {:error, :invalid_cleanup}
+
+  @doc "Persists independent cleanup evidence before filesystem removal begins."
+  @spec record_cleanup_evidence(state(), token(), String.t(), String.t(), non_neg_integer()) ::
+          {:ok, state()} | {:error, term()}
+  def record_cleanup_evidence(state, token, expected_head, evidence_ref, now_ms)
+      when is_binary(expected_head) and is_binary(evidence_ref) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_cleanup(state, token, expected_head),
+         true <- present_string?(evidence_ref),
+         {:ok, execution} <- current_execution(state, token),
+         %{phase: :removal_started, expected_head: ^expected_head} = receipt <- Map.get(execution, :cleanup_receipt) do
+      next_receipt =
+        receipt
+        |> Map.put(:evidence_ref, evidence_ref)
+        |> Map.put(:evidence_recorded_at_ms, now_ms)
+
+      {:ok, put_execution(state, Map.put(execution, :cleanup_receipt, next_receipt))}
+    else
+      false -> {:error, :invalid_cleanup_evidence}
+      nil -> {:error, :cleanup_not_prepared}
+      {:error, _reason} = error -> error
+      _ -> {:error, :cleanup_not_prepared}
+    end
+  end
+
+  def record_cleanup_evidence(_state, _token, _expected_head, _evidence_ref, _now_ms),
+    do: {:error, :invalid_cleanup_evidence}
 
   defp registration_result(state, execution, session) do
     case Map.get(state.sessions, session.session_id) do
@@ -822,7 +848,7 @@ defmodule SymphonyElixir.ExecutionFence do
       is_list(Map.get(identity, :launch_processes)) and
       Map.get(identity, :launch_processes) != [] and
       Enum.all?(Map.get(identity, :launch_processes), &(is_integer(&1) and &1 > 0)) and
-      is_integer(Map.get(identity, :main_pid)) and Map.get(identity, :main_pid) > 0
+      optional_positive_integer?(Map.get(identity, :main_pid))
   end
 
   defp attested_supervisor_identity?(_identity), do: false
@@ -834,6 +860,8 @@ defmodule SymphonyElixir.ExecutionFence do
       present_string?(Map.get(receipt, :expected_head)) and
       non_negative_integer?(Map.get(receipt, :prepared_at_ms)) and
       optional_non_negative_integer?(Map.get(receipt, :verified_at_ms)) and
+      optional_string?(Map.get(receipt, :evidence_ref)) and
+      optional_non_negative_integer?(Map.get(receipt, :evidence_recorded_at_ms)) and
       (Map.get(receipt, :phase) != :verified or
          non_negative_integer?(Map.get(receipt, :verified_at_ms))) and
       optional_terminal_outcome?(Map.get(receipt, :terminal_outcome))
@@ -980,7 +1008,16 @@ defmodule SymphonyElixir.ExecutionFence do
   defp sanitize_cleanup_receipt(nil), do: nil
 
   defp sanitize_cleanup_receipt(receipt),
-    do: Map.take(receipt, [:phase, :expected_head, :prepared_at_ms, :verified_at_ms, :terminal_outcome])
+    do:
+      Map.take(receipt, [
+        :phase,
+        :expected_head,
+        :prepared_at_ms,
+        :verified_at_ms,
+        :terminal_outcome,
+        :evidence_ref,
+        :evidence_recorded_at_ms
+      ])
 
   defp sanitize_session(session) do
     Map.take(session, [
@@ -1028,6 +1065,9 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp optional_non_negative_integer?(nil), do: true
   defp optional_non_negative_integer?(value), do: non_negative_integer?(value)
+
+  defp optional_positive_integer?(nil), do: true
+  defp optional_positive_integer?(value), do: positive_integer?(value)
 
   defp validate_admission(attrs, now_ms)
        when is_map(attrs) and is_integer(now_ms) and now_ms >= 0 do

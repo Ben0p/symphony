@@ -159,6 +159,26 @@ it claims this reservation before launching the mutable worker and posts termina
 cleanup receipts from the same fence. Runner tokens and attestation keys are supplied by the host
 and are never logged or placed in workflow files.
 
+To enable this managed runtime on a Linux runner, the host must provide the complete tuple below;
+the service rejects a partial tuple during supervisor startup and leaves the adapter disabled when
+all five values are absent. A host that declares `SYMPHONY_POOL_KEY` or
+`SYMPHONY_REPOSITORY_REF` is treated as a managed pool and must provide the tuple:
+
+```text
+DAHLIA_WORK_PACKAGE_PROVIDER_URL=https://provider.example
+DAHLIA_WORK_PACKAGE_RUNNER_TOKEN=<host-injected secret>
+DAHLIA_WORK_PACKAGE_ATTESTATION_KEY=<host-injected secret>
+DAHLIA_RUNNER_ID=<scoped runner identity>
+DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
+```
+
+`DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
+private reservation journal and archive root. The archive root must be outside active workspaces.
+The local Linux path uses the systemd user supervisor and records the claim, process-tree proof,
+and archive evidence before releasing provider capacity. Remote SSH workers remain held when this
+proof or the independent archive verifier is unavailable. These provider credentials are scrubbed
+from the Codex child environment.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 

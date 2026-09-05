@@ -1960,19 +1960,26 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, prepared_fence, _result} ->
         case persist_execution_fence(state, prepared_fence) do
           {:ok, prepared_state} ->
-            case cleanup_issue_workspace(issue_or_identifier, entry) do
-              :ok ->
-                persist_fenced_cleanup(prepared_state, token, head, now_ms, Map.get(entry, :terminal_outcome))
+            case prepare_cleanup_evidence(prepared_state, entry, token, head, now_ms) do
+              {:ok, evidence_state} ->
+                case cleanup_issue_workspace(issue_or_identifier, entry) do
+                  :ok ->
+                    finalize_fenced_workspace_cleanup(evidence_state, entry, token, head, now_ms)
 
-              {:ok, _removed} ->
-                persist_fenced_cleanup(prepared_state, token, head, now_ms, Map.get(entry, :terminal_outcome))
+                  {:ok, _removed} ->
+                    finalize_fenced_workspace_cleanup(evidence_state, entry, token, head, now_ms)
 
-              {:error, reason, _path} ->
-                Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
-                prepared_state
+                  {:error, reason, _path} ->
+                    Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+                    evidence_state
+
+                  {:error, reason} ->
+                    Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+                    evidence_state
+                end
 
               {:error, reason} ->
-                Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+                Logger.warning("Preserving fenced workspace without independent archive evidence: #{inspect(reason)}")
                 prepared_state
             end
 
@@ -1983,6 +1990,67 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp prepare_cleanup_evidence(%State{work_package_runtime: nil} = state, _entry, _token, _head, _now_ms),
+    do: {:ok, state}
+
+  defp prepare_cleanup_evidence(
+         %State{work_package_runtime: runtime} = state,
+         entry,
+         token,
+         head,
+         now_ms
+       )
+       when is_map(runtime) do
+    case Map.get(runtime, :cleanup_prepare_fun) do
+      preparer when is_function(preparer, 4) ->
+        case preparer.(state, token, head, entry) do
+          {:ok, evidence_ref} when is_binary(evidence_ref) and evidence_ref != "" ->
+            case ExecutionFence.record_cleanup_evidence(
+                   state.execution_fence,
+                   token,
+                   head,
+                   evidence_ref,
+                   now_ms
+                 ) do
+              {:ok, fence_state} -> persist_execution_fence(state, fence_state)
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:error, _reason} = error ->
+            error
+
+          _ ->
+            {:error, :invalid_cleanup_evidence}
+        end
+
+      _ ->
+        {:error, :cleanup_preservation_verifier_missing}
+    end
+  rescue
+    error -> {:error, {:cleanup_preservation_verifier_failed, error}}
+  end
+
+  defp prepare_cleanup_evidence(_state, _entry, _token, _head, _now_ms),
+    do: {:error, :invalid_cleanup_runtime}
+
+  defp finalize_fenced_workspace_cleanup(state, entry, token, head, now_ms) do
+    workspace_path = Map.get(entry, :workspace_path)
+    worker_host = Map.get(entry, :worker_host)
+
+    case Workspace.path_exists?(workspace_path, worker_host) do
+      {:ok, false} ->
+        persist_fenced_cleanup(state, token, head, now_ms, Map.get(entry, :terminal_outcome))
+
+      {:ok, true} ->
+        Logger.warning("Preserving fenced workspace because its path remains present after cleanup")
+        state
+
+      {:error, reason} ->
+        Logger.warning("Preserving fenced workspace because path absence could not be verified: #{inspect(reason)}")
         state
     end
   end
@@ -2333,16 +2401,25 @@ defmodule SymphonyElixir.Orchestrator do
         fn issue -> startup_workspace_cleanup(state, issue, owner) end
       end)
 
-    maintenance_fun =
-      Keyword.get_lazy(opts, :startup_maintenance_fun, fn ->
-        fn ->
-          StartupMaintenance.run(
-            &Tracker.fetch_issues_by_states/1,
-            startup_cleanup_fun,
-            Config.settings!().tracker
-          )
-        end
-      end)
+    maintenance_work =
+      case Keyword.get(opts, :startup_maintenance_fun) do
+        fun when is_function(fun, 0) ->
+          fun
+
+        _ ->
+          fn ->
+            StartupMaintenance.run(
+              &Tracker.fetch_issues_by_states/1,
+              startup_cleanup_fun,
+              Config.settings!().tracker
+            )
+          end
+      end
+
+    maintenance_fun = fn ->
+      replay_persisted_cleanup_receipts(state)
+      maintenance_work.()
+    end
 
     task =
       Task.Supervisor.async_nolink(task_supervisor, maintenance_fun)
@@ -2357,6 +2434,52 @@ defmodule SymphonyElixir.Orchestrator do
           |> Map.put(:task_pid, task.pid)
     }
   end
+
+  defp replay_persisted_cleanup_receipts(%State{work_package_runtime: nil}), do: :ok
+
+  defp replay_persisted_cleanup_receipts(%State{work_package_runtime: runtime} = state)
+       when is_map(runtime) do
+    Enum.each(state.execution_fence.executions, fn {issue_id, execution} ->
+      token = %{issue_id: issue_id, generation: execution.generation}
+
+      Enum.each(execution.leases, fn {_session_id, lease} ->
+        case {Map.get(lease, :termination_confirmed_at_ms), Map.get(lease, :termination_evidence)} do
+          {confirmed_at_ms, evidence} when is_integer(confirmed_at_ms) and is_map(evidence) ->
+            submit_termination_cleanup_receipt(
+              state,
+              %{
+                execution_token: token,
+                execution_session_id: lease.session_id,
+                issue: %Issue{id: issue_id, identifier: issue_id},
+                terminal_outcome: cleanup_terminal_outcome(state, token)
+              },
+              evidence
+            )
+
+          _ ->
+            :ok
+        end
+      end)
+
+      if execution.cleanup == :cleaned do
+        case {get_in(execution, [:terminal, :accepted_head]), cleanup_terminal_outcome(state, token)} do
+          {head, outcome} when is_binary(head) and head != "" ->
+            submit_repository_cleanup_receipt(state, token, head, outcome)
+
+          _ ->
+            :ok
+        end
+      end
+    end)
+
+    :ok
+  rescue
+    error ->
+      Logger.warning("Persisted cleanup receipt replay failed: #{inspect(error)}")
+      :ok
+  end
+
+  defp replay_persisted_cleanup_receipts(_state), do: :ok
 
   defp defer_startup_workspace_cleanup(%Issue{} = issue) do
     Logger.info("Deferring startup cleanup for terminal issue #{issue_context(issue)} until its persisted execution fence is reconciled")
