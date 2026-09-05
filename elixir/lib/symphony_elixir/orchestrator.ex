@@ -1674,7 +1674,7 @@ defmodule SymphonyElixir.Orchestrator do
     case ExecutionFence.validate_cleanup(state.execution_fence, token, head) do
       :ok ->
         case cleanup_issue_workspace(issue_or_identifier, entry) do
-          cleanup_result when cleanup_result in [:ok] ->
+          :ok ->
             persist_fenced_cleanup(state, token, head, now_ms)
 
           {:ok, _removed} ->

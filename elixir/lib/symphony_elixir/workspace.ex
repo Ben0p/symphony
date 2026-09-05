@@ -500,9 +500,7 @@ defmodule SymphonyElixir.Workspace do
               "before_remove",
               nil
             )
-            
         end
-
       false ->
         :ok
     end
