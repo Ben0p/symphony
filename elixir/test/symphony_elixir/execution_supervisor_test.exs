@@ -129,6 +129,27 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
     assert :ok = ExecutionSupervisor.validate_evidence(identity, evidence)
   end
 
+  test "reconciles an already inactive retained scope after normal completion" do
+    identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
+
+    runner = fn _executable, args, _opts ->
+      case args do
+        ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", "--value", _unit] ->
+          {"loaded\ninactive\n/user.slice/symphony.scope\n0\n", 0}
+
+        ["--user", "show", "--property=ControlGroup", "--value", _unit] ->
+          {"/user.slice/symphony.scope\n", 0}
+      end
+    end
+
+    assert {:ok, evidence} =
+             ExecutionSupervisor.terminate(identity, command_runner: runner, cgroup_reader: fn _ -> {:ok, []} end, now_ms: 200)
+
+    assert evidence.pre_active_state == "inactive"
+    assert evidence.pre_processes == []
+    assert :ok = ExecutionSupervisor.validate_evidence(identity, evidence)
+  end
+
   test "does not treat a failed or deactivating scope as terminated" do
     identity = ExecutionSupervisor.identity("issue-350", 4, "worker-350", "port-350", 100)
 

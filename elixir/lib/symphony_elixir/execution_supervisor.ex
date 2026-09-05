@@ -113,6 +113,9 @@ defmodule SymphonyElixir.ExecutionSupervisor do
         when active_state in ["", "inactive", "unknown"] ->
           absent_unit_evidence(identity, opts)
 
+        {:ok, %{load_state: "loaded", active_state: "inactive"} = unit_state} ->
+          verify_inactive(identity, unit_state, opts)
+
         {:ok, unit_state} ->
           terminate_loaded_unit(identity, unit_state, opts)
 
@@ -151,6 +154,10 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   def validate_evidence(_identity, _evidence), do: {:error, :invalid_termination_evidence}
 
   defp valid_pre_processes?(%{control_group: nil, pre_processes: nil}), do: true
+
+  defp valid_pre_processes?(%{pre_active_state: "inactive", pre_processes: processes})
+       when is_list(processes),
+       do: true
 
   defp valid_pre_processes?(%{pre_processes: processes}) when is_list(processes),
     do: processes != []
@@ -216,6 +223,15 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   defp absent_unit_evidence(identity, opts) do
     with {:ok, now_ms} <- observed_at(opts) do
       {:ok, termination_evidence(identity, "inactive", nil, now_ms, nil)}
+    end
+  end
+
+  defp verify_inactive(identity, unit_state, opts) do
+    with {:ok, control_group} <- control_group(identity.unit, opts),
+         :ok <- empty_control_group?(control_group, opts),
+         {:ok, now_ms} <- observed_at(opts) do
+      pre_state = Map.merge(unit_state, %{control_group: control_group, pre_processes: []})
+      {:ok, termination_evidence(identity, "inactive", control_group, now_ms, pre_state)}
     end
   end
 
