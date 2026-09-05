@@ -410,7 +410,7 @@ defmodule SymphonyElixir.CoreTest do
       workspace_root: test_root,
       poll_interval_ms: 10,
       hook_before_run:
-        "mkfifo #{shell_escape(hook_fifo)}; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
+        "if [ ! -p #{shell_escape(hook_fifo)} ]; then rm -f #{shell_escape(hook_fifo)}; mkfifo #{shell_escape(hook_fifo)}; fi; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
       hook_timeout_ms: 60_000
     )
 
@@ -2244,7 +2244,7 @@ defmodule SymphonyElixir.CoreTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
-      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" app-server")
+      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" --config model=\"gpt-5.6-luna\" --config model_reasoning_effort=high app-server")
       refute String.contains?(argv_line, "--ask-for-approval never")
       refute String.contains?(argv_line, "--sandbox danger-full-access")
     after

@@ -1096,7 +1096,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert Agent.get(guard_state, & &1) >= 3
 
       trace = File.read!(trace_file)
-      lines = String.split(trace, "\\n", trim: true)
+      lines = String.split(trace, "\n", trim: true)
 
       assert Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
