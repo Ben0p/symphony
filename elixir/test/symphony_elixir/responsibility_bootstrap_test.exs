@@ -14,6 +14,8 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
     "DAHLIA_WORK_PACKAGE_ATTESTATION_KEY",
     "DAHLIA_RUNNER_ID",
     "DAHLIA_MANAGED_PROJECT_PROFILE_ID",
+    "DAHLIA_WORK_PACKAGE_JOURNAL_PATH",
+    "DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT",
     "SYMPHONY_GLOBAL_PAUSE_FILE"
   ]
 
@@ -65,16 +67,22 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
     archive_root = Path.join(test_root, "cleanup-archives")
     previous_workflow_path = Workflow.workflow_file_path()
     previous_environment = save_environment(@managed_environment)
+    previous_memory_tracker_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    application_was_started? = application_started?()
 
     on_exit(fn ->
-      unless Enum.any?(Application.started_applications(), fn {app, _description, _version} ->
-               app == :symphony_elixir
-             end) do
-        _ = Application.ensure_all_started(:symphony_elixir)
+      if application_started?() do
+        _ = Application.stop(:symphony_elixir)
       end
 
       Workflow.set_workflow_file_path(previous_workflow_path)
       restore_environment(previous_environment)
+      restore_memory_tracker_issues(previous_memory_tracker_issues)
+
+      if application_was_started? do
+        _ = Application.ensure_all_started(:symphony_elixir)
+      end
+
       File.rm_rf(test_root)
     end)
 
@@ -126,6 +134,17 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
   end
 
   defp save_environment(keys), do: Map.new(keys, &{&1, System.get_env(&1)})
+
+  defp application_started? do
+    Enum.any?(Application.started_applications(), fn {app, _description, _version} ->
+      app == :symphony_elixir
+    end)
+  end
+
+  defp restore_memory_tracker_issues(nil), do: Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+
+  defp restore_memory_tracker_issues(value),
+    do: Application.put_env(:symphony_elixir, :memory_tracker_issues, value)
 
   defp restore_environment(environment) do
     Enum.each(environment, fn
