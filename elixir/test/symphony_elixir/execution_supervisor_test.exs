@@ -51,7 +51,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
       send(parent, {:command, executable, args})
 
       case args do
-        ["--user", "stop", "--wait", _unit] ->
+        ["--user", "stop", _unit] ->
           {"", 0}
 
         ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
@@ -87,7 +87,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
     assert evidence.main_pid == 111
     assert evidence.observed_at_ms == 200
     assert :ok = ExecutionSupervisor.validate_evidence(identity, evidence)
-    assert_received {:command, "systemctl", ["--user", "stop", "--wait", _]}
+    assert_received {:command, "systemctl", ["--user", "stop", _]}
   end
 
   test "captures the active cgroup and process identity before recording a lease" do
@@ -110,12 +110,31 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
     assert captured.main_pid == 111
   end
 
+  test "captures a scope when systemd omits MainPID and uses cgroup membership as proof" do
+    identity = ExecutionSupervisor.identity("issue-350", 4, "worker-no-main-pid", "port-350", 100)
+
+    runner = fn _executable, args, _opts ->
+      assert args == ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", identity.unit]
+      {"LoadState=loaded\nActiveState=active\nControlGroup=/user.slice/symphony.scope\n", 0}
+    end
+
+    assert {:ok, captured} =
+             ExecutionSupervisor.capture(
+               identity,
+               command_runner: runner,
+               cgroup_reader: fn "/user.slice/symphony.scope" -> {:ok, [321, 322]} end
+             )
+
+    assert captured.main_pid == nil
+    assert captured.launch_processes == [321, 322]
+  end
+
   test "leaves termination unconfirmed while the unit remains active" do
     identity = supervisor_identity()
 
     runner = fn _executable, args, _opts ->
       case args do
-        ["--user", "stop", "--wait", _unit] ->
+        ["--user", "stop", _unit] ->
           {"", 0}
 
         ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
@@ -135,7 +154,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
 
     runner = fn _executable, args, _opts ->
       case args do
-        ["--user", "stop", "--wait", _unit] -> {"not-found\n", 5}
+        ["--user", "stop", _unit] -> {"not-found\n", 5}
         ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] -> {"MainPID=0\nControlGroup=\nLoadState=not-found\nActiveState=inactive\n", 0}
       end
     end
@@ -176,7 +195,7 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
     for active_state <- ["failed", "deactivating"] do
       runner = fn _executable, args, _opts ->
         case args do
-          ["--user", "stop", "--wait", _unit] ->
+          ["--user", "stop", _unit] ->
             {"", 0}
 
           ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
@@ -256,6 +275,37 @@ defmodule SymphonyElixir.ExecutionSupervisorTest do
              ExecutionFence.confirm_termination(state, token, "worker-350", evidence, 2)
 
     assert get_in(state, [:executions, "issue-350", :termination_unconfirmed]) == false
+  end
+
+  test "persists a scope identity whose MainPID is unavailable" do
+    path = Path.join(System.tmp_dir!(), "symphony-supervisor-no-main-pid-#{System.unique_integer([:positive])}.json")
+    on_exit(fn -> File.rm(path) end)
+
+    admission = %{issue_id: "issue-no-main-pid", repository: "hypergridau/symphony", branch: "codex/no-main-pid", worktree: "/tmp/no-main-pid"}
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission, 0)
+
+    session =
+      Map.merge(admission, %{
+        generation: 1,
+        role: :worker,
+        session_id: "worker-no-main-pid",
+        process_id: "process-no-main-pid",
+        linear_state: "In Progress",
+        pr_state: "OPEN",
+        head: "abc123",
+        last_heartbeat_at: 0
+      })
+
+    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session, 0)
+
+    identity =
+      ExecutionSupervisor.identity("issue-no-main-pid", 1, "worker-no-main-pid", "process-no-main-pid", 0)
+      |> Map.merge(%{control_group: "/user.slice/symphony.scope", launch_processes: [321, 322], main_pid: nil})
+
+    assert {:ok, state} = ExecutionFence.record_supervisor(state, token, "worker-no-main-pid", identity)
+    assert :ok = Persistence.save(path, state)
+    assert {:ok, restored} = Persistence.load(path)
+    assert get_in(restored, [:executions, "issue-no-main-pid", :leases, "worker-no-main-pid", :supervisor_identity]) == identity
   end
 
   test "contains and terminates a real descendant on admitted Linux workers" do

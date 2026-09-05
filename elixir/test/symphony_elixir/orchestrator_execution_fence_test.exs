@@ -20,7 +20,7 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
         ["--user", "show", "--property=LoadState,ActiveState,ControlGroup,MainPID", _unit] ->
           {"LoadState=loaded\nActiveState=active\nControlGroup=/user.slice/symphony.scope\nMainPID=111\n", 0}
 
-        ["--user", "stop", "--wait", _unit] ->
+        ["--user", "stop", _unit] ->
           {"", 0}
 
         ["--user", "show", "--property=ActiveState", _unit] ->

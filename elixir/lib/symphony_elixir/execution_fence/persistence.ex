@@ -373,7 +373,7 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
 
       is_binary(control_group) and control_group != "" and
         is_list(launch_processes) and Enum.all?(launch_processes, &(is_integer(&1) and &1 > 0)) and
-        is_integer(main_pid) and main_pid >= 0 ->
+          (is_nil(main_pid) or (is_integer(main_pid) and main_pid >= 0)) ->
         {:ok,
          identity
          |> Map.put(:control_group, control_group)
@@ -468,7 +468,9 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
       "phase" => Atom.to_string(receipt.phase),
       "expected_head" => receipt.expected_head,
       "prepared_at_ms" => receipt.prepared_at_ms,
-      "verified_at_ms" => Map.get(receipt, :verified_at_ms)
+      "verified_at_ms" => Map.get(receipt, :verified_at_ms),
+      "evidence_ref" => Map.get(receipt, :evidence_ref),
+      "evidence_recorded_at_ms" => Map.get(receipt, :evidence_recorded_at_ms)
     }
 
     if Map.has_key?(receipt, :terminal_outcome) do
@@ -490,7 +492,11 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
         prepared_at_ms: prepared_at_ms
       }
 
-      receipt = maybe_put_decoded(receipt, :verified_at_ms, Map.get(payload, "verified_at_ms"))
+      receipt =
+        receipt
+        |> maybe_put_decoded(:verified_at_ms, Map.get(payload, "verified_at_ms"))
+        |> maybe_put_decoded(:evidence_ref, Map.get(payload, "evidence_ref"))
+        |> maybe_put_decoded(:evidence_recorded_at_ms, Map.get(payload, "evidence_recorded_at_ms"))
 
       case Map.get(payload, "terminal_outcome") do
         nil ->

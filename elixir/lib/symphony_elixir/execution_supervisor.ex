@@ -17,6 +17,9 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   @max_unit_bytes 180
 
   @type identity :: %{
+          optional(:control_group) => String.t(),
+          optional(:launch_processes) => [pos_integer()],
+          optional(:main_pid) => pos_integer() | nil,
           supervisor: :systemd_user,
           unit: String.t(),
           session_id: String.t(),
@@ -127,24 +130,19 @@ defmodule SymphonyElixir.ExecutionSupervisor do
 
   @doc "Captures the live systemd cgroup identity immediately after launch."
   @spec capture(identity(), keyword()) :: {:ok, identity()} | {:error, term()}
-  def capture(identity, opts \\ [])
-
-  def capture(identity, opts) when is_map(identity) and is_list(opts) do
+  def capture(identity, opts \\ []) when is_map(identity) and is_list(opts) do
     with :ok <- validate_identity(identity),
          {:ok, unit_state} <- show_unit(identity.unit, opts),
          :ok <- active_unit_for_capture(unit_state),
          {:ok, control_group} <- required_control_group(unit_state.control_group),
-         {:ok, processes} <- non_empty_control_group(control_group, opts),
-         {:ok, main_pid} <- required_main_pid(unit_state.main_pid) do
+         {:ok, processes} <- non_empty_control_group(control_group, opts) do
       {:ok,
        identity
        |> Map.put(:control_group, control_group)
        |> Map.put(:launch_processes, processes)
-       |> Map.put(:main_pid, main_pid)}
+       |> Map.put(:main_pid, unit_state.main_pid)}
     end
   end
-
-  def capture(_identity, _opts), do: {:error, :invalid_supervisor_identity}
 
   @doc "Validates the identity persisted with an execution generation."
   @spec validate(identity()) :: :ok | {:error, term()}
@@ -218,7 +216,7 @@ defmodule SymphonyElixir.ExecutionSupervisor do
   defp terminate_loaded_unit(identity, unit_state, opts) do
     with :ok <- active_unit_for_stop(unit_state),
          {:ok, pre_processes} <- non_empty_control_group(unit_state.control_group, opts) do
-      case systemctl(command_runner(opts), ["--user", "stop", "--wait", identity.unit], opts) do
+      case systemctl(command_runner(opts), ["--user", "stop", identity.unit], opts) do
         {:ok, _output} ->
           verify_stopped(identity, unit_state, pre_processes, opts)
 
@@ -300,13 +298,13 @@ defmodule SymphonyElixir.ExecutionSupervisor do
         end
       end)
 
-    if Enum.all?(["LoadState", "ActiveState", "ControlGroup", "MainPID"], &Map.has_key?(properties, &1)) do
+    if Enum.all?(["LoadState", "ActiveState", "ControlGroup"], &Map.has_key?(properties, &1)) do
       {:ok,
        %{
          load_state: String.trim(properties["LoadState"]),
          active_state: String.trim(properties["ActiveState"]),
          control_group: blank_to_nil(properties["ControlGroup"]),
-         main_pid: parse_pid(properties["MainPID"])
+         main_pid: parse_pid(Map.get(properties, "MainPID", ""))
        }}
     else
       {:error, :systemd_unit_state_missing}
@@ -341,9 +339,6 @@ defmodule SymphonyElixir.ExecutionSupervisor do
     do: {:ok, control_group}
 
   defp required_control_group(_control_group), do: {:error, :supervisor_cgroup_missing}
-
-  defp required_main_pid(main_pid) when is_integer(main_pid) and main_pid > 0, do: {:ok, main_pid}
-  defp required_main_pid(_main_pid), do: {:error, :supervisor_main_pid_missing}
 
   defp non_empty_control_group(nil, _opts), do: {:error, :supervisor_cgroup_missing}
 
