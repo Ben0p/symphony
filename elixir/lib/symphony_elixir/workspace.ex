@@ -654,7 +654,10 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp validate_remote_absolute_path(path) do
-    if String.starts_with?(path, ["/", "~/", "\\"]) or Regex.match?(~r/\A[A-Za-z]:\//, path) do
+    normalized = String.replace(path, "\\", "/")
+
+    if String.starts_with?(normalized, ["/", "~/"]) or
+         Regex.match?(~r/\A[A-Za-z]:\//, normalized) do
       :ok
     else
       {:error, {:workspace_path_unreadable, path, :not_absolute}}
