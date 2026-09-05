@@ -23,10 +23,27 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
           process_id: String.t(),
           responsible_delegation_id: String.t(),
           execution_fence_token: String.t(),
-          runtime_lease_id: String.t()
+          runtime_lease_id: String.t(),
+          cleanup_receipts: %{optional(String.t()) => map()}
         }
 
   @type state :: %{schema_version: 1, reservations: %{optional(String.t()) => reservation()}}
+
+  @doc "Returns the legacy reservation key, retained for generation one replay."
+  @spec reservation_key(String.t(), String.t(), String.t()) :: String.t()
+  def reservation_key(issue_id, profile_id, repository_ref)
+      when is_binary(issue_id) and is_binary(profile_id) and is_binary(repository_ref) do
+    Enum.join([issue_id, profile_id, repository_ref], "\u0000")
+  end
+
+  @doc "Returns a generation-scoped key for a later claim after reconciliation."
+  @spec reservation_key(String.t(), String.t(), String.t(), pos_integer()) :: String.t()
+  def reservation_key(issue_id, profile_id, repository_ref, generation)
+      when is_binary(issue_id) and is_binary(profile_id) and is_binary(repository_ref) and
+             is_integer(generation) and generation > 0 do
+    key = reservation_key(issue_id, profile_id, repository_ref)
+    if generation == 1, do: key, else: key <> "\u0000" <> Integer.to_string(generation)
+  end
 
   @spec load(Path.t()) :: {:ok, state()} | :missing | {:error, term()}
   def load(path) when is_binary(path) do
@@ -42,6 +59,46 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
       when is_binary(key) and is_map(reservation) do
     {:ok, %{state | reservations: Map.put(reservations, key, reservation)}}
   end
+
+  @doc "Stores one immutable cleanup receipt semantic under its reservation journal entry."
+  @spec put_cleanup_receipt(state(), String.t(), String.t(), map()) ::
+          {:ok, state()} | {:error, term()}
+  def put_cleanup_receipt(
+        %{schema_version: @schema_version, reservations: reservations} = state,
+        key,
+        receipt_kind,
+        receipt
+      )
+      when is_binary(key) and is_binary(receipt_kind) and is_map(receipt) do
+    case Map.get(reservations, key) do
+      %{cleanup_receipts: receipts} = reservation when is_map(receipts) ->
+        put_cleanup_receipt_entry(state, key, reservation, receipts, receipt_kind, receipt)
+
+      reservation when is_map(reservation) ->
+        put_cleanup_receipt_entry(state, key, reservation, %{}, receipt_kind, receipt)
+
+      nil ->
+        {:error, :reservation_missing}
+    end
+  end
+
+  def put_cleanup_receipt(_state, _key, _receipt_kind, _receipt),
+    do: {:error, :invalid_cleanup_receipt}
+
+  @spec cleanup_receipt(state(), String.t(), String.t()) :: {:ok, map()} | :missing
+  def cleanup_receipt(
+        %{schema_version: @schema_version, reservations: reservations},
+        key,
+        receipt_kind
+      )
+      when is_binary(key) and is_binary(receipt_kind) do
+    case get_in(reservations, [key, :cleanup_receipts, receipt_kind]) do
+      receipt when is_map(receipt) -> {:ok, receipt}
+      _ -> :missing
+    end
+  end
+
+  def cleanup_receipt(_state, _key, _receipt_kind), do: :missing
 
   @spec new() :: state()
   def new, do: %{schema_version: @schema_version, reservations: %{}}
@@ -135,8 +192,9 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
              &present_string?(Map.get(values, &1))
            ),
          true <- is_integer(values.generation) and values.generation > 0,
-         true <- is_list(values.scope_keys) and values.scope_keys != [] and Enum.all?(values.scope_keys, &present_string?/1) do
-      {:ok, values}
+         true <- is_list(values.scope_keys) and values.scope_keys != [] and Enum.all?(values.scope_keys, &present_string?/1),
+         {:ok, cleanup_receipts} <- decode_cleanup_receipts(Map.get(payload, "cleanup_receipts")) do
+      {:ok, maybe_put_decoded(values, :cleanup_receipts, cleanup_receipts)}
     else
       false -> {:error, :invalid_reservation}
       error -> error
@@ -144,6 +202,62 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
   end
 
   defp decode_reservation(_payload), do: {:error, :invalid_reservation}
+
+  defp decode_cleanup_receipts(nil), do: {:ok, nil}
+
+  defp decode_cleanup_receipts(receipts) when is_map(receipts) do
+    Enum.reduce_while(receipts, {:ok, %{}}, fn
+      {kind, receipt}, {:ok, acc}
+      when kind in ["termination_confirmed", "repository_cleanup_verified"] and is_map(receipt) ->
+        case decode_cleanup_receipt(receipt) do
+          {:ok, decoded} -> {:cont, {:ok, Map.put(acc, kind, decoded)}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+
+      _entry, _acc ->
+        {:halt, {:error, :invalid_cleanup_receipts}}
+    end)
+  end
+
+  defp decode_cleanup_receipts(_receipts), do: {:error, :invalid_cleanup_receipts}
+
+  defp decode_cleanup_receipt(receipt) when is_map(receipt) do
+    keys = [
+      :contract_version,
+      :receipt_id,
+      :receipt_kind,
+      :terminal_outcome,
+      :observed_at,
+      :evidence_ref,
+      :accepted_head,
+      :runner_id,
+      :managed_project_profile_id,
+      :reservation_id,
+      :reservation_nonce,
+      :issue_id,
+      :generation,
+      :session_id,
+      :process_id,
+      :responsible_delegation_id,
+      :execution_fence_token,
+      :runtime_lease_id,
+      :repository_ref,
+      :scope_keys,
+      :attested_at,
+      :signature
+    ]
+
+    if Enum.all?(receipt, fn {key, _value} -> key in Enum.map(keys, &Atom.to_string/1) end) do
+      {:ok,
+       Map.new(receipt, fn {key, value} ->
+         {String.to_existing_atom(key), value}
+       end)}
+    else
+      {:error, :invalid_cleanup_receipt}
+    end
+  end
+
+  defp decode_cleanup_receipt(_receipt), do: {:error, :invalid_cleanup_receipt}
 
   defp required_fields(payload, fields) do
     Enum.reduce_while(fields, {:ok, %{}}, fn {key, json_key}, {:ok, acc} ->
@@ -153,6 +267,9 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
       end
     end)
   end
+
+  defp maybe_put_decoded(map, _key, nil), do: map
+  defp maybe_put_decoded(map, key, value), do: Map.put(map, key, value)
 
   defp valid_reservation?(reservation) when is_map(reservation) do
     string_fields = [
@@ -173,10 +290,36 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
     Enum.all?(string_fields, &present_string?(Map.get(reservation, &1))) and
       is_integer(reservation[:generation]) and reservation[:generation] > 0 and
       is_list(reservation[:scope_keys]) and reservation[:scope_keys] != [] and
-      Enum.all?(reservation[:scope_keys], &present_string?/1)
+      Enum.all?(reservation[:scope_keys], &present_string?/1) and
+      valid_cleanup_receipts?(Map.get(reservation, :cleanup_receipts, %{}))
   end
 
   defp valid_reservation?(_reservation), do: false
+
+  defp valid_cleanup_receipts?(receipts) when is_map(receipts) do
+    Enum.all?(receipts, fn {kind, receipt} ->
+      is_binary(kind) and kind in ["termination_confirmed", "repository_cleanup_verified"] and
+        is_map(receipt)
+    end)
+  end
+
+  defp valid_cleanup_receipts?(_receipts), do: false
+
+  defp put_cleanup_receipt_entry(state, key, reservation, receipts, receipt_kind, receipt) do
+    case Map.get(receipts, receipt_kind) do
+      nil ->
+        next_reservation =
+          Map.put(reservation, :cleanup_receipts, Map.put(receipts, receipt_kind, receipt))
+
+        {:ok, %{state | reservations: Map.put(state.reservations, key, next_reservation)}}
+
+      ^receipt ->
+        {:ok, state}
+
+      _other ->
+        {:error, :cleanup_receipt_conflict}
+    end
+  end
 
   defp recover_missing(path) do
     candidates = recovery_candidates(path)

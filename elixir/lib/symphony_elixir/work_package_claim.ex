@@ -205,10 +205,13 @@ defmodule SymphonyElixir.WorkPackageClaim do
 
   defp ensure_reservation(authority, journal, request_fun) do
     key = journal_key(authority)
+    legacy_key = Journal.reservation_key(authority.issue_id, authority.managed_project_profile_id, authority.repository_ref)
 
     case Map.get(journal.reservations, key) do
       nil ->
-        with {:ok, reservation} <- request_reservation(authority, request_fun),
+        existing_legacy = if(key == legacy_key, do: nil, else: Map.get(journal.reservations, legacy_key))
+
+        with {:ok, reservation} <- request_reservation_or_replay(authority, existing_legacy, request_fun),
              reservation =
                Map.merge(
                  reservation,
@@ -233,6 +236,14 @@ defmodule SymphonyElixir.WorkPackageClaim do
         end
     end
   end
+
+  defp request_reservation_or_replay(authority, %{generation: generation} = reservation, _request_fun)
+       when generation == authority.generation do
+    {:ok, reservation}
+  end
+
+  defp request_reservation_or_replay(authority, _legacy_reservation, request_fun),
+    do: request_reservation(authority, request_fun)
 
   defp request_reservation(authority, request_fun) do
     url = authority.base_url <> "/runner/v1/work-packages/reservations/by-issue"
@@ -438,7 +449,12 @@ defmodule SymphonyElixir.WorkPackageClaim do
   end
 
   defp journal_key(authority) do
-    Enum.join([authority.issue_id, authority.managed_project_profile_id, authority.repository_ref], "\u0000")
+    Journal.reservation_key(
+      authority.issue_id,
+      authority.managed_project_profile_id,
+      authority.repository_ref,
+      authority.generation
+    )
   end
 
   defp validate_base_url(url) do
