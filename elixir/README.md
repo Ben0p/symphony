@@ -147,6 +147,17 @@ seconds; `DAHLIA_RUNNER_OBSERVATION_STATE_PATH` can override the local sequence 
 observation contains only the versioned contract fields and the reporter persists its sequence
 before sending, so the provider can reject replayed or out-of-order observations.
 
+### Work-package runtime claim
+
+`SymphonyElixir.WorkPackageClaim` is a bounded operator adapter for the provider's v1 runner
+reservation contract. It requires a validated current execution-fence generation and its active
+responsible runtime lease, plus an active responsible delegation for the exact issue and repository.
+The reservation nonce and authority tuple are written to a private atomic journal before claim; a
+lost response or restart therefore reuses the same reservation and generation. The adapter is
+intentionally separate from worker dispatch (the scheduler integration is a later slice). Runner
+tokens and attestation keys are supplied by the host and are never logged or placed in workflow
+files.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 

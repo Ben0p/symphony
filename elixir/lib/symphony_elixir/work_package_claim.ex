@@ -1,0 +1,446 @@
+defmodule SymphonyElixir.WorkPackageClaim do
+  @moduledoc """
+  Claims one provider work-package reservation using persisted Symphony authority.
+
+  The adapter is intentionally separate from worker dispatch. It binds every
+  request to the current execution-fence generation, runtime lease, and active
+  responsible delegation, and journals a reservation before attempting claim.
+  """
+
+  alias SymphonyElixir.ExecutionFence
+  alias SymphonyElixir.ResponsibilityGraph
+  alias SymphonyElixir.WorkPackageClaim.Journal
+
+  @request_timeout_ms 5_000
+  @contract_version "work-package-runtime-attestation.v1"
+
+  @type input :: %{
+          base_url: String.t(),
+          runner_token: String.t(),
+          attestation_key: String.t(),
+          runner_id: String.t(),
+          managed_project_profile_id: String.t(),
+          issue_id: String.t(),
+          issue_identifier: String.t() | nil,
+          repository_ref: String.t(),
+          fence_state: ExecutionFence.state(),
+          responsibility_graph: ResponsibilityGraph.state(),
+          journal_path: Path.t()
+        }
+
+  @type request_fun :: (String.t(), keyword() -> {:ok, Req.Response.t()} | {:error, term()})
+
+  @spec claim(input(), keyword()) :: {:ok, map()} | {:error, term()}
+  def claim(input, opts \\ []) when is_map(input) and is_list(opts) do
+    request_fun = Keyword.get(opts, :request_fun, &Req.post/2)
+    now_fun = Keyword.get(opts, :now_fun, &DateTime.utc_now/0)
+
+    with %DateTime{} = now <- now_fun.(),
+         {:ok, authority} <- authority(input, DateTime.to_unix(now, :millisecond)),
+         {:ok, journal} <- load_journal(input.journal_path),
+         {:ok, reservation, journal} <- ensure_reservation(authority, journal, request_fun),
+         :ok <- Journal.save(input.journal_path, journal),
+         {:ok, attestation} <- attestation(authority, reservation, now),
+         {:ok, response} <- request_claim(authority, reservation, attestation, request_fun),
+         {:ok, body} <- response_data(response),
+         {:ok, result} <- validate_claim_result(body, authority, reservation) do
+      {:ok, %{reservation: reservation, attestation: attestation, response: result}}
+    end
+  end
+
+  @doc "Builds the provider HMAC canonical JSON in wire-field order."
+  @spec canonical_json(map()) :: {:ok, String.t()} | {:error, term()}
+  def canonical_json(attestation) when is_map(attestation) do
+    fields = [
+      {"contractVersion", Map.get(attestation, :contract_version)},
+      {"runnerId", Map.get(attestation, :runner_id)},
+      {"managedProjectProfileId", Map.get(attestation, :managed_project_profile_id)},
+      {"reservationId", Map.get(attestation, :reservation_id)},
+      {"reservationNonce", Map.get(attestation, :reservation_nonce)},
+      {"issueId", Map.get(attestation, :issue_id)},
+      {"generation", Map.get(attestation, :generation)},
+      {"sessionId", Map.get(attestation, :session_id)},
+      {"processId", Map.get(attestation, :process_id)},
+      {"responsibleDelegationId", Map.get(attestation, :responsible_delegation_id)},
+      {"executionFenceToken", Map.get(attestation, :execution_fence_token)},
+      {"runtimeLeaseId", Map.get(attestation, :runtime_lease_id)},
+      {"repositoryRef", Map.get(attestation, :repository_ref)},
+      {"scopeKeys", Enum.sort(Map.get(attestation, :scope_keys, []))},
+      {"attestedAt", Map.get(attestation, :attested_at)}
+    ]
+
+    if Enum.all?(fields, fn {_key, value} -> not is_nil(value) end) and
+         is_integer(Map.get(attestation, :generation)) and Map.get(attestation, :generation) > 0 and
+         is_list(Map.get(attestation, :scope_keys)) do
+      encoded =
+        fields
+        |> Enum.map(fn {key, value} -> [Jason.encode!(key), ":", Jason.encode!(value)] end)
+        |> Enum.intersperse(",")
+        |> then(&["{", &1, "}"])
+        |> IO.iodata_to_binary()
+
+      {:ok, encoded}
+    else
+      {:error, :invalid_attestation}
+    end
+  end
+
+  @spec sign(map(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def sign(attestation, key) when is_map(attestation) and is_binary(key) do
+    with true <- String.trim(key) != "",
+         {:ok, canonical} <- canonical_json(attestation) do
+      {:ok, :crypto.mac(:hmac, :sha256, key, canonical) |> Base.url_encode64(padding: false)}
+    else
+      false -> {:error, :missing_attestation_key}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp authority(input, now_ms) do
+    required = [
+      :base_url,
+      :runner_token,
+      :attestation_key,
+      :runner_id,
+      :managed_project_profile_id,
+      :issue_id,
+      :repository_ref,
+      :journal_path
+    ]
+
+    if Enum.all?(required, &present_string?(Map.get(input, &1))) and
+         is_map(Map.get(input, :fence_state)) and is_map(Map.get(input, :responsibility_graph)) do
+      with {:ok, base_url} <- validate_base_url(input.base_url),
+           :ok <- ExecutionFence.validate(input.fence_state),
+           :ok <- ResponsibilityGraph.validate(input.responsibility_graph),
+           {:ok, execution} <- current_execution(input.fence_state, input.issue_id),
+           {:ok, lease} <- active_worker_lease(execution),
+           {:ok, delegation} <-
+             ResponsibilityGraph.admission_delegation(
+               input.responsibility_graph,
+               input.issue_id,
+               input[:issue_identifier],
+               input.repository_ref
+             ),
+           :ok <- valid_delegation_lease(delegation, lease, input.repository_ref, now_ms),
+           :ok <- if(execution.repository == input.repository_ref, do: :ok, else: {:error, :repository_mismatch}) do
+        generation = execution.generation
+        session_id = lease.session_id
+
+        {:ok,
+         %{
+           base_url: String.trim_trailing(base_url, "/"),
+           runner_token: input.runner_token,
+           attestation_key: input.attestation_key,
+           runner_id: input.runner_id,
+           managed_project_profile_id: input.managed_project_profile_id,
+           issue_id: input.issue_id,
+           repository_ref: input.repository_ref,
+           generation: generation,
+           session_id: session_id,
+           process_id: lease.process_id,
+           responsible_delegation_id: delegation.id,
+           execution_fence_token: "#{input.issue_id}:#{generation}",
+           runtime_lease_id: session_id,
+           journal_path: input.journal_path
+         }}
+      end
+    else
+      {:error, :invalid_claim_input}
+    end
+  end
+
+  defp current_execution(%{executions: executions}, issue_id) do
+    case Map.get(executions, issue_id) do
+      %{status: :active, ownership: :reconciled} = execution -> {:ok, execution}
+      %{status: :active} -> {:error, :execution_not_reconciled}
+      nil -> {:error, :execution_missing}
+      _ -> {:error, :execution_not_active}
+    end
+  end
+
+  defp current_execution(_state, _issue_id), do: {:error, :execution_missing}
+
+  defp active_worker_lease(%{leases: leases, generation: generation}) do
+    active_leases =
+      leases
+      |> Map.values()
+      |> Enum.filter(&(&1.role == :worker and &1.status == :active and &1.generation == generation))
+
+    case active_leases do
+      [lease] -> {:ok, lease}
+      [] -> {:error, :runtime_lease_missing}
+      _ -> {:error, :runtime_lease_ambiguous}
+    end
+  end
+
+  defp valid_delegation_lease(%{id: id, runtime_lease: runtime_lease} = delegation, lease, repository_ref, now_ms)
+       when is_binary(id) do
+    if is_map(runtime_lease) and
+         Map.take(runtime_lease, [:issue_id, :repository, :generation, :session_id, :process_id]) ==
+           Map.take(lease, [:issue_id, :repository, :generation, :session_id, :process_id]) and
+         runtime_lease.repository == repository_ref and
+         is_integer(delegation[:expires_at_ms]) and delegation.expires_at_ms > now_ms do
+      :ok
+    else
+      {:error, :runtime_lease_mismatch}
+    end
+  end
+
+  defp valid_delegation_lease(_delegation, _lease, _repository_ref, _now_ms), do: {:error, :runtime_lease_missing}
+
+  defp load_journal(path) do
+    case Journal.load(path) do
+      :missing -> {:ok, Journal.new()}
+      {:ok, state} -> {:ok, state}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_reservation(authority, journal, request_fun) do
+    key = journal_key(authority)
+
+    case Map.get(journal.reservations, key) do
+      nil ->
+        with {:ok, reservation} <- request_reservation(authority, request_fun),
+             reservation =
+               Map.merge(
+                 reservation,
+                 Map.take(authority, [
+                   :runner_id,
+                   :generation,
+                   :session_id,
+                   :process_id,
+                   :responsible_delegation_id,
+                   :execution_fence_token,
+                   :runtime_lease_id
+                 ])
+               ),
+             :ok <- reservation_matches_authority(reservation, authority),
+             {:ok, next_journal} <- Journal.put(journal, key, reservation) do
+          {:ok, reservation, next_journal}
+        end
+
+      reservation ->
+        with :ok <- reservation_matches_authority(reservation, authority) do
+          {:ok, reservation, journal}
+        end
+    end
+  end
+
+  defp request_reservation(authority, request_fun) do
+    url = authority.base_url <> "/runner/v1/work-packages/reservations/by-issue"
+
+    payload = %{
+      issueId: authority.issue_id,
+      managedProjectProfileId: authority.managed_project_profile_id,
+      repositoryRef: authority.repository_ref
+    }
+
+    with {:ok, response} <- request(request_fun, url, authority.runner_token, payload),
+         {:ok, data} <- response_data(response),
+         do: parse_reservation(data, authority)
+  end
+
+  defp parse_reservation(data, authority) when is_map(data) do
+    with {:ok, projection_id} <- response_string(data, "projectionId"),
+         {:ok, reservation_id} <- response_string(data, "reservationId"),
+         {:ok, nonce} <- response_string(data, "reservationNonce"),
+         {:ok, issue_id} <- response_string(data, "issueId"),
+         {:ok, profile_id} <- response_string(data, "managedProjectProfileId"),
+         {:ok, repository_ref} <- response_string(data, "repositoryRef"),
+         {:ok, scope_keys} <- response_scope_keys(data, "scopeKeys"),
+         true <-
+           issue_id == authority.issue_id and profile_id == authority.managed_project_profile_id and
+             repository_ref == authority.repository_ref do
+      {:ok,
+       %{
+         issue_id: issue_id,
+         managed_project_profile_id: authority.managed_project_profile_id,
+         repository_ref: repository_ref,
+         projection_id: projection_id,
+         reservation_id: reservation_id,
+         reservation_nonce: nonce,
+         scope_keys: scope_keys
+       }}
+    else
+      false -> {:error, :reservation_scope_mismatch}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp parse_reservation(_data, _authority), do: {:error, :invalid_reservation_response}
+
+  defp reservation_matches_authority(reservation, authority) do
+    expected =
+      Map.take(authority, [
+        :issue_id,
+        :managed_project_profile_id,
+        :repository_ref,
+        :runner_id,
+        :generation,
+        :session_id,
+        :process_id,
+        :responsible_delegation_id,
+        :execution_fence_token,
+        :runtime_lease_id
+      ])
+
+    actual = Map.take(reservation, Map.keys(expected))
+
+    if actual == expected and present_string?(reservation.reservation_nonce) and
+         is_list(reservation.scope_keys),
+       do: :ok,
+       else: {:error, :reservation_authority_mismatch}
+  end
+
+  defp attestation(authority, reservation, now) do
+    with %DateTime{} <- now,
+         unsigned = %{
+           contract_version: @contract_version,
+           runner_id: authority.runner_id,
+           managed_project_profile_id: authority.managed_project_profile_id,
+           reservation_id: reservation.reservation_id,
+           reservation_nonce: reservation.reservation_nonce,
+           issue_id: authority.issue_id,
+           generation: authority.generation,
+           session_id: authority.session_id,
+           process_id: authority.process_id,
+           responsible_delegation_id: authority.responsible_delegation_id,
+           execution_fence_token: authority.execution_fence_token,
+           runtime_lease_id: authority.runtime_lease_id,
+           repository_ref: authority.repository_ref,
+           scope_keys: reservation.scope_keys,
+           attested_at: DateTime.to_iso8601(DateTime.truncate(now, :millisecond))
+         },
+         {:ok, signature} <- sign(unsigned, authority.attestation_key) do
+      {:ok, Map.put(unsigned, :signature, signature)}
+    else
+      _ -> {:error, :invalid_clock}
+    end
+  end
+
+  defp request_claim(authority, reservation, attestation, request_fun) do
+    url = authority.base_url <> "/runner/v1/work-packages/" <> reservation.projection_id <> "/claim"
+    request(request_fun, url, authority.runner_token, %{attestation: wire_attestation(attestation)})
+  end
+
+  defp wire_attestation(attestation) do
+    Map.new(attestation, fn {key, value} ->
+      {camel_case(key), value}
+    end)
+  end
+
+  defp camel_case(:contract_version), do: "contractVersion"
+  defp camel_case(:runner_id), do: "runnerId"
+  defp camel_case(:managed_project_profile_id), do: "managedProjectProfileId"
+  defp camel_case(:reservation_id), do: "reservationId"
+  defp camel_case(:reservation_nonce), do: "reservationNonce"
+  defp camel_case(:issue_id), do: "issueId"
+  defp camel_case(:generation), do: "generation"
+  defp camel_case(:session_id), do: "sessionId"
+  defp camel_case(:process_id), do: "processId"
+  defp camel_case(:responsible_delegation_id), do: "responsibleDelegationId"
+  defp camel_case(:execution_fence_token), do: "executionFenceToken"
+  defp camel_case(:runtime_lease_id), do: "runtimeLeaseId"
+  defp camel_case(:repository_ref), do: "repositoryRef"
+  defp camel_case(:scope_keys), do: "scopeKeys"
+  defp camel_case(:attested_at), do: "attestedAt"
+  defp camel_case(:signature), do: "signature"
+
+  defp request(request_fun, url, token, payload) do
+    options = [
+      headers: [{"authorization", "Bearer #{token}"}, {"content-type", "application/json"}],
+      json: payload,
+      connect_options: [timeout: @request_timeout_ms],
+      receive_timeout: @request_timeout_ms,
+      retry: false
+    ]
+
+    case request_fun.(url, options) do
+      {:ok, %Req.Response{status: status} = response} when status in 200..299 -> {:ok, response}
+      {:ok, %Req.Response{status: status}} -> {:error, {:provider_status, status}}
+      {:error, reason} -> {:error, {:provider_request, reason}}
+      _ -> {:error, :invalid_provider_response}
+    end
+  rescue
+    _error -> {:error, :provider_request_failed}
+  end
+
+  defp response_data(%Req.Response{body: %{"data" => data}}) when is_map(data), do: {:ok, data}
+  defp response_data(%Req.Response{body: body}) when is_map(body), do: {:ok, body}
+
+  defp response_data(%Req.Response{body: body}) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, %{"data" => data}} when is_map(data) -> {:ok, data}
+      {:ok, data} when is_map(data) -> {:ok, data}
+      _ -> {:error, :invalid_provider_payload}
+    end
+  end
+
+  defp response_data(_response), do: {:error, :invalid_provider_payload}
+
+  defp validate_claim_result(
+         %{
+           "projectionId" => projection_id,
+           "projectionState" => "active",
+           "mutationState" => "applied",
+           "claimEvidence" => evidence
+         },
+         authority,
+         reservation
+       )
+       when is_map(evidence) do
+    expected = %{
+      "responsibleDelegationId" => authority.responsible_delegation_id,
+      "executionFenceToken" => authority.execution_fence_token,
+      "runtimeLeaseId" => authority.runtime_lease_id
+    }
+
+    if projection_id == reservation.projection_id and Map.take(evidence, Map.keys(expected)) == expected do
+      {:ok,
+       %{
+         projection_id: projection_id,
+         projection_state: "active",
+         mutation_state: "applied",
+         claim_evidence: expected
+       }}
+    else
+      {:error, :claim_result_mismatch}
+    end
+  end
+
+  defp validate_claim_result(_body, _authority, _reservation), do: {:error, :invalid_claim_result}
+
+  defp response_string(data, key) do
+    case Map.get(data, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, {:missing_reservation_field, key}}
+    end
+  end
+
+  defp response_scope_keys(data, key) do
+    case Map.get(data, key) do
+      values when is_list(values) and values != [] ->
+        if Enum.all?(values, &present_string?/1),
+          do: {:ok, Enum.uniq(values) |> Enum.sort()},
+          else: {:error, :invalid_scope_keys}
+
+      _ ->
+        {:error, :invalid_scope_keys}
+    end
+  end
+
+  defp journal_key(authority) do
+    Enum.join([authority.issue_id, authority.managed_project_profile_id, authority.repository_ref], "\u0000")
+  end
+
+  defp validate_base_url(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) and host != "" -> {:ok, url}
+      _ -> {:error, :invalid_base_url}
+    end
+  end
+
+  defp present_string?(value), do: is_binary(value) and String.trim(value) != ""
+end
