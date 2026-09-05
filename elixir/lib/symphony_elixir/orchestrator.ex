@@ -190,6 +190,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:startup_maintenance_timeout, _ref}, state), do: {:noreply, state}
 
+  def handle_info({:startup_cleanup_fence_updated, fence_state}, state) do
+    case ExecutionFence.validate(fence_state) do
+      :ok ->
+        notify_dashboard()
+        {:noreply, %{state | execution_fence: fence_state}}
+
+      {:error, reason} ->
+        Logger.error("Ignoring invalid startup cleanup fence update: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
   def handle_info({ref, {:ok, result}}, %{startup_maintenance: %{task_ref: ref}} = state)
       when is_reference(ref) do
     Process.demonitor(ref, [:flush])
@@ -1342,8 +1354,8 @@ defmodule SymphonyElixir.Orchestrator do
                execution_fence_guard: fn ->
                  GenServer.call(
                    recipient,
-                    {:execution_authorize, token, responsibility_delegation_id, :state_mutation},
-                    @execution_authorization_timeout_ms
+                   {:execution_authorize, token, responsibility_delegation_id, :state_mutation},
+                   @execution_authorization_timeout_ms
                  )
                end
              )
@@ -1470,12 +1482,19 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp execution_attributes(%Issue{id: issue_id, identifier: identifier, branch_name: branch_name}, _worker_host) do
-    workspace = Path.join(Config.settings!().workspace.root, Workspace.workspace_key(identifier || issue_id))
+  defp execution_attributes(%Issue{id: issue_id, identifier: identifier, branch_name: branch_name}, worker_host) do
+    workspace_root =
+      case worker_host do
+        nil -> Config.local_workspace_root()
+        _ -> Config.settings!().workspace.root
+      end
+
+    workspace = Path.join(workspace_root, Workspace.workspace_key(identifier || issue_id))
 
     %{
       issue_id: issue_id,
       repository: repository_identity(),
+      worker_host: worker_host,
       branch: branch_name || "codex/#{Workspace.workspace_key(identifier || issue_id)}",
       worktree: workspace
     }
@@ -1576,8 +1595,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp release_responsibility_lease(state, _running_entry), do: state
 
-  defp normalize_release_reason(reason) when is_atom(reason), do: reason
-  defp normalize_release_reason(_reason), do: :worker_exit
+  defp normalize_release_reason(reason) when reason in [:spawn_failed, :global_pause], do: reason
+  defp normalize_release_reason(_reason), do: :orchestrator_stop
 
   defp maybe_fence_terminal_execution(state, _running_entry, false), do: state
 
@@ -1640,16 +1659,34 @@ defmodule SymphonyElixir.Orchestrator do
       head when is_binary(head) and head != "" and head != "unobserved" ->
         case execution_workspace_path(state.execution_fence, token, entry) do
           {:ok, workspace_path} ->
-            case Workspace.current_head(workspace_path, Map.get(entry, :worker_host)) do
-              {:ok, ^head} ->
-                cleanup_fenced_execution(state, issue_or_identifier, Map.put(entry, :workspace_path, workspace_path), token, head)
+            case cleanup_receipt_status(state.execution_fence, token, head) do
+              :removal_started ->
+                case Workspace.path_exists?(workspace_path, Map.get(entry, :worker_host)) do
+                  {:ok, false} ->
+                    persist_fenced_cleanup(state, token, head, execution_fence_now_ms())
 
-              {:ok, observed_head} ->
-                record_head_divergence(state, token, head, observed_head)
+                  {:ok, true} ->
+                    verify_and_cleanup_fenced_workspace(
+                      state,
+                      issue_or_identifier,
+                      Map.put(entry, :workspace_path, workspace_path),
+                      token,
+                      head
+                    )
 
-              {:error, reason} ->
-                Logger.warning("Preserving fenced workspace because exact head could not be observed: #{inspect(reason)}")
-                state
+                  {:error, reason} ->
+                    Logger.warning("Preserving fenced workspace because cleanup replay could not verify path absence: #{inspect(reason)}")
+                    state
+                end
+
+              _ ->
+                verify_and_cleanup_fenced_workspace(
+                  state,
+                  issue_or_identifier,
+                  Map.put(entry, :workspace_path, workspace_path),
+                  token,
+                  head
+                )
             end
 
           {:error, reason} ->
@@ -1668,24 +1705,56 @@ defmodule SymphonyElixir.Orchestrator do
     state
   end
 
+  defp verify_and_cleanup_fenced_workspace(state, issue_or_identifier, entry, token, head) do
+    workspace_path = Map.get(entry, :workspace_path)
+
+    case Workspace.current_head(workspace_path, Map.get(entry, :worker_host)) do
+      {:ok, ^head} ->
+        cleanup_fenced_execution(state, issue_or_identifier, entry, token, head)
+
+      {:ok, observed_head} ->
+        record_head_divergence(state, token, head, observed_head)
+
+      {:error, reason} ->
+        Logger.warning("Preserving fenced workspace because exact head could not be observed: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp cleanup_receipt_status(fence_state, %{issue_id: issue_id, generation: generation}, expected_head) do
+    case Map.get(fence_state.executions, issue_id) do
+      %{generation: ^generation, cleanup_receipt: %{phase: phase, expected_head: ^expected_head}} -> phase
+      _ -> nil
+    end
+  end
+
+  defp cleanup_receipt_status(_fence_state, _token, _expected_head), do: nil
+
   defp cleanup_fenced_execution(state, issue_or_identifier, entry, token, head) do
     now_ms = execution_fence_now_ms()
 
-    case ExecutionFence.validate_cleanup(state.execution_fence, token, head) do
-      :ok ->
-        case cleanup_issue_workspace(issue_or_identifier, entry) do
-          :ok ->
-            persist_fenced_cleanup(state, token, head, now_ms)
+    case ExecutionFence.prepare_cleanup(state.execution_fence, token, head, now_ms) do
+      {:ok, prepared_fence, _result} ->
+        case persist_execution_fence(state, prepared_fence) do
+          {:ok, prepared_state} ->
+            case cleanup_issue_workspace(issue_or_identifier, entry) do
+              :ok ->
+                persist_fenced_cleanup(prepared_state, token, head, now_ms)
 
-          {:ok, _removed} ->
-            persist_fenced_cleanup(state, token, head, now_ms)
+              {:ok, _removed} ->
+                persist_fenced_cleanup(prepared_state, token, head, now_ms)
 
-          {:error, reason, _path} ->
-            Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
-            state
+              {:error, reason, _path} ->
+                Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+                prepared_state
+
+              {:error, reason} ->
+                Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+                prepared_state
+            end
 
           {:error, reason} ->
-            Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+            Logger.error("Execution-fence cleanup intent was not persisted: #{inspect(reason)}")
             state
         end
 
@@ -1699,7 +1768,9 @@ defmodule SymphonyElixir.Orchestrator do
     case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
       {:ok, fence_state, result} when result in [:cleaned, :already_cleaned] ->
         case persist_execution_fence(state, fence_state) do
-          {:ok, next_state} -> next_state
+          {:ok, next_state} ->
+            next_state
+
           {:error, reason} ->
             Logger.error("Execution-fence cleanup state was not persisted: #{inspect(reason)}")
             state
@@ -1741,15 +1812,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp execution_workspace_path(fence_state, %{issue_id: issue_id, generation: generation}, entry) do
-    case Map.get(entry, :workspace_path) do
-      path when is_binary(path) and path != "" ->
-        {:ok, path}
+    case Map.get(fence_state.executions, issue_id) do
+      %{generation: ^generation, worktree: worktree} when is_binary(worktree) ->
+        case Map.get(entry, :workspace_path) do
+          path when is_binary(path) and path != "" and path == worktree ->
+            {:ok, worktree}
+
+          path when is_binary(path) and path != "" ->
+            {:error, :execution_workspace_mismatch}
+
+          _ ->
+            {:ok, worktree}
+        end
 
       _ ->
-        case Map.get(fence_state.executions, issue_id) do
-          %{generation: ^generation, worktree: worktree} when is_binary(worktree) -> {:ok, worktree}
-          _ -> {:error, :unknown_execution_workspace}
-        end
+        {:error, :unknown_execution_workspace}
     end
   end
 
@@ -1976,9 +2053,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp start_startup_maintenance(%State{} = state, opts) do
     metadata = StartupMaintenance.start()
     task_supervisor = state.task_supervisor
+    owner = self()
+
     startup_cleanup_fun =
       Keyword.get_lazy(opts, :startup_cleanup_fun, fn ->
-        fn issue -> startup_workspace_cleanup(state.execution_fence, issue) end
+        fn issue -> startup_workspace_cleanup(state, issue, owner) end
       end)
 
     maintenance_fun =
@@ -2011,7 +2090,10 @@ defmodule SymphonyElixir.Orchestrator do
     {:error, :execution_fence_reconciliation_required}
   end
 
-  defp startup_workspace_cleanup(%{executions: executions}, %Issue{id: issue_id} = issue) do
+  defp startup_workspace_cleanup(%State{} = state, %Issue{id: issue_id} = issue, owner)
+       when is_pid(owner) do
+    executions = state.execution_fence.executions
+
     case Map.get(executions, issue_id) do
       nil ->
         Workspace.remove_issue_workspaces_for_startup(issue)
@@ -2019,13 +2101,56 @@ defmodule SymphonyElixir.Orchestrator do
       %{cleanup: :cleaned} ->
         Workspace.remove_issue_workspaces_for_startup(issue)
 
+      %{
+        cleanup: :pending,
+        cleanup_receipt: %{phase: :removal_started, expected_head: expected_head},
+        generation: generation,
+        worktree: workspace,
+        worker_host: worker_host
+      } ->
+        replay_persisted_cleanup(state, owner, issue, generation, workspace, worker_host, expected_head)
+
       _execution ->
         defer_startup_workspace_cleanup(issue)
     end
   end
 
-  defp startup_workspace_cleanup(_execution_fence, %Issue{} = issue),
+  defp startup_workspace_cleanup(_state, %Issue{} = issue, _owner),
     do: defer_startup_workspace_cleanup(issue)
+
+  defp replay_persisted_cleanup(state, owner, issue, generation, workspace, worker_host, expected_head) do
+    token = %{issue_id: issue.id, generation: generation}
+
+    case Workspace.path_exists?(workspace, worker_host) do
+      {:ok, false} ->
+        fence_state =
+          case Persistence.load(state.execution_fence_path) do
+            {:ok, persisted_state} -> persisted_state
+            _ -> state.execution_fence
+          end
+
+        case ExecutionFence.cleanup(fence_state, token, expected_head, execution_fence_now_ms()) do
+          {:ok, fence_state, _result} ->
+            case Persistence.save(state.execution_fence_path, fence_state) do
+              :ok ->
+                send(owner, {:startup_cleanup_fence_updated, fence_state})
+                :ok
+
+              {:error, reason} ->
+                {:error, {:execution_fence_persistence_failed, reason}}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:ok, true} ->
+        defer_startup_workspace_cleanup(issue)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -2334,6 +2459,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec confirm_execution_termination(GenServer.server(), map(), String.t(), map(), non_neg_integer()) ::
+          {:ok, :confirmed | :already_confirmed} | {:error, term()} | :unavailable
+  def confirm_execution_termination(server, token, session_id, evidence, now_ms) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_confirm_termination, token, session_id, evidence, now_ms})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
   @spec fence_execution(GenServer.server(), map(), map(), non_neg_integer()) ::
           {:ok, :fenced | :already_fenced} | {:error, term()} | :unavailable
   def fence_execution(server, token, attrs, now_ms) do
@@ -2562,6 +2702,32 @@ defmodule SymphonyElixir.Orchestrator do
 
           {:error, persist_reason} ->
             {:reply, {:error, {:execution_fence_persistence_failed, persist_reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call(
+        {:execution_fence_confirm_termination, token, session_id, evidence, now_ms},
+        _from,
+        %State{} = state
+      ) do
+    case ExecutionFence.confirm_termination(
+           state.execution_fence,
+           token,
+           session_id,
+           evidence,
+           now_ms
+         ) do
+      {:ok, fence_state, result} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} ->
+            {:reply, {:ok, result}, next_state}
+
+          {:error, reason} ->
+            {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
         end
 
       {:error, _reason} = error ->

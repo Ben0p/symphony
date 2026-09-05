@@ -264,25 +264,66 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "remote workspace removal rejects paths outside the configured root before SSH" do
-    test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-remote-workspace-confinement-#{System.unique_integer([:positive])}"
-      )
+    configured_root = "/tmp/symphony-elixir-remote-root-#{System.unique_integer([:positive])}"
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: configured_root)
 
-    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
-
-    dot_path = test_root <> "/../outside"
+    dot_path = configured_root <> "/../outside"
 
     assert {:error, {:workspace_path_unreadable, ^dot_path, :dot_segment}, ""} =
              Workspace.remove(dot_path, "worker-01:2200")
 
-    outside = Path.join(System.tmp_dir!(), "outside")
+    outside = "/tmp/symphony-elixir-remote-outside"
 
-    assert {:error, {:workspace_outside_root, ^outside, configured_root}, ""} =
+    assert {:error, {:workspace_outside_root, ^outside, ^configured_root}, ""} =
              Workspace.remove(outside, "worker-01:2200")
+  end
 
-    assert configured_root == test_root
+  test "generated POSIX remote cleanup shell removes only a confined child" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-cleanup-shell-#{System.unique_integer([:positive])}"
+      )
+
+    root = Path.join(test_root, "root")
+    outside = Path.join(test_root, "outside")
+    child = Path.join(root, "child")
+
+    try do
+      if match?({:win32, _}, :os.type()) do
+        :ok
+      else
+        File.mkdir_p!(child)
+        File.mkdir_p!(outside)
+        File.write!(Path.join(child, "keep.txt"), "remove")
+
+        script = Workspace.remote_cleanup_script_for_test(child, root)
+        {_output, status} = System.cmd("sh", ["-c", script], stderr_to_stdout: true)
+
+        assert status == 0
+        refute File.exists?(child)
+        assert File.exists?(root)
+
+        symlink = Path.join(root, "escape")
+
+        case symlink_or_skip!(outside, symlink) do
+          :ok ->
+            File.write!(Path.join(outside, "keep.txt"), "preserve")
+            escaped_child = Path.join(symlink, "child")
+            escape_script = Workspace.remote_cleanup_script_for_test(escaped_child, root)
+            {_output, status} = System.cmd("sh", ["-c", escape_script], stderr_to_stdout: true)
+
+            assert status == 73
+            assert File.exists?(outside)
+            assert File.exists?(Path.join(outside, "keep.txt"))
+
+          {:symlink_unavailable, _reason} ->
+            :ok
+        end
+      end
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "workspace canonicalizes symlinked workspace roots before creating issue directories" do
@@ -1031,10 +1072,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
+
       assert {:error, {:workspace_hook_failed, "before_remove", 17, _}, ^workspace} =
                Workspace.remove(workspace)
 
       assert File.exists?(workspace)
+
+      assert {:error, {{:workspace_hook_failed, "before_remove", 17, _}, ^workspace}} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
     after
       File.rm_rf(test_root)
     end
@@ -1058,6 +1103,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
+
       assert {:error, {:workspace_hook_failed, "before_remove", 17, _}, ^workspace} =
                Workspace.remove(workspace)
 
@@ -1097,6 +1143,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
+
       assert {:error, {:workspace_hook_timeout, "before_remove", _}, ^workspace} =
                Workspace.remove(workspace)
 

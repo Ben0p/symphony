@@ -124,6 +124,81 @@ defmodule SymphonyElixir.ExecutionFenceTest do
     assert {:error, :stale_generation} = ExecutionFence.authorize(state, token, :commit)
   end
 
+  test "orchestrator stop retains ownership until process-tree termination is confirmed" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, :released} = ExecutionFence.release(state, token, "worker-1", :orchestrator_stop)
+
+    assert state.executions[@issue].termination_unconfirmed
+    assert state.executions[@issue].ownership == :unknown
+
+    other_admission = Map.put(admission(), :issue_id, "HGS-295")
+
+    assert {:error, {:repository_not_quiescent, @issue}} =
+             ExecutionFence.admit(state, other_admission, 110)
+
+    evidence = %{
+      session_id: "worker-1",
+      process_id: "process-worker-1",
+      process_tree: :terminated,
+      evidence_ref: "process-tree-check-1",
+      observed_at_ms: 110
+    }
+
+    assert {:ok, state, :confirmed} =
+             ExecutionFence.confirm_termination(state, token, "worker-1", evidence, 110)
+
+    refute state.executions[@issue].termination_unconfirmed
+    assert state.executions[@issue].ownership == :reconciled
+    assert {:ok, _state, next_token} = ExecutionFence.admit(state, admission(), 120)
+    assert next_token.generation == 2
+  end
+
+  test "termination confirmation waits for every released mutable lease" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :reviewer, session("reviewer-1", 100), 100)
+
+    {:ok, state, :released} = ExecutionFence.release(state, token, "worker-1", :orchestrator_stop)
+    {:ok, state, :released} = ExecutionFence.release(state, token, "reviewer-1", :orchestrator_stop)
+
+    worker_evidence = %{
+      session_id: "worker-1",
+      process_id: "process-worker-1",
+      process_tree: :terminated,
+      evidence_ref: "process-tree-check-worker",
+      observed_at_ms: 110
+    }
+
+    reviewer_evidence = %{
+      session_id: "reviewer-1",
+      process_id: "process-reviewer-1",
+      process_tree: :terminated,
+      evidence_ref: "process-tree-check-reviewer",
+      observed_at_ms: 111
+    }
+
+    {:ok, state, :confirmed} =
+      ExecutionFence.confirm_termination(state, token, "worker-1", worker_evidence, 110)
+
+    assert state.executions[@issue].termination_unconfirmed
+    assert state.executions[@issue].ownership == :unknown
+    assert state.executions[@issue].leases["reviewer-1"].termination_required
+
+    {:ok, state, :confirmed} =
+      ExecutionFence.confirm_termination(state, token, "reviewer-1", reviewer_evidence, 111)
+
+    refute state.executions[@issue].termination_unconfirmed
+    assert state.executions[@issue].ownership == :reconciled
+  end
+
   test "restart preserves an active generation with no active leases as quiescent" do
     {:ok, state, _token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
     state = put_in(state, [:executions, @issue, :ownership], :unknown)
@@ -164,6 +239,55 @@ defmodule SymphonyElixir.ExecutionFenceTest do
 
     {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 210)
     assert {:error, :ownership_unreconciled} = ExecutionFence.cleanup(state, token, "abc123", 220)
+  end
+
+  test "explicit process-tree termination evidence restores cleanup eligibility" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1", 100), 100)
+
+    {:ok, state, %{status: :blocked, expired: ["worker-1"]}} =
+      ExecutionFence.reconcile_sessions(state, [], 200, 50)
+
+    assert state.executions[@issue].termination_unconfirmed
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 210)
+
+    evidence = %{
+      session_id: "worker-1",
+      process_id: "process-worker-1",
+      process_tree: :terminated,
+      evidence_ref: "process-tree-check-1",
+      observed_at_ms: 220
+    }
+
+    assert {:error, :termination_not_proven} =
+             ExecutionFence.confirm_termination(
+               state,
+               token,
+               "worker-1",
+               %{evidence | process_tree: :running},
+               220
+             )
+
+    assert {:ok, state, :confirmed} =
+             ExecutionFence.confirm_termination(state, token, "worker-1", evidence, 220)
+
+    assert state.executions[@issue].termination_unconfirmed == false
+    assert state.executions[@issue].ownership == :reconciled
+    assert {:ok, state, :cleaned} = ExecutionFence.cleanup(state, token, "abc123", 230)
+    assert state.executions[@issue].cleanup_receipt.phase == :verified
+  end
+
+  test "cleanup intent is idempotent and durable before filesystem removal" do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 110)
+
+    assert {:ok, state, :prepared} = ExecutionFence.prepare_cleanup(state, token, "abc123", 120)
+    assert state.executions[@issue].cleanup_receipt.phase == :removal_started
+
+    assert {:ok, ^state, :already_prepared} =
+             ExecutionFence.prepare_cleanup(state, token, "abc123", 121)
   end
 
   test "terminal state dominates a stale non-terminal session observation" do

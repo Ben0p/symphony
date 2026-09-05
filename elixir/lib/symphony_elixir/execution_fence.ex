@@ -111,6 +111,7 @@ defmodule SymphonyElixir.ExecutionFence do
       execution = %{
         issue_id: issue_id,
         repository: attrs.repository,
+        worker_host: Map.get(attrs, :worker_host),
         generation: generation,
         branch: attrs.branch,
         worktree: attrs.worktree,
@@ -119,6 +120,7 @@ defmodule SymphonyElixir.ExecutionFence do
         leases: %{},
         terminal: nil,
         cleanup: :pending,
+        cleanup_receipt: nil,
         termination_unconfirmed: false,
         admitted_at_ms: now_ms
       }
@@ -155,7 +157,8 @@ defmodule SymphonyElixir.ExecutionFence do
             branch: attrs.branch,
             worktree: attrs.worktree,
             status: :active,
-            registered_at_ms: now_ms
+            registered_at_ms: now_ms,
+            termination_required: false
           },
           Map.take(attrs, [:linear_state, :pr_state, :head, :last_heartbeat_at])
         )
@@ -272,10 +275,38 @@ defmodule SymphonyElixir.ExecutionFence do
          %{status: status} = lease when status in [:active, :released, :expired] <-
            Map.get(execution.leases, session_id) do
       if status == :active do
-        updated_lease = lease |> Map.put(:status, :released) |> Map.put(:release_reason, reason)
-        {:ok, put_lease(state, execution, updated_lease), :released}
+        updated_lease =
+          lease
+          |> Map.put(:status, :released)
+          |> Map.put(:release_reason, reason)
+          |> Map.put(:termination_required, reason == :orchestrator_stop)
+
+        next_state = put_lease(state, execution, updated_lease)
+
+        if reason == :orchestrator_stop do
+          updated_execution =
+            next_state
+            |> get_in([:executions, execution.issue_id])
+            |> Map.merge(%{ownership: :unknown, termination_unconfirmed: true})
+
+          {:ok, put_execution(next_state, updated_execution), :released}
+        else
+          {:ok, next_state, :released}
+        end
       else
-        {:ok, state, :already_released}
+        if reason == :orchestrator_stop and not Map.get(lease, :termination_required, false) do
+          upgraded_lease = Map.put(lease, :termination_required, true)
+          next_state = put_lease(state, execution, upgraded_lease)
+
+          updated_execution =
+            next_state
+            |> get_in([:executions, execution.issue_id])
+            |> Map.merge(%{ownership: :unknown, termination_unconfirmed: true})
+
+          {:ok, put_execution(next_state, updated_execution), :already_released}
+        else
+          {:ok, state, :already_released}
+        end
       end
     else
       nil -> {:ok, state, :already_released}
@@ -285,6 +316,96 @@ defmodule SymphonyElixir.ExecutionFence do
   end
 
   def release(_state, _token, _session_id, _reason), do: {:error, :invalid_session}
+
+  @doc "Confirms a generation-bound process tree is terminated from explicit evidence."
+  @spec confirm_termination(state(), token(), String.t(), map(), non_neg_integer()) ::
+          {:ok, state(), :confirmed | :already_confirmed} | {:error, term()}
+  def confirm_termination(state, token, session_id, evidence, now_ms)
+      when is_binary(session_id) and is_map(evidence) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_state(state),
+         {:ok, execution} <- current_execution(state, token),
+         %{status: status} = lease when status in [:expired, :released] <-
+           Map.get(execution.leases, session_id),
+         :ok <- termination_confirmation_required(lease),
+         :ok <- validate_termination_evidence(lease, session_id, evidence, now_ms) do
+      if Map.get(lease, :termination_confirmed_at_ms) do
+        {:ok, state, :already_confirmed}
+      else
+        confirmed_lease =
+          lease
+          |> Map.put(:termination_confirmed_at_ms, now_ms)
+          |> Map.put(:termination_evidence_ref, evidence.evidence_ref)
+
+        confirmed_state = put_lease(state, execution, confirmed_lease)
+        confirmed_execution = get_in(confirmed_state, [:executions, execution.issue_id])
+
+        if execution_requires_termination?(confirmed_execution) do
+          {:ok, confirmed_state, :confirmed}
+        else
+          updated_execution =
+            confirmed_execution
+            |> Map.put(:termination_unconfirmed, false)
+            |> maybe_reconcile_confirmed_ownership()
+
+          {:ok, put_execution(confirmed_state, updated_execution), :confirmed}
+        end
+      end
+    else
+      nil -> {:error, :unknown_session}
+      {:error, _reason} = error -> error
+      _ -> {:error, :termination_not_confirmable}
+    end
+  end
+
+  def confirm_termination(_state, _token, _session_id, _evidence, _now_ms),
+    do: {:error, :invalid_termination_confirmation}
+
+  @doc false
+  @spec confirm_termination(state(), token(), map(), non_neg_integer()) ::
+          {:ok, state(), :confirmed | :already_confirmed} | {:error, term()}
+  def confirm_termination(state, token, evidence, now_ms) when is_map(evidence) do
+    case Map.get(evidence, :session_id) do
+      session_id when is_binary(session_id) ->
+        confirm_termination(state, token, session_id, evidence, now_ms)
+
+      _ ->
+        {:error, :invalid_termination_confirmation}
+    end
+  end
+
+  @doc "Begins a durable, replayable filesystem cleanup phase."
+  @spec prepare_cleanup(state(), token(), String.t(), non_neg_integer()) ::
+          {:ok, state(), :prepared | :already_prepared} | {:error, term()}
+  def prepare_cleanup(state, token, expected_head, now_ms)
+      when is_binary(expected_head) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- validate_cleanup(state, token, expected_head),
+         {:ok, execution} <- current_execution(state, token) do
+      receipt = Map.get(execution, :cleanup_receipt)
+
+      cond do
+        execution.cleanup == :cleaned ->
+          {:ok, state, :already_prepared}
+
+        match?(%{phase: :removal_started}, receipt) and receipt.expected_head == expected_head ->
+          {:ok, state, :already_prepared}
+
+        is_nil(receipt) ->
+          receipt = %{
+            phase: :removal_started,
+            expected_head: expected_head,
+            prepared_at_ms: now_ms
+          }
+
+          {:ok, put_execution(state, Map.put(execution, :cleanup_receipt, receipt)), :prepared}
+
+        true ->
+          {:error, :cleanup_conflict}
+      end
+    end
+  end
+
+  def prepare_cleanup(_state, _token, _expected_head, _now_ms),
+    do: {:error, :invalid_cleanup}
 
   defp registration_result(state, execution, session) do
     case Map.get(state.sessions, session.session_id) do
@@ -366,6 +487,9 @@ defmodule SymphonyElixir.ExecutionFence do
         execution.status != :terminal ->
           {:error, :not_terminal}
 
+        termination_unconfirmed?(execution) ->
+          {:error, :ownership_unreconciled}
+
         execution.ownership != :reconciled ->
           {:error, :ownership_unreconciled}
 
@@ -395,7 +519,17 @@ defmodule SymphonyElixir.ExecutionFence do
       if execution.cleanup == :cleaned do
         {:ok, state, :already_cleaned}
       else
-        updated = execution |> Map.put(:cleanup, :cleaned) |> Map.put(:cleaned_at_ms, now_ms)
+        receipt =
+          execution
+          |> Map.get(:cleanup_receipt)
+          |> verified_cleanup_receipt(expected_head, now_ms)
+
+        updated =
+          execution
+          |> Map.put(:cleanup, :cleaned)
+          |> Map.put(:cleaned_at_ms, now_ms)
+          |> Map.put(:cleanup_receipt, receipt)
+
         {:ok, put_execution(state, updated), :cleaned}
       end
     end
@@ -458,7 +592,8 @@ defmodule SymphonyElixir.ExecutionFence do
   defp valid_execution?(issue_id, execution) when is_binary(issue_id) and is_map(execution) do
     valid_execution_identity?(issue_id, execution) and
       valid_execution_status?(execution) and valid_execution_leases?(execution) and
-      valid_terminal_consistency?(execution)
+      valid_terminal_consistency?(execution) and valid_cleanup_consistency?(execution) and
+      valid_termination_consistency?(execution)
   end
 
   defp valid_execution?(_issue_id, _execution), do: false
@@ -487,12 +622,14 @@ defmodule SymphonyElixir.ExecutionFence do
   defp valid_execution_identity?(issue_id, execution) do
     Map.get(execution, :issue_id) == issue_id and
       present_string?(Map.get(execution, :repository)) and
+      optional_string?(Map.get(execution, :worker_host)) and
       positive_integer?(Map.get(execution, :generation)) and
       present_string?(Map.get(execution, :branch)) and
       present_string?(Map.get(execution, :worktree)) and
       non_negative_integer?(Map.get(execution, :admitted_at_ms)) and
       optional_non_negative_integer?(Map.get(execution, :cleaned_at_ms)) and
-      Map.get(execution, :termination_unconfirmed, false) in [true, false]
+      Map.get(execution, :termination_unconfirmed, false) in [true, false] and
+      valid_cleanup_receipt?(Map.get(execution, :cleanup_receipt))
   end
 
   defp valid_history_execution?(execution) when is_map(execution) do
@@ -586,7 +723,86 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp valid_lease_clock?(lease) do
     non_negative_integer?(Map.get(lease, :last_heartbeat_at)) and
-      non_negative_integer?(Map.get(lease, :registered_at_ms))
+      non_negative_integer?(Map.get(lease, :registered_at_ms)) and
+      Map.get(lease, :termination_required, false) in [true, false] and
+      optional_non_negative_integer?(Map.get(lease, :termination_confirmed_at_ms)) and
+      optional_string?(Map.get(lease, :termination_evidence_ref))
+  end
+
+  defp valid_cleanup_receipt?(nil), do: true
+
+  defp valid_cleanup_receipt?(receipt) when is_map(receipt) do
+    Map.get(receipt, :phase) in [:removal_started, :verified] and
+      present_string?(Map.get(receipt, :expected_head)) and
+      non_negative_integer?(Map.get(receipt, :prepared_at_ms)) and
+      optional_non_negative_integer?(Map.get(receipt, :verified_at_ms)) and
+      (Map.get(receipt, :phase) != :verified or
+         non_negative_integer?(Map.get(receipt, :verified_at_ms)))
+  end
+
+  defp valid_cleanup_receipt?(_receipt), do: false
+
+  defp valid_cleanup_consistency?(execution) when is_map(execution) do
+    case {Map.get(execution, :cleanup), Map.get(execution, :cleanup_receipt)} do
+      {:pending, nil} -> true
+      {:pending, %{phase: :removal_started}} -> true
+      {:cleaned, %{phase: :verified}} -> true
+      {:cleaned, nil} -> true
+      _ -> false
+    end
+  end
+
+  defp valid_cleanup_consistency?(_execution), do: false
+
+  defp valid_termination_consistency?(execution) when is_map(execution) do
+    not execution_requires_termination?(execution) or
+      Map.get(execution, :termination_unconfirmed, false)
+  end
+
+  defp valid_termination_consistency?(_execution), do: false
+
+  defp validate_termination_evidence(lease, session_id, evidence, now_ms) do
+    cond do
+      evidence.session_id != session_id ->
+        {:error, :termination_session_mismatch}
+
+      evidence.process_id != lease.process_id ->
+        {:error, :termination_process_mismatch}
+
+      evidence.process_tree != :terminated ->
+        {:error, :termination_not_proven}
+
+      not present_string?(evidence.evidence_ref) ->
+        {:error, :termination_evidence_missing}
+
+      not non_negative_integer?(evidence.observed_at_ms) or evidence.observed_at_ms > now_ms ->
+        {:error, :invalid_termination_timestamp}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp maybe_reconcile_confirmed_ownership(%{ownership: :contradictory} = execution),
+    do: execution
+
+  defp maybe_reconcile_confirmed_ownership(execution),
+    do: Map.put(execution, :ownership, :reconciled)
+
+  defp verified_cleanup_receipt(nil, expected_head, now_ms) do
+    %{
+      phase: :verified,
+      expected_head: expected_head,
+      prepared_at_ms: now_ms,
+      verified_at_ms: now_ms
+    }
+  end
+
+  defp verified_cleanup_receipt(receipt, expected_head, now_ms) do
+    receipt
+    |> Map.put(:phase, :verified)
+    |> Map.put(:expected_head, expected_head)
+    |> Map.put(:verified_at_ms, now_ms)
   end
 
   defp valid_terminal?(nil), do: true
@@ -611,16 +827,19 @@ defmodule SymphonyElixir.ExecutionFence do
     |> Map.take([
       :issue_id,
       :repository,
+      :worker_host,
       :generation,
       :branch,
       :worktree,
       :status,
       :ownership,
       :cleanup,
+      :termination_unconfirmed,
       :admitted_at_ms,
       :cleaned_at_ms
     ])
     |> Map.put(:terminal, sanitize_terminal(execution.terminal))
+    |> Map.put(:cleanup_receipt, sanitize_cleanup_receipt(Map.get(execution, :cleanup_receipt)))
     |> Map.put(
       :sessions,
       execution.leases
@@ -634,6 +853,11 @@ defmodule SymphonyElixir.ExecutionFence do
 
   defp sanitize_terminal(terminal),
     do: Map.take(terminal, [:state, :accepted_head, :merge_identity, :observed_at_ms])
+
+  defp sanitize_cleanup_receipt(nil), do: nil
+
+  defp sanitize_cleanup_receipt(receipt),
+    do: Map.take(receipt, [:phase, :expected_head, :prepared_at_ms, :verified_at_ms])
 
   defp sanitize_session(session) do
     Map.take(session, [
@@ -651,7 +875,10 @@ defmodule SymphonyElixir.ExecutionFence do
       :linear_state,
       :pr_state,
       :head,
-      :release_reason
+      :release_reason,
+      :termination_required,
+      :termination_confirmed_at_ms,
+      :termination_evidence_ref
     ])
   end
 
@@ -716,7 +943,8 @@ defmodule SymphonyElixir.ExecutionFence do
   end
 
   defp quiescent?(execution) do
-    execution.ownership == :reconciled and active_lease_ids(execution) == [] and
+    execution.ownership == :reconciled and not termination_unconfirmed?(execution) and
+      active_lease_ids(execution) == [] and
       (execution.status == :active or
          (execution.status == :terminal and execution.cleanup == :cleaned))
   end
@@ -949,14 +1177,39 @@ defmodule SymphonyElixir.ExecutionFence do
     end)
   end
 
-  defp termination_unconfirmed?(execution),
-    do: Map.get(execution, :termination_unconfirmed, false) == true
+  defp termination_unconfirmed?(execution) do
+    Map.get(execution, :termination_unconfirmed, false) == true or
+      execution_requires_termination?(execution)
+  end
+
+  defp execution_requires_termination?(execution) when is_map(execution) do
+    Enum.any?(Map.get(execution, :leases, %{}), fn {_session_id, lease} ->
+      termination_pending?(lease)
+    end)
+  end
+
+  defp execution_requires_termination?(_execution), do: false
+
+  defp termination_pending?(lease) when is_map(lease) do
+    Map.get(lease, :termination_required, false) == true and
+      is_nil(Map.get(lease, :termination_confirmed_at_ms))
+  end
+
+  defp termination_pending?(_lease), do: false
+
+  defp termination_confirmation_required(lease) do
+    if Map.get(lease, :termination_required, false) do
+      :ok
+    else
+      {:error, :termination_not_required}
+    end
+  end
 
   defp add_unconfirmed_reasons(summary, state) do
     Enum.reduce(state.executions, summary, fn {_issue_id, execution}, summary_acc ->
       if termination_unconfirmed?(execution) do
         Enum.reduce(execution.leases, summary_acc, fn {session_id, lease}, inner_summary ->
-          if lease.status == :expired,
+          if termination_pending?(lease),
             do: add_reason(inner_summary, :unknown, session_id),
             else: inner_summary
         end)
@@ -1110,10 +1363,12 @@ defmodule SymphonyElixir.ExecutionFence do
 
       now_ms - lease.last_heartbeat_at >= ttl_ms ->
         expired_state = expire_lease(state, execution, session_id)
+
         blocked_state =
           expired_state
           |> mark_termination_unconfirmed(issue_id)
           |> mark_ownership(issue_id, :unknown)
+
         blocked_summary = add_reason(summary, :unknown, session_id)
         {blocked_state, add_reason(blocked_summary, :expired, session_id)}
 
@@ -1126,7 +1381,9 @@ defmodule SymphonyElixir.ExecutionFence do
   defp expire_lease(state, execution, session_id) do
     state
     |> put_in([:executions, execution.issue_id, :leases, session_id, :status], :expired)
+    |> put_in([:executions, execution.issue_id, :leases, session_id, :termination_required], true)
     |> put_in([:sessions, session_id, :status], :expired)
+    |> put_in([:sessions, session_id, :termination_required], true)
   end
 
   defp mark_termination_unconfirmed(state, issue_id),
