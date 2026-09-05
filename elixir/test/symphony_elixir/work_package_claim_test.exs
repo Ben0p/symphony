@@ -8,6 +8,8 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
   @issue_id "issue-349"
   @profile "profile-349"
 
+  @canonical_json_fixture ~s({"contractVersion":"work-package-runtime-attestation.v1","runnerId":"runner-349","managedProjectProfileId":"profile-349","reservationId":"reservation-349","reservationNonce":"nonce-349","issueId":"issue-349","generation":1,"sessionId":"worker-349","processId":"process-349","responsibleDelegationId":"delegation-349","executionFenceToken":"issue-349:1","runtimeLeaseId":"worker-349","repositoryRef":"hypergridau/symphony","scopeKeys":["repo:hypergridau/symphony","work:349"],"attestedAt":"2026-09-06T10:00:00.000Z"})
+
   test "claims a reservation and replays the same journaled tuple after restart" do
     path = temp_path()
     on_exit(fn -> File.rm_rf(path) end)
@@ -59,16 +61,28 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
     %{input: input} = authority_fixture(path)
 
     reservation_fun = fn url, _options ->
-      if String.ends_with?(url, "/reservations/by-issue"), do: {:ok, response(%{"data" => %{"projectionId" => "p", "reservationId" => "r"}})}, else: {:ok, response(%{"data" => %{}})}
+      if String.ends_with?(url, "/reservations/by-issue") do
+        {:ok, response(%{"data" => %{"projectionId" => "p", "reservationId" => "r"}})}
+      else
+        {:ok, response(%{"data" => %{}})}
+      end
     end
 
-    assert {:error, {:missing_reservation_field, "reservationNonce"}} = WorkPackageClaim.claim(input, request_fun: reservation_fun)
-    expired_graph = put_in(input.responsibility_graph, [:delegations, "delegation-349", :expires_at_ms], 1)
-    assert {:error, :runtime_lease_mismatch} = WorkPackageClaim.claim(%{input | responsibility_graph: expired_graph}, request_fun: reservation_fun)
-    assert {:ok, canonical} = WorkPackageClaim.canonical_json(attestation_for_test())
+    assert {:error, {:missing_reservation_field, "reservationNonce"}} =
+             WorkPackageClaim.claim(input, request_fun: reservation_fun)
 
-    assert canonical ==
-             ~s({"contractVersion":"work-package-runtime-attestation.v1","runnerId":"runner-349","managedProjectProfileId":"profile-349","reservationId":"reservation-349","reservationNonce":"nonce-349","issueId":"issue-349","generation":1,"sessionId":"worker-349","processId":"process-349","responsibleDelegationId":"delegation-349","executionFenceToken":"issue-349:1","runtimeLeaseId":"worker-349","repositoryRef":"hypergridau/symphony","scopeKeys":["repo:hypergridau/symphony","work:349"],"attestedAt":"2026-09-06T10:00:00.000Z"})
+    expired_graph = put_in(input.responsibility_graph, [:delegations, "delegation-349", :expires_at_ms], 1)
+
+    assert {:error, :runtime_lease_mismatch} =
+             WorkPackageClaim.claim(
+               %{input | responsibility_graph: expired_graph},
+               request_fun: reservation_fun
+             )
+
+    assert {:ok, canonical} =
+             WorkPackageClaim.canonical_json(attestation_for_test())
+
+    assert canonical == @canonical_json_fixture
 
     assert {:ok, signature} = WorkPackageClaim.sign(attestation_for_test(), "attestation-key")
     assert signature == "eYASgI7yqAih8J9N1Noj0r8Ap8X3H3tVgi__MnwwQkg"
@@ -91,23 +105,33 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
       end
     end
 
-    assert {:error, :reservation_scope_mismatch} = WorkPackageClaim.claim(input, request_fun: wrong_profile)
+    assert {:error, :reservation_scope_mismatch} =
+             WorkPackageClaim.claim(input, request_fun: wrong_profile)
 
     malformed_claim = fn url, _options ->
-      if String.ends_with?(url, "/reservations/by-issue"), do: {:ok, response(%{"data" => reservation_payload()})}, else: {:ok, response(%{"data" => %{}})}
+      if String.ends_with?(url, "/reservations/by-issue") do
+        {:ok, response(%{"data" => reservation_payload()})}
+      else
+        {:ok, response(%{"data" => %{}})}
+      end
     end
 
-    assert {:error, :invalid_claim_result} = WorkPackageClaim.claim(input, request_fun: malformed_claim)
+    assert {:error, :invalid_claim_result} =
+             WorkPackageClaim.claim(input, request_fun: malformed_claim)
 
     provider_error = fn _url, _options -> {:ok, response(%{"error" => "unavailable"}, 503)} end
-    assert {:error, {:provider_status, 503}} = WorkPackageClaim.claim(input, request_fun: provider_error)
+
+    assert {:error, {:provider_status, 503}} =
+             WorkPackageClaim.claim(input, request_fun: provider_error)
 
     assert {:ok, journal} = Journal.load(path)
     assert map_size(journal.reservations) == 1
     [{key, reservation}] = Map.to_list(journal.reservations)
     {:ok, corrupted_journal} = Journal.put(journal, key, %{reservation | generation: 2})
     assert :ok = Journal.save(path, corrupted_journal)
-    assert {:error, :reservation_authority_mismatch} = WorkPackageClaim.claim(input, request_fun: provider_error)
+
+    assert {:error, :reservation_authority_mismatch} =
+             WorkPackageClaim.claim(input, request_fun: provider_error)
   end
 
   defp authority_fixture(path) do
@@ -121,11 +145,26 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
         admitted,
         token,
         :worker,
-        %{session_id: "worker-349", process_id: "process-349", branch: "hgs-349", worktree: "tmp", linear_state: "In Progress", pr_state: "none", head: "unobserved", last_heartbeat_at: 0},
+        %{
+          session_id: "worker-349",
+          process_id: "process-349",
+          branch: "hgs-349",
+          worktree: "tmp",
+          linear_state: "In Progress",
+          pr_state: "none",
+          head: "unobserved",
+          last_heartbeat_at: 0
+        },
         0
       )
 
-    lease = %{issue_id: @issue_id, repository: @repository, generation: 1, session_id: "worker-349", process_id: "process-349"}
+    lease = %{
+      issue_id: @issue_id,
+      repository: @repository,
+      generation: 1,
+      session_id: "worker-349",
+      process_id: "process-349"
+    }
 
     scope = %{
       company_id: "hypergrid",
@@ -138,14 +177,50 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
       paths: [],
       modules: [],
       environments: ["local"],
-      actions: [:read, :observe, :delegate, :reconcile, :edit, :commit, :push, :state_mutation, :cleanup, :review, :report]
+      actions: [
+        :read,
+        :observe,
+        :delegate,
+        :reconcile,
+        :edit,
+        :commit,
+        :push,
+        :state_mutation,
+        :cleanup,
+        :review,
+        :report
+      ]
     }
 
-    authority = %{class: :routine_engineering, capabilities: scope.actions, environments: ["local"]}
+    authority = %{
+      class: :routine_engineering,
+      capabilities: scope.actions,
+      environments: ["local"]
+    }
+
     budget = %{model: "luna", effort: :high, max_tokens: 1000, max_children: 1}
 
-    {:ok, owner_graph, _} = ResponsibilityGraph.delegate(ResponsibilityGraph.new(), delegation("owner", :accountable, scope, authority, budget), 0)
-    {:ok, child_graph, _} = ResponsibilityGraph.delegate(owner_graph, delegation("delegation-349", :responsible, scope, authority, budget, parent_delegation_id: "owner"), 0)
+    {:ok, owner_graph, _} =
+      ResponsibilityGraph.delegate(
+        ResponsibilityGraph.new(),
+        delegation("owner", :accountable, scope, authority, budget),
+        0
+      )
+
+    {:ok, child_graph, _} =
+      ResponsibilityGraph.delegate(
+        owner_graph,
+        delegation(
+          "delegation-349",
+          :responsible,
+          scope,
+          authority,
+          budget,
+          parent_delegation_id: "owner"
+        ),
+        0
+      )
+
     {:ok, graph} = ResponsibilityGraph.bind_runtime_lease(child_graph, "delegation-349", lease, 0)
 
     input = %{

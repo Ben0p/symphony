@@ -97,6 +97,45 @@ defmodule SymphonyElixir.WorkPackageClaim do
   end
 
   defp authority(input, now_ms) do
+    with :ok <- validate_claim_input(input),
+         {:ok, base_url} <- validate_base_url(input.base_url),
+         :ok <- ExecutionFence.validate(input.fence_state),
+         :ok <- ResponsibilityGraph.validate(input.responsibility_graph),
+         {:ok, execution} <- current_execution(input.fence_state, input.issue_id),
+         {:ok, lease} <- active_worker_lease(execution),
+         {:ok, delegation} <-
+           ResponsibilityGraph.admission_delegation(
+             input.responsibility_graph,
+             input.issue_id,
+             input[:issue_identifier],
+             input.repository_ref
+           ),
+         :ok <- valid_delegation_lease(delegation, lease, input.repository_ref, now_ms),
+         :ok <- repository_matches(execution, input.repository_ref) do
+      generation = execution.generation
+      session_id = lease.session_id
+
+      {:ok,
+       %{
+         base_url: String.trim_trailing(base_url, "/"),
+         runner_token: input.runner_token,
+         attestation_key: input.attestation_key,
+         runner_id: input.runner_id,
+         managed_project_profile_id: input.managed_project_profile_id,
+         issue_id: input.issue_id,
+         repository_ref: input.repository_ref,
+         generation: generation,
+         session_id: session_id,
+         process_id: lease.process_id,
+         responsible_delegation_id: delegation.id,
+         execution_fence_token: "#{input.issue_id}:#{generation}",
+         runtime_lease_id: session_id,
+         journal_path: input.journal_path
+       }}
+    end
+  end
+
+  defp validate_claim_input(input) do
     required = [
       :base_url,
       :runner_token,
@@ -109,46 +148,13 @@ defmodule SymphonyElixir.WorkPackageClaim do
     ]
 
     if Enum.all?(required, &present_string?(Map.get(input, &1))) and
-         is_map(Map.get(input, :fence_state)) and is_map(Map.get(input, :responsibility_graph)) do
-      with {:ok, base_url} <- validate_base_url(input.base_url),
-           :ok <- ExecutionFence.validate(input.fence_state),
-           :ok <- ResponsibilityGraph.validate(input.responsibility_graph),
-           {:ok, execution} <- current_execution(input.fence_state, input.issue_id),
-           {:ok, lease} <- active_worker_lease(execution),
-           {:ok, delegation} <-
-             ResponsibilityGraph.admission_delegation(
-               input.responsibility_graph,
-               input.issue_id,
-               input[:issue_identifier],
-               input.repository_ref
-             ),
-           :ok <- valid_delegation_lease(delegation, lease, input.repository_ref, now_ms),
-           :ok <- if(execution.repository == input.repository_ref, do: :ok, else: {:error, :repository_mismatch}) do
-        generation = execution.generation
-        session_id = lease.session_id
-
-        {:ok,
-         %{
-           base_url: String.trim_trailing(base_url, "/"),
-           runner_token: input.runner_token,
-           attestation_key: input.attestation_key,
-           runner_id: input.runner_id,
-           managed_project_profile_id: input.managed_project_profile_id,
-           issue_id: input.issue_id,
-           repository_ref: input.repository_ref,
-           generation: generation,
-           session_id: session_id,
-           process_id: lease.process_id,
-           responsible_delegation_id: delegation.id,
-           execution_fence_token: "#{input.issue_id}:#{generation}",
-           runtime_lease_id: session_id,
-           journal_path: input.journal_path
-         }}
-      end
-    else
-      {:error, :invalid_claim_input}
-    end
+         is_map(Map.get(input, :fence_state)) and is_map(Map.get(input, :responsibility_graph)),
+       do: :ok,
+       else: {:error, :invalid_claim_input}
   end
+
+  defp repository_matches(%{repository: repository}, repository), do: :ok
+  defp repository_matches(_execution, _repository), do: {:error, :repository_mismatch}
 
   defp current_execution(%{executions: executions}, issue_id) do
     case Map.get(executions, issue_id) do

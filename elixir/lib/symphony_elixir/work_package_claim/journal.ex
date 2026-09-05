@@ -179,47 +179,52 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
   defp valid_reservation?(_reservation), do: false
 
   defp recover_missing(path) do
-    candidates =
-      path
-      |> Path.dirname()
-      |> case do
-        directory ->
-          case File.ls(directory) do
-            {:ok, entries} ->
-              entries
-              |> Enum.filter(fn entry ->
-                String.starts_with?(entry, Path.basename(path) <> ".tmp-") or
-                  String.starts_with?(entry, Path.basename(path) <> ".previous-")
-              end)
-              |> Enum.map(&Path.join(directory, &1))
-              |> Enum.sort_by(&recovery_mtime/1, :desc)
-
-            {:error, _reason} ->
-              []
-          end
-      end
+    candidates = recovery_candidates(path)
 
     case candidates do
       [] ->
         :missing
 
       [candidate | _] ->
-        case File.read(candidate) do
-          {:ok, contents} ->
-            case decode(contents) do
-              {:ok, state} ->
-                if String.contains?(Path.basename(candidate), ".tmp-"),
-                  do: {:ok, state},
-                  else: {:error, {:journal_recovery_required, candidate}}
-
-              {:error, reason} ->
-                {:error, {:invalid_recovery_journal, candidate, reason}}
-            end
-
-          {:error, reason} ->
-            {:error, {:recovery_read_failed, candidate, reason}}
-        end
+        read_recovery_candidate(candidate)
     end
+  end
+
+  defp recovery_candidates(path) do
+    case File.ls(Path.dirname(path)) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&recovery_entry?(&1, Path.basename(path)))
+        |> Enum.map(&Path.join(Path.dirname(path), &1))
+        |> Enum.sort_by(&recovery_mtime/1, :desc)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp recovery_entry?(entry, basename) do
+    String.starts_with?(entry, basename <> ".tmp-") or
+      String.starts_with?(entry, basename <> ".previous-")
+  end
+
+  defp read_recovery_candidate(candidate) do
+    with {:ok, contents} <- File.read(candidate),
+         {:ok, state} <- decode(contents) do
+      recovery_state(candidate, state)
+    else
+      {:error, {:invalid_journal, reason}} ->
+        {:error, {:invalid_recovery_journal, candidate, reason}}
+
+      {:error, reason} ->
+        {:error, {:recovery_read_failed, candidate, reason}}
+    end
+  end
+
+  defp recovery_state(candidate, state) do
+    if String.contains?(Path.basename(candidate), ".tmp-"),
+      do: {:ok, state},
+      else: {:error, {:journal_recovery_required, candidate}}
   end
 
   defp recovery_mtime(path) do
@@ -264,8 +269,10 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
       {:ok, handle} ->
         chmod_result = File.chmod(path, 0o600)
 
+        result = with :ok <- chmod_result, do: :file.write(handle, contents)
+
         try do
-          with :ok <- chmod_result, :ok <- :file.write(handle, contents), do: :ok
+          result
         after
           :file.close(handle)
         end
@@ -281,24 +288,34 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
         :ok
 
       {:error, :eexist} ->
-        backup_path = "#{path}.previous-#{System.unique_integer([:positive])}"
-
-        with :ok <- File.rename(path, backup_path),
-             :ok <- File.rename(temporary_path, path) do
-          _ = File.rm(backup_path)
-          :ok
-        else
-          {:error, reason} ->
-            _ = File.rm(path)
-
-            case File.rename(backup_path, path) do
-              :ok -> {:error, {:rename_failed, reason}}
-              {:error, restore_reason} -> {:error, {:rename_failed, reason, {:restore_failed, restore_reason}}}
-            end
-        end
+        replace_existing_file(temporary_path, path)
 
       {:error, reason} ->
         {:error, {:rename_failed, reason}}
+    end
+  end
+
+  defp replace_existing_file(temporary_path, path) do
+    backup_path = "#{path}.previous-#{System.unique_integer([:positive])}"
+
+    with :ok <- File.rename(path, backup_path),
+         :ok <- File.rename(temporary_path, path) do
+      _ = File.rm(backup_path)
+      :ok
+    else
+      {:error, reason} -> restore_previous_file(backup_path, path, reason)
+    end
+  end
+
+  defp restore_previous_file(backup_path, path, reason) do
+    _ = File.rm(path)
+
+    case File.rename(backup_path, path) do
+      :ok ->
+        {:error, {:rename_failed, reason}}
+
+      {:error, restore_reason} ->
+        {:error, {:rename_failed, reason, {:restore_failed, restore_reason}}}
     end
   end
 end
