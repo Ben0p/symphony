@@ -3,11 +3,14 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
 
   alias SymphonyElixir.{ExecutionFence, ResponsibilityGraph, RuntimeIdentity}
 
+  @source_head_1 String.duplicate("1", 40)
+  @source_head_2 String.duplicate("2", 40)
+
   @env %{
     "SYMPHONY_POOL_KEY" => "pool-engineering",
     "SYMPHONY_REPOSITORY_REF" => "openai/symphony",
-    "SYMPHONY_ACCEPTED_SOURCE_HEAD" => "source-head-1",
-    "SYMPHONY_CURRENT_SOURCE_HEAD" => "source-head-1"
+    "SYMPHONY_ACCEPTED_SOURCE_HEAD" => @source_head_1,
+    "SYMPHONY_CURRENT_SOURCE_HEAD" => @source_head_1
   }
 
   @pause %{configured?: true, paused?: false, state: "running", path: "/run/symphony/pause", reason: nil}
@@ -27,7 +30,7 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
              repository_ref: "openai/symphony",
              workspace_root: "/srv/symphony/workspaces",
              global_pause_file: "/run/symphony/pause",
-             accepted_source_head: "source-head-1",
+             accepted_source_head: @source_head_1,
              status: "configured",
              source_head_status: "verified"
            }
@@ -52,7 +55,7 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
   test "a changed observed source head makes readiness stale" do
     snapshot =
       RuntimeIdentity.snapshot(ExecutionFence.new(), enforced_graph(),
-        env: Map.put(@env, "SYMPHONY_CURRENT_SOURCE_HEAD", "source-head-2"),
+        env: Map.put(@env, "SYMPHONY_CURRENT_SOURCE_HEAD", @source_head_2),
         workspace_root: "/srv/symphony/workspaces",
         pause_snapshot: @pause,
         managed_pool?: true,
@@ -63,6 +66,68 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
     assert snapshot.runtime_identity.source_head_status == "stale"
     assert snapshot.readiness.ready? == false
     assert "accepted_source_head_stale" in snapshot.readiness.reasons
+  end
+
+  test "a missing observed source head keeps managed readiness unverified" do
+    snapshot =
+      RuntimeIdentity.snapshot(ExecutionFence.new(), enforced_graph(),
+        env:
+          @env
+          |> Map.delete("SYMPHONY_CURRENT_SOURCE_HEAD")
+          |> Map.put("SYMPHONY_SOURCE_HEAD", @source_head_1),
+        workspace_root: "/srv/symphony/workspaces",
+        pause_snapshot: @pause,
+        managed_pool?: true,
+        managed_runtime_configured?: true
+      )
+
+    assert snapshot.runtime_identity.status == "configured"
+    assert snapshot.runtime_identity.source_head_status == "unverified"
+    assert snapshot.readiness.ready? == false
+    assert "accepted_source_head_unverified" in snapshot.readiness.reasons
+  end
+
+  test "source revisions must be full Git object IDs" do
+    snapshot =
+      RuntimeIdentity.snapshot(ExecutionFence.new(), enforced_graph(),
+        env: Map.put(@env, "SYMPHONY_ACCEPTED_SOURCE_HEAD", "source-head-1"),
+        workspace_root: "/srv/symphony/workspaces",
+        pause_snapshot: @pause,
+        managed_pool?: true,
+        managed_runtime_configured?: true
+      )
+
+    assert snapshot.runtime_identity.status == "invalid"
+    assert snapshot.runtime_identity.source_head_status == "invalid"
+    assert snapshot.readiness.ready? == false
+    assert "accepted_source_head_invalid" in snapshot.readiness.reasons
+
+    observed_invalid =
+      RuntimeIdentity.snapshot(ExecutionFence.new(), enforced_graph(),
+        env: Map.put(@env, "SYMPHONY_CURRENT_SOURCE_HEAD", "not-a-source-id"),
+        workspace_root: "/srv/symphony/workspaces",
+        pause_snapshot: @pause,
+        managed_pool?: true,
+        managed_runtime_configured?: true
+      )
+
+    assert observed_invalid.runtime_identity.source_head_status == "invalid"
+    assert "accepted_source_head_invalid" in observed_invalid.readiness.reasons
+  end
+
+  test "an enforced graph with no active delegation reports quiescent authority" do
+    snapshot =
+      RuntimeIdentity.snapshot(ExecutionFence.new(), %{enforced_graph() | delegations: %{}},
+        env: @env,
+        workspace_root: "/srv/symphony/workspaces",
+        pause_snapshot: @pause,
+        managed_pool?: true,
+        managed_runtime_configured?: true
+      )
+
+    assert snapshot.execution_authority.delegation_posture == "quiescent"
+    assert snapshot.execution_authority.status == "ready"
+    assert snapshot.readiness == %{ready?: true, status: "ready", reasons: []}
   end
 
   test "managed runtime with missing identity fails readiness" do

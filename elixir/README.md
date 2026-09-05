@@ -172,15 +172,17 @@ DAHLIA_RUNNER_ID=<scoped runner identity>
 DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
 
 # Launcher identity (required for managed-pool readiness)
-SYMPHONY_ACCEPTED_SOURCE_HEAD=<launcher-attested source revision>
+SYMPHONY_ACCEPTED_SOURCE_HEAD=<launcher-attested 40-character Git object ID>
 ```
 
 `DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
 private reservation journal and archive root. The archive root must be outside active workspaces.
 The `/api/v1/state` response reports the effective `SYMPHONY_POOL_KEY`,
 `SYMPHONY_REPOSITORY_REF`, workflow workspace root, `SYMPHONY_GLOBAL_PAUSE_FILE`, and the accepted
-source head under `runtime_identity`. A launcher may provide `SYMPHONY_CURRENT_SOURCE_HEAD` as an
-observed revision; a mismatch marks the identity stale and makes managed-pool readiness fail.
+source head under `runtime_identity`. The launcher must provide `SYMPHONY_CURRENT_SOURCE_HEAD` as
+the matching 40-character observed revision from its executable attestation; an absent or malformed
+observation leaves the source unverified and makes managed-pool readiness fail, while a mismatch
+marks the identity stale.
 The same response reports `execution_authority.fence` (`hgs294`) and `execution_authority.delegation`
 (`hgs300`) together with their posture derived from the durable fence and responsibility graph.
 No provider or attestation credential is included in this projection.

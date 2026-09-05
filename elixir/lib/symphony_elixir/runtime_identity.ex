@@ -35,7 +35,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
       cond do
         not managed_pool? and not managed_runtime_configured? -> "unmanaged"
         missing != [] -> "missing"
-        source_head_status == "stale" -> "stale"
+        source_head_status in ["stale", "invalid"] -> source_head_status
         true -> "configured"
       end
 
@@ -94,19 +94,26 @@ defmodule SymphonyElixir.RuntimeIdentity do
 
   defp source_head_status(accepted, env) do
     case {present?(accepted), current_source_head(env)} do
-      {false, _} -> "missing"
-      {true, nil} -> "unverified"
-      {true, current} when current == accepted -> "verified"
-      {true, _current} -> "stale"
+      {false, _} ->
+        "missing"
+
+      {true, current} ->
+        cond do
+          not valid_source_head?(accepted) -> "invalid"
+          is_nil(current) -> "unverified"
+          not valid_source_head?(current) -> "invalid"
+          current == accepted -> "verified"
+          true -> "stale"
+        end
     end
   end
 
-  # The launcher may provide the observed source revision under either name
-  # while the contract is rolled out.  No local Git command is used here: an
-  # installed escript need not contain a .git directory, so an absent observed
-  # value is truthfully reported as unverified rather than guessed.
+  # The launcher provides the one observed source revision from its executable
+  # attestation. No local Git command is used here: an installed escript need
+  # not contain a .git directory, so an absent observed value is truthfully
+  # reported as unverified rather than guessed.
   defp current_source_head(env) when is_map(env) do
-    value(env, "SYMPHONY_CURRENT_SOURCE_HEAD") || value(env, "SYMPHONY_SOURCE_HEAD")
+    value(env, "SYMPHONY_CURRENT_SOURCE_HEAD")
   end
 
   defp current_source_head(_env), do: nil
@@ -121,7 +128,9 @@ defmodule SymphonyElixir.RuntimeIdentity do
       fence_posture: fence_posture,
       delegation_posture: delegation_posture,
       status:
-        if(fence_posture in ["active", "quiescent"] and delegation_posture == "active",
+        if(
+          fence_posture in ["active", "quiescent"] and
+            delegation_posture in ["active", "quiescent"],
           do: "ready",
           else: "unknown"
         )
@@ -151,7 +160,11 @@ defmodule SymphonyElixir.RuntimeIdentity do
   defp delegation_posture(responsibility_state) do
     case ResponsibilityGraph.snapshot(responsibility_state) do
       %{enforcement: :enforced, delegations: delegations} when is_list(delegations) ->
-        if Enum.any?(delegations, &active_responsible?/1), do: "active", else: "missing"
+        cond do
+          Enum.any?(delegations, &active_responsible?/1) -> "active"
+          Enum.any?(delegations, &active_delegation?/1) -> "missing"
+          true -> "quiescent"
+        end
 
       %{enforcement: :manual} ->
         "manual"
@@ -164,6 +177,8 @@ defmodule SymphonyElixir.RuntimeIdentity do
   defp active_responsible?(delegation),
     do: delegation.role == :responsible and delegation.status == :active
 
+  defp active_delegation?(delegation), do: delegation.status == :active
+
   defp readiness_reasons(managed_pool?, managed_runtime_configured?, missing, source_head_status, authority) do
     required? = managed_pool? or managed_runtime_configured?
 
@@ -172,6 +187,8 @@ defmodule SymphonyElixir.RuntimeIdentity do
     |> add_missing_reasons(missing, required?)
     |> maybe_reason(required? and source_head_status == "stale", "accepted_source_head_stale")
     |> maybe_reason(required? and source_head_status == "missing", "accepted_source_head_missing")
+    |> maybe_reason(required? and source_head_status == "unverified", "accepted_source_head_unverified")
+    |> maybe_reason(required? and source_head_status == "invalid", "accepted_source_head_invalid")
     |> maybe_reason(required? and authority.status != "ready", "execution_authority_unavailable")
     |> Enum.uniq()
   end
@@ -206,4 +223,7 @@ defmodule SymphonyElixir.RuntimeIdentity do
   defp blank?(value), do: not present?(value)
 
   defp present?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp valid_source_head?(value),
+    do: is_binary(value) and Regex.match?(~r/\A[0-9a-fA-F]{40}\z/, String.trim(value))
 end
