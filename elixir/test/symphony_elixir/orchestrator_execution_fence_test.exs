@@ -198,6 +198,156 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
     assert next_token.generation == 2
   end
 
+  test "ordinary replay filters acknowledged history before applying its batch limit" do
+    journal_path =
+      Path.join(System.tmp_dir!(), "symphony-cleanup-starvation-#{System.unique_integer([:positive])}.json")
+
+    on_exit(fn -> File.rm(journal_path) end)
+
+    {fence_state, executions} =
+      Enum.reduce(0..9, {ExecutionFence.new(), []}, fn index, {fence, acc} ->
+        {next_fence, details} = replay_cleaned_execution(fence, index)
+        {next_fence, [details | acc]}
+      end)
+
+    profile = "profile-350-starvation"
+
+    journal =
+      Enum.reduce(executions, Journal.new(), fn details, current_journal ->
+        reservation = replay_reservation(details, profile)
+        key = Journal.reservation_key(details.issue_id, profile, details.repository, 1)
+
+        {:ok, current_journal} = Journal.put(current_journal, key, reservation)
+
+        {:ok, current_journal} =
+          Journal.put_cleanup_receipt(
+            current_journal,
+            key,
+            "termination_confirmed",
+            %{
+              receipt_id: "termination-#{details.index}",
+              receipt_kind: "termination_confirmed",
+              generation: 1,
+              evidence_ref: details.evidence_ref,
+              accepted_head: details.head
+            }
+          )
+
+        termination_ack = %{
+          projection_id: reservation.projection_id,
+          reservation_id: reservation.reservation_id,
+          receipt_id: "termination-#{details.index}",
+          receipt_kind: "termination_confirmed",
+          execution_capacity_state: "released",
+          scope_state: "released",
+          reservation_state: "released",
+          generation: 1,
+          evidence_ref: details.evidence_ref,
+          accepted_head: details.head,
+          replayed: false
+        }
+
+        {:ok, current_journal} =
+          Journal.put_cleanup_receipt_ack(
+            current_journal,
+            key,
+            "termination_confirmed",
+            termination_ack
+          )
+
+        if details.index < 9 do
+          {:ok, current_journal} =
+            Journal.put_cleanup_receipt(
+              current_journal,
+              key,
+              "repository_cleanup_verified",
+              %{
+                receipt_id: "repository-#{details.index}",
+                receipt_kind: "repository_cleanup_verified",
+                generation: 1,
+                evidence_ref: "sha256:cleanup-#{details.index}",
+                accepted_head: details.head
+              }
+            )
+
+          repository_ack = %{
+            projection_id: reservation.projection_id,
+            reservation_id: reservation.reservation_id,
+            receipt_id: "repository-#{details.index}",
+            receipt_kind: "repository_cleanup_verified",
+            execution_capacity_state: "released",
+            scope_state: "released",
+            reservation_state: "released",
+            generation: 1,
+            evidence_ref: "sha256:cleanup-#{details.index}",
+            accepted_head: details.head,
+            replayed: false
+          }
+
+          {:ok, current_journal} =
+            Journal.put_cleanup_receipt_ack(
+              current_journal,
+              key,
+              "repository_cleanup_verified",
+              repository_ack
+            )
+
+          current_journal
+        else
+          current_journal
+        end
+      end)
+
+    assert :ok = Journal.save(journal_path, journal)
+    Process.put(:starvation_receipt_calls, 0)
+
+    request_fun = fn _url, options ->
+      Process.put(:starvation_receipt_calls, Process.get(:starvation_receipt_calls) + 1)
+      payload = Keyword.fetch!(options, :json)
+      assert payload["receiptKind"] == "repository_cleanup_verified"
+
+      {:ok,
+       provider_response(%{
+         "projectionId" => "projection-9",
+         "reservationId" => "reservation-9",
+         "receiptId" => payload["receiptId"],
+         "receiptKind" => "repository_cleanup_verified",
+         "executionCapacityState" => "released",
+         "scopeState" => "released",
+         "reservationState" => "released",
+         "generation" => 1,
+         "evidenceRef" => payload["evidenceRef"],
+         "acceptedHead" => payload["acceptedHead"],
+         "replayed" => false
+       })}
+    end
+
+    runtime = %{
+      base_url: "http://provider.test",
+      runner_token: "runner-token",
+      attestation_key: "attestation-key",
+      runner_id: "runner-starvation",
+      managed_project_profile_id: profile,
+      journal_path: journal_path,
+      request_fun: request_fun,
+      now_fun: fn -> ~U[2026-09-06 10:10:00.000Z] end,
+      cleanup_evidence_fun: fn _state, _token, _head -> {:ok, "sha256:cleanup-9"} end
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 0,
+      execution_fence: fence_state,
+      work_package_runtime: runtime,
+      running: %{},
+      blocked: %{},
+      claimed: MapSet.new()
+    }
+
+    assert {:noreply, _next_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+    assert Process.get(:starvation_receipt_calls) == 1
+  end
+
   test "restart reconciliation stops and confirms persisted supervisor ownership" do
     admission = admission()
     {:ok, fence_state, token} = ExecutionFence.admit(ExecutionFence.new(), admission, 100)
@@ -549,6 +699,80 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
       head: "abc123",
       last_heartbeat_at: 100
     })
+  end
+
+  defp replay_cleaned_execution(fence, index) do
+    issue_id = "HGS-350-starvation-#{index}"
+    repository = "openai/symphony-#{index}"
+    head = "head-#{index}"
+    admission = %{issue_id: issue_id, repository: repository, branch: "codex/#{index}", worktree: "/tmp/#{issue_id}"}
+    session_id = "worker-starvation-#{index}"
+
+    {:ok, fence, token} = ExecutionFence.admit(fence, admission, 100)
+
+    session = %{
+      issue_id: issue_id,
+      repository: repository,
+      branch: admission.branch,
+      worktree: admission.worktree,
+      generation: 1,
+      role: :worker,
+      session_id: session_id,
+      process_id: "process-starvation-#{index}",
+      linear_state: "In Progress",
+      pr_state: "OPEN",
+      head: head,
+      last_heartbeat_at: 100
+    }
+
+    {:ok, fence, :registered} = ExecutionFence.register(fence, token, :worker, session, 100)
+    {:ok, fence, :released} = ExecutionFence.release(fence, token, session_id, :orchestrator_stop)
+
+    evidence = %{
+      session_id: session_id,
+      process_id: session.process_id,
+      process_tree: :terminated,
+      evidence_ref: "process-tree-starvation-#{index}",
+      observed_at_ms: 110
+    }
+
+    {:ok, fence, :confirmed} = ExecutionFence.confirm_termination(fence, token, session_id, evidence, 110)
+    {:ok, fence, :fenced} = ExecutionFence.fence(fence, token, %{terminal_state: "Done", accepted_head: head}, 120)
+    {:ok, fence, :prepared} = ExecutionFence.prepare_cleanup(fence, token, head, 121)
+    {:ok, fence} = ExecutionFence.record_cleanup_evidence(fence, token, head, "sha256:cleanup-#{index}", 122)
+    {:ok, fence, :cleaned} = ExecutionFence.cleanup(fence, token, head, 123)
+
+    {fence,
+     %{
+       index: index,
+       issue_id: issue_id,
+       repository: repository,
+       session_id: session_id,
+       process_id: session.process_id,
+       head: head,
+       evidence_ref: evidence.evidence_ref,
+       projection_id: "projection-#{index}",
+       reservation_id: "reservation-#{index}"
+     }}
+  end
+
+  defp replay_reservation(details, profile) do
+    %{
+      issue_id: details.issue_id,
+      managed_project_profile_id: profile,
+      repository_ref: details.repository,
+      projection_id: details.projection_id,
+      reservation_id: details.reservation_id,
+      reservation_nonce: "nonce-#{details.index}",
+      scope_keys: ["repo:#{details.repository}"],
+      runner_id: "runner-starvation",
+      generation: 1,
+      session_id: details.session_id,
+      process_id: details.process_id,
+      responsible_delegation_id: "delegation-#{details.index}",
+      execution_fence_token: "#{details.issue_id}:1",
+      runtime_lease_id: details.session_id
+    }
   end
 
   defp provider_response(data), do: %Req.Response{status: 200, body: %{"data" => data}}

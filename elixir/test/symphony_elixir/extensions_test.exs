@@ -426,6 +426,57 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
+  test "phoenix state response includes managed runtime identity and readiness" do
+    orchestrator_name = Module.concat(__MODULE__, :RuntimeIdentityOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> Map.merge(%{
+        runtime_identity: %{
+          pool_key: "pool-engineering",
+          repository_ref: "openai/symphony",
+          workspace_root: "/srv/symphony/workspaces",
+          global_pause_file: "/run/symphony/pause",
+          accepted_source_head: "source-head-1",
+          status: "configured",
+          source_head_status: "verified"
+        },
+        execution_authority: %{
+          fence: "hgs294",
+          delegation: "hgs300",
+          fence_posture: "quiescent",
+          delegation_posture: "active",
+          status: "ready"
+        },
+        managed_work_package: %{required?: true, configured?: true, state: "configured"},
+        readiness: %{ready?: true, status: "ready", reasons: []}
+      })
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    response = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert response["runtime_identity"]["pool_key"] == "pool-engineering"
+    assert response["runtime_identity"]["accepted_source_head"] == "source-head-1"
+
+    assert response["execution_authority"] == %{
+             "fence" => "hgs294",
+             "delegation" => "hgs300",
+             "fence_posture" => "quiescent",
+             "delegation_posture" => "active",
+             "status" => "ready"
+           }
+
+    assert response["managed_work_package"] == %{
+             "required?" => true,
+             "configured?" => true,
+             "state" => "configured"
+           }
+
+    assert response["readiness"] == %{"ready?" => true, "status" => "ready", "reasons" => []}
+  end
+
   test "phoenix observability api preserves snapshot timeout behavior" do
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)

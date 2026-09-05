@@ -170,10 +170,20 @@ DAHLIA_WORK_PACKAGE_RUNNER_TOKEN=<host-injected secret>
 DAHLIA_WORK_PACKAGE_ATTESTATION_KEY=<host-injected secret>
 DAHLIA_RUNNER_ID=<scoped runner identity>
 DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
+
+# Launcher identity (required for managed-pool readiness)
+SYMPHONY_ACCEPTED_SOURCE_HEAD=<launcher-attested source revision>
 ```
 
 `DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
 private reservation journal and archive root. The archive root must be outside active workspaces.
+The `/api/v1/state` response reports the effective `SYMPHONY_POOL_KEY`,
+`SYMPHONY_REPOSITORY_REF`, workflow workspace root, `SYMPHONY_GLOBAL_PAUSE_FILE`, and the accepted
+source head under `runtime_identity`. A launcher may provide `SYMPHONY_CURRENT_SOURCE_HEAD` as an
+observed revision; a mismatch marks the identity stale and makes managed-pool readiness fail.
+The same response reports `execution_authority.fence` (`hgs294`) and `execution_authority.delegation`
+(`hgs300`) together with their posture derived from the durable fence and responsibility graph.
+No provider or attestation credential is included in this projection.
 The local Linux path uses the systemd user supervisor and records the claim, process-tree proof,
 and archive evidence before releasing provider capacity. Remote SSH workers remain held when this
 proof or the independent archive verifier is unavailable. These provider credentials are scrubbed

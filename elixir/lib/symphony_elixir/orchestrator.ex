@@ -14,15 +14,18 @@ defmodule SymphonyElixir.Orchestrator do
     ExecutionSupervisor,
     GlobalPause,
     ResponsibilityGraph,
+    RuntimeIdentity,
     StartupMaintenance,
     StatusDashboard,
     Tracker,
     WorkPackageClaim,
     WorkPackageCleanupReceipt,
+    WorkPackageRuntime,
     Workspace
   }
 
   alias SymphonyElixir.ExecutionFence.Persistence
+  alias SymphonyElixir.WorkPackageClaim.Journal
   alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
   alias SymphonyElixir.Tracker.Issue
 
@@ -2446,7 +2449,7 @@ defmodule SymphonyElixir.Orchestrator do
        when is_map(runtime) do
     actions =
       Enum.flat_map(state.execution_fence.executions, fn {issue_id, execution} ->
-        token = %{issue_id: issue_id, generation: execution.generation}
+        token = %{issue_id: issue_id, generation: execution.generation, repository_ref: execution.repository}
 
         termination_actions =
           Enum.flat_map(execution.leases, fn {_session_id, lease} ->
@@ -2475,6 +2478,7 @@ defmodule SymphonyElixir.Orchestrator do
       end)
 
     actions
+    |> Enum.filter(&cleanup_receipt_pending?(runtime, &1))
     |> Enum.take(@cleanup_receipt_replay_limit)
     |> Enum.reduce(state, fn
       {:termination, token, session_id, evidence, issue, outcome}, current_state ->
@@ -2494,6 +2498,91 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp replay_persisted_cleanup_receipts(state), do: state
+
+  # Acknowledged receipts are durable and need no further provider call.  Filter
+  # them before taking the bounded replay batch; otherwise a large historical
+  # journal can permanently starve a newer pending receipt.  An unreadable or
+  # malformed journal/ack deliberately remains pending so the normal submit
+  # path logs the concrete validation error instead of silently hiding it.
+  defp cleanup_receipt_pending?(runtime, {kind, token, _session_id, _evidence, _issue, _outcome})
+       when kind == :termination do
+    cleanup_receipt_pending?(runtime, token, "termination_confirmed")
+  end
+
+  defp cleanup_receipt_pending?(runtime, {kind, token, _head, _outcome}) when kind == :repository do
+    cleanup_receipt_pending?(runtime, token, "repository_cleanup_verified")
+  end
+
+  defp cleanup_receipt_pending?(_runtime, _action), do: true
+
+  defp cleanup_receipt_pending?(runtime, token, receipt_kind)
+       when is_map(runtime) and is_map(token) and is_binary(receipt_kind) do
+    with issue_id when is_binary(issue_id) <- Map.get(token, :issue_id),
+         generation when is_integer(generation) and generation > 0 <- Map.get(token, :generation),
+         profile_id when is_binary(profile_id) <- Map.get(runtime, :managed_project_profile_id),
+         repository_ref when is_binary(repository_ref) <- Map.get(token, :repository_ref),
+         path when is_binary(path) <- Map.get(runtime, :journal_path),
+         {:ok, journal} <- load_cleanup_journal(path),
+         key <- Journal.reservation_key(issue_id, profile_id, repository_ref, generation),
+         reservation when is_map(reservation) <- Map.get(journal.reservations, key),
+         {:ok, semantic} <- Journal.cleanup_receipt(journal, key, receipt_kind),
+         {:ok, acknowledgement} <- Journal.cleanup_receipt_ack(journal, key, receipt_kind),
+         true <- valid_replayed_ack?(semantic, acknowledgement, reservation, receipt_kind) do
+      false
+    else
+      _ -> true
+    end
+  end
+
+  defp load_cleanup_journal(path) do
+    case Journal.load(path) do
+      :missing -> {:ok, Journal.new()}
+      {:ok, journal} -> {:ok, journal}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp valid_replayed_ack?(semantic, acknowledgement, reservation, receipt_kind)
+       when is_map(semantic) and is_map(acknowledgement) and is_map(reservation) do
+    expected = %{
+      projection_id: Map.get(reservation, :projection_id),
+      reservation_id: Map.get(reservation, :reservation_id),
+      receipt_id: Map.get(semantic, :receipt_id),
+      receipt_kind: receipt_kind,
+      generation: Map.get(reservation, :generation),
+      evidence_ref: Map.get(semantic, :evidence_ref),
+      accepted_head: Map.get(semantic, :accepted_head),
+      execution_capacity_state: "released"
+    }
+
+    semantic_complete? =
+      Enum.all?([:receipt_id, :evidence_ref, :accepted_head], &present_string?(Map.get(semantic, &1)))
+
+    semantic_identity? =
+      Map.get(semantic, :receipt_kind) == receipt_kind and
+        Map.get(semantic, :generation) == Map.get(reservation, :generation)
+
+    acknowledgement_complete? = Enum.all?(expected, fn {_field, value} -> not is_nil(value) end)
+    values_match? = Enum.all?(expected, fn {field, value} -> Map.get(acknowledgement, field) == value end)
+
+    state_match? =
+      case receipt_kind do
+        "termination_confirmed" ->
+          {Map.get(acknowledgement, :scope_state), Map.get(acknowledgement, :reservation_state)} in [{"held", "claimed"}, {"released", "released"}]
+
+        "repository_cleanup_verified" ->
+          {Map.get(acknowledgement, :scope_state), Map.get(acknowledgement, :reservation_state)} ==
+            {"released", "released"}
+
+        _ ->
+          false
+      end
+
+    semantic_complete? and semantic_identity? and acknowledgement_complete? and values_match? and state_match? and
+      is_boolean(Map.get(acknowledgement, :replayed))
+  end
+
+  defp valid_replayed_ack?(_semantic, _acknowledgement, _reservation, _receipt_kind), do: false
 
   defp defer_startup_workspace_cleanup(%Issue{} = issue) do
     Logger.info("Deferring startup cleanup for terminal issue #{issue_context(issue)} until its persisted execution fence is reconciled")
@@ -3337,6 +3426,14 @@ defmodule SymphonyElixir.Orchestrator do
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
 
+    identity_snapshot =
+      RuntimeIdentity.snapshot(
+        state.execution_fence,
+        state.responsibility_graph,
+        managed_pool?: WorkPackageRuntime.managed_pool?(),
+        managed_runtime_configured?: is_map(state.work_package_runtime)
+      )
+
     running =
       state.running
       |> Enum.map(fn {issue_id, metadata} ->
@@ -3414,6 +3511,10 @@ defmodule SymphonyElixir.Orchestrator do
        rate_limits: Map.get(state, :codex_rate_limits),
        pause_gate: GlobalPause.snapshot(),
        startup_maintenance: StartupMaintenance.snapshot(state.startup_maintenance),
+       runtime_identity: identity_snapshot.runtime_identity,
+       execution_authority: identity_snapshot.execution_authority,
+       managed_work_package: identity_snapshot.managed_work_package,
+       readiness: identity_snapshot.readiness,
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
