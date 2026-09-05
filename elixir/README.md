@@ -126,6 +126,27 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
+- `--activate-responsibility-graph` performs the one-time local transition from manual to
+  machine-enforced responsibility admission after the runtime starts
+
+The activation switch is intended for the current COO or explicitly delegated runtime owner
+while the global mutable-admission gate is paused. It requires a declared managed pool, the
+complete `DAHLIA_WORK_PACKAGE_*` runtime tuple, and an exact `paused` global pause file. The
+default remains manual, and an already enforced graph returns success without changing its
+persisted state. The launcher never enables this switch implicitly; the authorized local start
+command is:
+
+```bash
+./bin/symphony \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --activate-responsibility-graph \
+  /path/to/WORKFLOW.md
+```
+
+The command only changes the existing responsibility graph snapshot. It does not clear the
+pause gate, create delegations, admit an issue, or start a worker. Restarting with the same
+switch reloads the persisted `enforced` graph and is idempotent; remove the switch to retain the
+manual default for a fresh graph.
 
 ### Private runner call-home
 
