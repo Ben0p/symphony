@@ -35,20 +35,88 @@ defmodule SymphonyElixir.Linear.RateLimiterTest do
   end
 
   test "serializes concurrent callers through the shared state file", %{tracker_settings: tracker_settings} do
-    timestamps =
+    parent = self()
+
+    tasks =
       1..3
-      |> Task.async_stream(
-        fn _ ->
-          assert :ok = RateLimiter.await(tracker_settings)
-          System.monotonic_time(:millisecond)
-        end,
-        max_concurrency: 3,
-        timeout: 2_000
-      )
-      |> Enum.map(fn {:ok, timestamp} -> timestamp end)
+      |> Enum.map(fn _ ->
+        Task.async(fn ->
+          send(parent, {:rate_limiter_ready, self()})
+
+          receive do
+            :start ->
+              assert :ok = RateLimiter.await(tracker_settings)
+              System.monotonic_time(:millisecond)
+          end
+        end)
+      end)
+
+    Enum.each(tasks, fn _task ->
+      assert_receive {:rate_limiter_ready, _pid}, 1_000
+    end)
+
+    started_at = System.monotonic_time(:millisecond)
+    Enum.each(tasks, fn %Task{pid: pid} -> send(pid, :start) end)
+
+    timestamps =
+      tasks
+      |> Enum.map(&Task.await(&1, 2_000))
       |> Enum.sort()
 
-    assert Enum.at(timestamps, 2) - Enum.at(timestamps, 0) >= 70
+    assert Enum.max(timestamps) - started_at >= 70
+  end
+
+  test "does not evict a live lock after its stale interval", %{tracker_settings: tracker_settings} do
+    lock_path = tracker_settings.provider["rate_limit_file"] <> ".lock"
+    parent = self()
+
+    owner =
+      Task.async(fn ->
+        {:ok, io} = File.open(lock_path, [:write, :exclusive, :binary])
+
+        metadata =
+          [
+            "symphony-linear-rate-lock-v1",
+            to_string(:os.getpid()),
+            Integer.to_string(System.system_time(:millisecond)),
+            "test-owner"
+          ]
+          |> Enum.join("\n")
+
+        :ok = IO.binwrite(io, metadata)
+        :ok = File.touch(lock_path, System.system_time(:second) - 1)
+        send(parent, :live_lock_ready)
+        Process.sleep(175)
+        File.close(io)
+        File.rm(lock_path)
+      end)
+
+    assert_receive :live_lock_ready, 1_000
+    started_at = System.monotonic_time(:millisecond)
+    assert :ok = RateLimiter.await(tracker_settings)
+    assert System.monotonic_time(:millisecond) - started_at >= 150
+    assert :ok = Task.await(owner, 2_000)
+  end
+
+  test "does not evict an incomplete live lock after its stale interval", %{tracker_settings: tracker_settings} do
+    lock_path = tracker_settings.provider["rate_limit_file"] <> ".lock"
+    parent = self()
+
+    owner =
+      Task.async(fn ->
+        {:ok, io} = File.open(lock_path, [:write, :exclusive, :binary])
+        :ok = File.touch(lock_path, System.system_time(:second) - 1)
+        send(parent, :incomplete_lock_ready)
+        Process.sleep(175)
+        File.close(io)
+        File.rm(lock_path)
+      end)
+
+    assert_receive :incomplete_lock_ready, 1_000
+    started_at = System.monotonic_time(:millisecond)
+    assert :ok = RateLimiter.await(tracker_settings)
+    assert System.monotonic_time(:millisecond) - started_at >= 150
+    assert :ok = Task.await(owner, 2_000)
   end
 
   test "honors a bounded retry-after cooldown", %{tracker_settings: tracker_settings} do

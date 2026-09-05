@@ -5,6 +5,8 @@ defmodule SymphonyElixir.Linear.RateLimiter do
   Each pool is a separate OS process, so an in-memory limiter cannot protect
   the shared Linear API key. A short-lived exclusive lock and a wall-clock
   reservation timestamp in a shared file provide a small host-local gate.
+  Lock metadata records the owner OS process so stale cleanup cannot evict a
+  live lock when its BEAM owner is briefly descheduled.
   """
 
   require Logger
@@ -14,6 +16,7 @@ defmodule SymphonyElixir.Linear.RateLimiter do
   @default_stale_lock_ms 5_000
   @default_max_retry_after_ms 3_600_000
   @lock_poll_ms 10
+  @lock_metadata_version "symphony-linear-rate-lock-v1"
 
   @type settings :: %{
           state_path: Path.t(),
@@ -166,12 +169,16 @@ defmodule SymphonyElixir.Linear.RateLimiter do
   defp acquire_lock(settings, fun, started_at) do
     case File.open(settings.lock_path, [:write, :exclusive, :binary]) do
       {:ok, io} ->
+        lock_token = lock_token()
+
         result =
           try do
-            fun.()
+            with :ok <- write_lock_metadata(io, lock_token) do
+              fun.()
+            end
           after
             File.close(io)
-            File.rm(settings.lock_path)
+            release_lock(settings.lock_path, lock_token)
           end
 
         case result do
@@ -202,13 +209,100 @@ defmodule SymphonyElixir.Linear.RateLimiter do
   end
 
   defp stale_lock?(path, stale_lock_ms) do
-    case File.stat(path, time: :posix) do
-      {:ok, %File.Stat{mtime: modified_at}} when is_integer(modified_at) ->
-        System.system_time(:millisecond) - modified_at * 1_000 >= stale_lock_ms
+    case File.read(path) do
+      {:ok, content} ->
+        case parse_lock_metadata(content) do
+          {:ok, pid, created_at_ms} ->
+            lock_expired?(created_at_ms, stale_lock_ms) and not pid_alive?(pid)
 
-      _ ->
+          # A newly-created lock can be observed before its metadata write if
+          # its BEAM owner is descheduled. Treat incomplete or legacy locks as
+          # live so that stale cleanup cannot evict an active reservation.
+          :error ->
+            false
+        end
+
+      {:error, _reason} ->
         false
     end
+  end
+
+  defp lock_token do
+    [@lock_metadata_version, to_string(:os.getpid()), Integer.to_string(System.system_time(:millisecond)), Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)]
+    |> Enum.join("\n")
+  end
+
+  defp write_lock_metadata(io, lock_token) do
+    case IO.binwrite(io, lock_token) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:linear_rate_limit_lock_metadata_write_failed, reason}}
+    end
+  end
+
+  defp release_lock(path, lock_token) do
+    case File.read(path) do
+      {:ok, ^lock_token} ->
+        _ = File.rm(path)
+        :ok
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp parse_lock_metadata(content) when is_binary(content) do
+    case String.split(content, "\n", trim: true) do
+      [@lock_metadata_version, pid, created_at_ms, _random_token] ->
+        with {:ok, pid} <- parse_os_pid(pid),
+             {created_at_ms, ""} <- Integer.parse(created_at_ms) do
+          {:ok, pid, created_at_ms}
+        else
+          _ -> :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_lock_metadata(_content), do: :error
+
+  defp parse_os_pid(pid) do
+    case Integer.parse(pid) do
+      {pid, ""} when pid > 0 -> {:ok, Integer.to_string(pid)}
+      _ -> :error
+    end
+  end
+
+  defp lock_expired?(created_at_ms, stale_lock_ms) do
+    System.system_time(:millisecond) - created_at_ms >= stale_lock_ms
+  end
+
+  defp pid_alive?(pid) when is_binary(pid) do
+    case :os.type() do
+      {:unix, _name} ->
+        case System.cmd("kill", ["-0", pid], stderr_to_stdout: true) do
+          {_output, 0} -> true
+          {_output, 1} -> false
+          _other -> true
+        end
+
+      {:win32, _name} ->
+        case System.cmd("tasklist", ["/FI", "PID eq #{pid}", "/NH"], stderr_to_stdout: true) do
+          {output, 0} ->
+            output
+            |> String.downcase()
+            |> then(&(not String.contains?(&1, "no tasks")))
+
+          _other ->
+            true
+        end
+
+      _other ->
+        true
+    end
+  rescue
+    _error -> true
   end
 
   defp retry_after_ms(response, max_retry_after_ms) do
