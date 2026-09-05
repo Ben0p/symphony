@@ -924,6 +924,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end)
 
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    stale_activity_monotonic_ms = System.monotonic_time(:millisecond) - 5_000
     initial_state = :sys.get_state(pid)
 
     running_entry = %{
@@ -940,7 +941,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: stale_activity_at,
       last_codex_event: :notification,
-      started_at: stale_activity_at
+      started_at: stale_activity_at,
+      started_monotonic_ms: stale_activity_monotonic_ms,
+      codex_last_activity_monotonic_ms: stale_activity_monotonic_ms,
+      codex_last_activity_method: "item/reasoning/completed"
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
@@ -957,6 +961,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
 
     assert %{
              attempt: 1,
@@ -970,6 +975,582 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     assert remaining_ms >= 9_500
     assert remaining_ms <= 10_500
+
+    send(pid, :tick)
+    Process.sleep(100)
+    reserved_state = :sys.get_state(pid)
+
+    refute Map.has_key?(reserved_state.running, issue_id)
+    assert reserved_state.retry_attempts[issue_id].attempt == 1
+    assert MapSet.member?(reserved_state.claimed, issue_id)
+
+    assert %{
+             reason: "codex_no_activity",
+             restart_count: 1,
+             threshold_ms: 1_000,
+             worker_process_alive: true,
+             session_id: "thread-stall-turn-stall",
+             token_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0}
+           } = state.retry_attempts[issue_id].stall_diagnostic
+  end
+
+  test "orchestrator stops a worker after bounded consecutive stall recovery is exhausted" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000,
+      codex_max_stall_retries: 3
+    )
+
+    issue_id = "issue-stall-exhausted"
+    orchestrator_name = Module.concat(__MODULE__, :StallExhaustedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    stale_activity_monotonic_ms = System.monotonic_time(:millisecond) - 5_000
+    initial_state = :sys.get_state(pid)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-STALL-EXHAUSTED",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-STALL-EXHAUSTED",
+      dispatchable: true
+    }
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-stall-exhausted",
+      codex_app_server_pid: 4242,
+      codex_input_tokens: 120,
+      codex_output_tokens: 30,
+      codex_total_tokens: 150,
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: stale_activity_at,
+      last_codex_event: :notification,
+      started_at: stale_activity_at,
+      started_monotonic_ms: stale_activity_monotonic_ms,
+      codex_last_activity_monotonic_ms: stale_activity_monotonic_ms,
+      codex_last_activity_method: "item/reasoning/completed"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:stall_restarts, %{issue_id => 3})
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    assert %{
+             error: "codex stalled 4 consecutive times; automatic recovery exhausted",
+             stall_diagnostic: %{
+               reason: "codex_no_activity",
+               restart_count: 4,
+               worker_process_alive: true,
+               codex_app_server_pid: 4242,
+               token_totals: %{input_tokens: 120, output_tokens: 30, total_tokens: 150}
+             }
+           } = state.blocked[issue_id]
+
+    assert %{blocked: [%{stall_diagnostic: %{restart_count: 4}}]} =
+             Orchestrator.snapshot(orchestrator_name, 1_000)
+  end
+
+  test "orchestrator leaves active command and reasoning workers running while activity is current" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :ActiveWorkOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    now = DateTime.utc_now()
+
+    entries =
+      for {issue_id, identifier, event} <- [
+            {"issue-active-command", "MT-ACTIVE-COMMAND", :command_execution},
+            {"issue-active-reasoning", "MT-ACTIVE-REASONING", :reasoning}
+          ],
+          into: %{} do
+        worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+        issue = %Issue{
+          id: issue_id,
+          identifier: identifier,
+          state: "In Progress",
+          url: "https://example.org/issues/#{identifier}",
+          dispatchable: true
+        }
+
+        {issue_id,
+         %{
+           pid: worker_pid,
+           ref: make_ref(),
+           identifier: identifier,
+           issue: issue,
+           session_id: "thread-#{issue_id}",
+           last_codex_message: nil,
+           last_codex_timestamp: now,
+           last_codex_event: event,
+           started_at: DateTime.add(now, -30, :second),
+           started_monotonic_ms: System.monotonic_time(:millisecond) - 30_000,
+           codex_last_activity_monotonic_ms: System.monotonic_time(:millisecond),
+           codex_last_activity_method: "item/reasoning/started"
+         }}
+      end
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_issues,
+      Enum.map(entries, fn {_issue_id, entry} -> entry.issue end)
+    )
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, entries)
+      |> Map.put(:claimed, MapSet.new(Map.keys(entries)))
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    assert Map.keys(state.running) |> Enum.sort() == Map.keys(entries) |> Enum.sort()
+    assert state.retry_attempts == %{}
+    assert state.blocked == %{}
+    assert Enum.all?(entries, fn {_issue_id, entry} -> Process.alive?(entry.pid) end)
+
+    Enum.each(entries, fn {_issue_id, entry} -> Process.exit(entry.pid, :normal) end)
+  end
+
+  test "orchestrator uses a monotonic configured timeout at the exact boundary" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 300_000,
+      codex_max_no_progress_tokens: 0
+    )
+
+    fixed_now_ms = 1_000_000
+    Application.put_env(:symphony_elixir, :monotonic_now_ms, fixed_now_ms)
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :monotonic_now_ms) end)
+
+    orchestrator_name = Module.concat(__MODULE__, :MonotonicBoundaryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    entries =
+      for {issue_id, identifier, silence_ms} <- [
+            {"issue-quiet-build", "MT-QUIET-BUILD", 3_700},
+            {"issue-exact-boundary", "MT-EXACT-BOUNDARY", 300_000}
+          ],
+          into: %{} do
+        worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+        issue = %Issue{
+          id: issue_id,
+          identifier: identifier,
+          state: "In Progress",
+          url: "https://example.org/issues/#{identifier}",
+          dispatchable: true
+        }
+
+        {issue_id,
+         %{
+           pid: worker_pid,
+           ref: make_ref(),
+           identifier: identifier,
+           issue: issue,
+           session_id: "thread-#{issue_id}",
+           last_codex_message: nil,
+           last_codex_timestamp: DateTime.utc_now(),
+           last_codex_event: :notification,
+           started_at: DateTime.utc_now(),
+           started_monotonic_ms: fixed_now_ms - silence_ms,
+           codex_last_activity_monotonic_ms: fixed_now_ms - silence_ms,
+           codex_last_activity_method: "item/commandExecution/started"
+         }}
+      end
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_issues,
+      Enum.map(entries, fn {_issue_id, entry} -> entry.issue end)
+    )
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, entries)
+      |> Map.put(:claimed, MapSet.new(Map.keys(entries)))
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    boundary_state = :sys.get_state(pid)
+    assert Map.has_key?(boundary_state.running, "issue-quiet-build")
+    assert Map.has_key?(boundary_state.running, "issue-exact-boundary")
+
+    Application.put_env(:symphony_elixir, :monotonic_now_ms, fixed_now_ms + 1)
+    send(pid, :tick)
+    Process.sleep(100)
+    exceeded_state = :sys.get_state(pid)
+
+    assert Map.has_key?(exceeded_state.running, "issue-quiet-build")
+    refute Map.has_key?(exceeded_state.running, "issue-exact-boundary")
+
+    assert %{
+             error: "stalled for 300001ms without qualifying codex activity",
+             stall_diagnostic: %{
+               reason: "codex_no_activity",
+               threshold_ms: 300_000,
+               last_qualifying_activity_class: "item/commandExecution/started"
+             }
+           } = exceeded_state.retry_attempts["issue-exact-boundary"]
+
+    Process.exit(entries["issue-quiet-build"].pid, :normal)
+  end
+
+  test "unrelated token and rate-limit notifications do not refresh liveness" do
+    fixed_now_ms = 2_000_000
+    Application.put_env(:symphony_elixir, :monotonic_now_ms, fixed_now_ms)
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :monotonic_now_ms) end)
+
+    issue_id = "issue-noisy-notifications"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-NOISE",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-NOISE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :NoisyNotificationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-noise",
+      last_codex_message: nil,
+      last_codex_timestamp: DateTime.utc_now(),
+      last_codex_event: :notification,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now(),
+      started_monotonic_ms: fixed_now_ms - 10_000,
+      codex_last_activity_monotonic_ms: fixed_now_ms - 5_000,
+      codex_last_activity_method: "item/reasoning/completed"
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{"inputTokens" => 12, "outputTokens" => 4, "totalTokens" => 16}
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    state = :sys.get_state(pid)
+    assert state.running[issue_id].codex_last_activity_monotonic_ms == fixed_now_ms - 5_000
+    assert state.running[issue_id].codex_last_activity_method == "item/reasoning/completed"
+  end
+
+  test "orchestrator bounds token growth without meaningful progress and preserves command progress" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 0,
+      codex_max_no_progress_tokens: 250_000
+    )
+
+    issue_id = "issue-token-growth-stall"
+    orchestrator_name = Module.concat(__MODULE__, :TokenGrowthStallOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    now = DateTime.utc_now()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TOKEN-STALL",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-TOKEN-STALL",
+      dispatchable: true
+    }
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-token-stall",
+      codex_input_tokens: 260_000,
+      codex_output_tokens: 10_000,
+      codex_total_tokens: 270_000,
+      codex_progress_token_baseline: 10_000,
+      codex_durable_progress_token_baseline: 10_000,
+      codex_last_progress_timestamp: DateTime.add(now, -30, :second),
+      codex_last_progress_method: "session_started",
+      last_codex_message: nil,
+      last_codex_timestamp: now,
+      last_codex_event: :notification,
+      started_at: DateTime.add(now, -30, :second),
+      turn_count: 1,
+      codex_app_server_pid: 4242
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+
+    assert %{
+             reason: "codex_token_growth_without_meaningful_progress",
+             no_progress_tokens: 260_000,
+             no_progress_token_threshold: 250_000,
+             last_progress_method: "session_started",
+             worker_process_alive: true
+           } = state.retry_attempts[issue_id].stall_diagnostic
+
+    command_issue_id = "issue-command-progress"
+    command_worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    command_issue = %{issue | id: command_issue_id, identifier: "MT-COMMAND-PROGRESS"}
+
+    command_entry = %{
+      running_entry
+      | pid: command_worker_pid,
+        issue: command_issue,
+        identifier: command_issue.identifier,
+        codex_progress_token_baseline: 270_000,
+        codex_durable_progress_token_baseline: 270_000
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [command_issue])
+
+    :sys.replace_state(pid, fn current ->
+      %{current | running: %{command_issue_id => command_entry}, claimed: MapSet.new([command_issue_id])}
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    command_state = :sys.get_state(pid)
+
+    assert Map.has_key?(command_state.running, command_issue_id)
+    assert Process.alive?(command_worker_pid)
+    Process.exit(command_worker_pid, :normal)
+
+    loop_issue_id = "issue-read-only-command-loop"
+    loop_worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    loop_issue = %{issue | id: loop_issue_id, identifier: "MT-READ-ONLY-COMMAND-LOOP"}
+
+    loop_entry = %{
+      running_entry
+      | pid: loop_worker_pid,
+        issue: loop_issue,
+        identifier: loop_issue.identifier,
+        codex_progress_token_baseline: 270_000,
+        codex_durable_progress_token_baseline: 10_000,
+        codex_last_progress_method: "item/commandExecution/outputDelta"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [loop_issue])
+
+    :sys.replace_state(pid, fn current ->
+      %{current | running: %{loop_issue_id => loop_entry}, claimed: MapSet.new([loop_issue_id])}
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    loop_state = :sys.get_state(pid)
+
+    refute Process.alive?(loop_worker_pid)
+    refute Map.has_key?(loop_state.running, loop_issue_id)
+
+    assert %{
+             durable_token_stall: true,
+             no_progress_tokens: 0,
+             no_durable_progress_tokens: 260_000,
+             last_progress_method: "item/commandExecution/outputDelta"
+           } = loop_state.retry_attempts[loop_issue_id].stall_diagnostic
+  end
+
+  test "orchestrator enforces a cumulative token budget across worker attempts" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 0,
+      codex_max_no_progress_tokens: 0,
+      codex_max_total_tokens: 100
+    )
+
+    issue_id = "issue-total-token-budget"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TOTAL-BUDGET",
+      title: "Cumulative token budget test",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-TOTAL-BUDGET",
+      dispatchable: true
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TotalTokenBudgetOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    first_worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    initial_state = :sys.get_state(pid)
+
+    first_entry = %{
+      pid: first_worker_pid,
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-total-budget-first",
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now(),
+      last_codex_event: :notification
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => first_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{"inputTokens" => 45, "outputTokens" => 15, "totalTokens" => 60}
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    first_state = :sys.get_state(pid)
+    assert first_state.codex_issue_totals[issue_id] == 60
+    assert first_state.running[issue_id].codex_issue_total_tokens == 60
+    refute Map.has_key?(first_state.blocked, issue_id)
+
+    Process.exit(first_worker_pid, :normal)
+    second_worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    second_entry = %{first_entry | pid: second_worker_pid, session_id: "thread-total-budget-second"}
+
+    :sys.replace_state(pid, fn current ->
+      %{current | running: %{issue_id => second_entry}}
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{"inputTokens" => 30, "outputTokens" => 10, "totalTokens" => 40}
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(second_worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+    assert state.codex_issue_totals[issue_id] == 100
+
+    assert %{
+             reason: "codex_total_token_budget_exhausted",
+             issue_total_tokens: 100,
+             total_token_threshold: 100,
+             current_attempt_total_tokens: 40
+           } = state.blocked[issue_id].stall_diagnostic
+
+    assert state.blocked[issue_id].error ==
+             "codex total token budget exhausted at 100 tokens (threshold 100)"
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
@@ -996,6 +1577,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end)
 
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    stale_activity_monotonic_ms = System.monotonic_time(:millisecond) - 5_000
     initial_state = :sys.get_state(pid)
 
     running_entry = %{
@@ -1019,7 +1601,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       },
       last_codex_timestamp: stale_activity_at,
       last_codex_event: :notification,
-      started_at: stale_activity_at
+      started_at: stale_activity_at,
+      started_monotonic_ms: stale_activity_monotonic_ms,
+      codex_last_activity_monotonic_ms: stale_activity_monotonic_ms,
+      codex_last_activity_method: "mcpServer/elicitation/request"
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])

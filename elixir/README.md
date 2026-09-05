@@ -74,6 +74,21 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+### Global mutable-admission pause
+
+Repository-pool operators can prevent new workers from being admitted by setting
+`SYMPHONY_GLOBAL_PAUSE_FILE` to a host-local state file. A configured gate is
+fail-closed: only the exact file contents `running` permit new workers; missing,
+unreadable, or invalid contents remain paused. The orchestrator checks the gate
+while polling, before retry dispatch, before execution-fence admission, and
+immediately before spawning a worker. Existing workers are not terminated by the
+gate.
+
+Startup terminal-workspace cleanup is fence-aware: a terminal issue with no
+recorded execution generation in the current pool, or a generation already
+marked cleaned, can use the existing path-safe cleanup path. Any recorded
+non-cleaned generation remains deferred for explicit fence reconciliation.
+
 ## Burrito releases
 
 Symphony ships self-contained executables built with
@@ -111,6 +126,26 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
+
+### Private runner call-home
+
+The runtime can report a fixed, sanitized Symphony posture projection to a private Dahlia provider
+endpoint. The reporter is disabled when any required setting is absent or invalid. Configure these
+values in the runner host environment, not in a repository-owned `WORKFLOW.md`:
+
+```text
+DAHLIA_RUNNER_CALL_HOME_URL=https://provider.example/runner/v1/symphony/observations
+DAHLIA_RUNNER_CALL_HOME_TOKEN=<host-injected secret>
+DAHLIA_RUNNER_ID=<scoped runner identity>
+DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
+DAHLIA_SYMPHONY_POOL_KEY=<registered pool key>
+```
+
+`DAHLIA_RESPONSIBLE_DELEGATION_ID` and `DAHLIA_EXECUTION_FENCE_ID` are required for active-run
+observations. `DAHLIA_RUNNER_OBSERVATION_INTERVAL_MS` defaults to 5 seconds and is capped at 60
+seconds; `DAHLIA_RUNNER_OBSERVATION_STATE_PATH` can override the local sequence state file. Each
+observation contains only the versioned contract fields and the reporter persists its sequence
+before sending, so the provider can reject replayed or out-of-order observations.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
@@ -211,6 +246,10 @@ codex:
 - Scope and paging: candidate reads filter the configured project slug and requested state names,
   following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
   state/ID lists return `{:ok, []}` without a Linear request.
+- Rate limiting: host-local Symphony processes share a provider rate-limit state file and lock.
+  HTTP `Retry-After` headers and Linear GraphQL rate-limit bodies both persist a bounded cooldown;
+  a one-hour provider window therefore fails closed locally instead of being retried against the
+  exhausted API bucket.
 - Identity and normalization: `issue.id` is the Linear issue ID and `issue.native_ref` is currently
   `nil`. Records missing a nonblank ID, identifier, title, or state are dropped from candidate
   pages and fail ID refreshes. State keeps Linear's spelling; integer priorities are preserved and

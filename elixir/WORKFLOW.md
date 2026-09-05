@@ -39,6 +39,11 @@ codex:
     networkAccess: true
 ---
 
+The optional private runner call-home reporter is configured only by host-side `DAHLIA_*`
+environment variables. Keep its bearer token out of this file and out of child-agent environment
+inheritance. The reporter remains disabled unless the runner URL, token, runner identity, managed
+project profile, and registered pool key are all valid.
+
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}

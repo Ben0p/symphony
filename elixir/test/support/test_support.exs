@@ -22,7 +22,12 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0
+        ]
 
       setup do
         workflow_root =
@@ -67,6 +72,48 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def path_env(paths), do: path_env(paths, System.get_env("PATH") || "")
+
+  def path_env(paths, existing_path) when is_list(paths) do
+    paths
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Kernel.++([existing_path])
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(path_separator())
+  end
+
+  def shell_path(path) when is_binary(path), do: String.replace(path, "\\", "/")
+
+  def shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(shell_path(value), "'", "'\"'\"'") <> "'"
+  end
+
+  def write_executable_script!(path, script) when is_binary(path) and is_binary(script) do
+    File.write!(path, script)
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  def symlink_or_skip!(target, link) when is_binary(target) and is_binary(link) do
+    case File.ln_s(target, link) do
+      :ok ->
+        :ok
+
+      {:error, reason} when reason in [:eperm, :eacces, :enotsup] ->
+        {:symlink_unavailable, reason}
+
+      {:error, reason} ->
+        ExUnit.Assertions.flunk("symlink capability probe failed unexpectedly: #{inspect(reason)}")
+    end
+  end
+
+  defp path_separator do
+    case :os.type() do
+      {:win32, _name} -> ";"
+      _other -> ":"
+    end
+  end
 
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
@@ -114,6 +161,9 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          codex_max_stall_retries: 3,
+          codex_max_no_progress_tokens: 0,
+          codex_max_total_tokens: 0,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -152,6 +202,9 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_max_stall_retries = Keyword.get(config, :codex_max_stall_retries)
+    codex_max_no_progress_tokens = Keyword.get(config, :codex_max_no_progress_tokens)
+    codex_max_total_tokens = Keyword.get(config, :codex_max_total_tokens)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -194,6 +247,9 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "  max_stall_retries: #{yaml_value(codex_max_stall_retries)}",
+        "  max_no_progress_tokens: #{yaml_value(codex_max_no_progress_tokens)}",
+        "  max_total_tokens: #{yaml_value(codex_max_total_tokens)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
@@ -206,7 +262,12 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_binary(value) do
-    "\"" <> String.replace(value, "\"", "\\\"") <> "\""
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+
+    "\"" <> escaped <> "\""
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)

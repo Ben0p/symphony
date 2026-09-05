@@ -92,6 +92,20 @@ defmodule SymphonyElixir.Config do
     Path.expand(settings!().workspace.root, workflow_dir)
   end
 
+  @doc false
+  @spec execution_fence_state_path() :: Path.t()
+  def execution_fence_state_path do
+    settings!().execution_fence.state_path
+  end
+
+  @doc false
+  @spec responsibility_graph_state_path() :: Path.t()
+  def responsibility_graph_state_path do
+    settings!().execution_fence.state_path
+    |> Path.dirname()
+    |> Path.join("responsibility-graph.json")
+  end
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     WorkflowStore.force_reload()

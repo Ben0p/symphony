@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.{AppServer, ModelRouter}
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
@@ -38,20 +38,42 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with :ok <- execution_fence_preflight(opts) do
+      case Workspace.create_for_issue(issue, worker_host) do
+        {:ok, workspace} ->
+          send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          try do
+            with :ok <- execution_fence_preflight(opts),
+                 :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+              run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            end
+          after
+            run_after_run_hook_if_authorized(workspace, issue, worker_host, opts)
+            send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
           end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp execution_fence_preflight(opts) do
+    case Keyword.get(opts, :execution_fence_guard) do
+      nil ->
+        :ok
+
+      guard when is_function(guard, 0) ->
+        case guard.() do
+          :ok -> :ok
+          {:ok, _metadata} -> :ok
+          {:error, _reason} = error -> error
+          _other -> {:error, :invalid_execution_fence_guard_result}
         end
 
-      {:error, reason} ->
-        {:error, reason}
+      _invalid ->
+        {:error, :invalid_execution_fence_guard}
     end
   end
 
@@ -69,27 +91,45 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace
-       }}
-    )
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, opts)
+       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) and is_list(opts) do
+    runtime_info =
+      %{
+        worker_host: worker_host,
+        workspace_path: workspace,
+        execution_token: Keyword.get(opts, :execution_token),
+        execution_session_id: Keyword.get(opts, :execution_session_id)
+      }
+      |> maybe_put_runtime_head(Workspace.current_head(workspace, worker_host))
+
+    send(recipient, {:worker_runtime_info, issue_id, runtime_info})
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
+
+  defp maybe_put_runtime_head(runtime_info, {:ok, head}),
+    do: Map.put(runtime_info, :head, head)
+
+  defp maybe_put_runtime_head(runtime_info, _result), do: runtime_info
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    route = ModelRouter.resolve(issue, Keyword.get(opts, :attempt))
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    Logger.info(
+      "Codex model route selected for #{issue_context(issue)} model=#{route.model} tier=#{route.tier} effort=#{route.effort} attempt=#{route.attempt} escalated=#{route.escalated} reason=#{inspect(route.reason)}"
+    )
+
+    with {:ok, session} <-
+           AppServer.start_session(
+             workspace,
+             worker_host: worker_host,
+             model_route: route,
+             execution_fence_guard: Keyword.get(opts, :execution_fence_guard)
+           ) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
@@ -99,14 +139,15 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, app_session.model_route)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue),
+             execution_fence_guard: Keyword.get(opts, :execution_fence_guard)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -139,9 +180,16 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns, route) do
+    """
+    Codex routing evidence: model=#{route.model}; tier=#{route.tier}; effort=#{route.effort}; attempt=#{route.attempt}; escalated=#{route.escalated}; reason=#{route.reason}.
+    Include this routing evidence in the Linear implementation handoff comment.
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+    #{PromptBuilder.build_prompt(issue, opts)}
+    """
+  end
+
+  defp build_turn_prompt(_issue, _opts, turn_number, max_turns, _route) do
     """
     Continuation guidance:
 
@@ -212,5 +260,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
+  end
+
+  defp run_after_run_hook_if_authorized(workspace, issue, worker_host, opts) do
+    case execution_fence_preflight(opts) do
+      :ok ->
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+
+      {:error, reason} ->
+        Logger.warning("Skipping after-run hook after execution fence rejection for #{issue_context(issue)}: #{inspect(reason)}")
+        :ok
+    end
   end
 end
