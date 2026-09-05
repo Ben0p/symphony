@@ -199,6 +199,7 @@ defmodule SymphonyElixir.WorkPackageCleanup do
              :ok <- manifest_matches_target(manifest, target),
              :ok <- current_archive_state_matches?(manifest, target, opts),
              :ok <- verify_archive_contents(manifest, archive_root, target, opts),
+             :ok <- manifest_evidence_ref_matches(manifest),
              true <- is_binary(manifest["evidence_ref"]) and manifest["evidence_ref"] != "" do
           {:ok, manifest["evidence_ref"]}
         else
@@ -223,7 +224,8 @@ defmodule SymphonyElixir.WorkPackageCleanup do
              final_metadata = Map.put(metadata, :content, content),
              evidence_ref = evidence_ref(final_metadata),
              :ok <- atomic_write(Path.join(staging_dir, "manifest.json"), Jason.encode!(Map.put(final_metadata, :evidence_ref, evidence_ref))),
-             :ok <- File.rename(staging_dir, archive_dir) do
+             :ok <- File.rename(staging_dir, archive_dir),
+             :ok <- verify_published_archive(archive_root, target, opts) do
           {:ok, evidence_ref}
         else
           {:error, reason} ->
@@ -271,7 +273,8 @@ defmodule SymphonyElixir.WorkPackageCleanup do
     with :ok <- manifest_matches_target(manifest, target),
          true <- manifest["expected_head"] == expected_head,
          true <- manifest["observed_head"] == expected_head,
-         true <- manifest["evidence_ref"] == receipt.evidence_ref do
+         true <- manifest["evidence_ref"] == receipt.evidence_ref,
+         :ok <- manifest_evidence_ref_matches(manifest) do
       :ok
     else
       false -> {:error, :cleanup_manifest_mismatch}
@@ -309,6 +312,24 @@ defmodule SymphonyElixir.WorkPackageCleanup do
       {:error, _reason} = error -> error
     end
   end
+
+  defp verify_published_archive(archive_root, target, opts) do
+    with {:ok, manifest} <- read_manifest(archive_root, target),
+         :ok <- manifest_matches_target(manifest, target),
+         :ok <- verify_archive_contents(manifest, archive_root, target, opts),
+         :ok <- manifest_evidence_ref_matches(manifest) do
+      :ok
+    end
+  end
+
+  defp manifest_evidence_ref_matches(%{"evidence_ref" => evidence_ref} = manifest)
+       when is_binary(evidence_ref) and evidence_ref != "" do
+    if evidence_ref(Map.delete(manifest, "evidence_ref")) == evidence_ref,
+      do: :ok,
+      else: {:error, :cleanup_manifest_mismatch}
+  end
+
+  defp manifest_evidence_ref_matches(_manifest), do: {:error, :cleanup_manifest_mismatch}
 
   defp content_files(%{"workspace_files" => files}) when is_list(files), do: {:ok, files}
   defp content_files(_content), do: {:error, :cleanup_archive_content_missing}
@@ -520,8 +541,18 @@ defmodule SymphonyElixir.WorkPackageCleanup do
   end
 
   defp evidence_ref(metadata) do
-    "sha256:" <> (:crypto.hash(:sha256, Jason.encode!(metadata)) |> Base.encode16(case: :lower))
+    canonical = canonical_manifest_value(metadata)
+    "sha256:" <> (:crypto.hash(:sha256, Jason.encode!(canonical)) |> Base.encode16(case: :lower))
   end
+
+  defp canonical_manifest_value(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {to_string(key), canonical_manifest_value(nested)} end)
+  end
+
+  defp canonical_manifest_value(value) when is_list(value),
+    do: Enum.map(value, &canonical_manifest_value/1)
+
+  defp canonical_manifest_value(value), do: value
 
   defp command(opts), do: Keyword.get(opts, :command_runner, &System.cmd/3)
 

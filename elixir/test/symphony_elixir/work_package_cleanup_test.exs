@@ -170,6 +170,39 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
              WorkPackageCleanup.verify(state, token, head, archive_root: context.archive_root)
   end
 
+  test "verification rejects a forged content hash that keeps the receipt", context do
+    head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
+    {fence, token} = admitted_fence(context.workspace)
+    state = %{execution_fence: fence}
+    opts = [archive_root: context.archive_root, command_runner: command_runner()]
+
+    assert {:ok, evidence_ref} = WorkPackageCleanup.prepare(state, token, head, %{workspace_path: context.workspace, worker_host: nil}, opts)
+    {:ok, fence, :released} = ExecutionFence.release(fence, token, "worker:HGS-350:1", :completed)
+    {:ok, fence, :fenced} = ExecutionFence.fence(fence, token, %{terminal_state: "Done", accepted_head: head}, 10)
+    {:ok, fence, :prepared} = ExecutionFence.prepare_cleanup(fence, token, head, 20, :completed)
+    {:ok, fence} = ExecutionFence.record_cleanup_evidence(fence, token, head, evidence_ref, 21)
+    state = %{execution_fence: fence}
+    archive_dir = archive_dir(context.archive_root, @issue_id, 1, "codex/hgs-350", head)
+    tampered = "tampered\n"
+    File.write!(Path.join(archive_dir, "workspace/tracked.txt"), tampered)
+    {:ok, manifest_json} = File.read(Path.join(archive_dir, "manifest.json"))
+    {:ok, manifest} = Jason.decode(manifest_json)
+    tampered_digest = :crypto.hash(:sha256, tampered) |> Base.encode16(case: :lower)
+
+    workspace_files =
+      Enum.map(manifest["content"]["workspace_files"], fn
+        %{"path" => "tracked.txt"} = entry -> Map.merge(entry, %{"size" => byte_size(tampered), "sha256" => tampered_digest})
+        entry -> entry
+      end)
+
+    content = Map.put(manifest["content"], "workspace_files", workspace_files)
+    File.write!(Path.join(archive_dir, "manifest.json"), Jason.encode!(Map.put(manifest, "content", content)))
+    File.rm_rf!(context.workspace)
+
+    assert {:error, :cleanup_manifest_mismatch} =
+             WorkPackageCleanup.verify(state, token, head, archive_root: context.archive_root)
+  end
+
   test "verification requires the durable evidence and workspace absence", context do
     head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
     {fence, token} = admitted_fence(context.workspace)
