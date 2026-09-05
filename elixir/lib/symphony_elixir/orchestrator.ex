@@ -1671,25 +1671,30 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_fenced_execution(state, issue_or_identifier, entry, token, head) do
     now_ms = execution_fence_now_ms()
 
+    case cleanup_issue_workspace(issue_or_identifier, entry) do
+      cleanup_result when cleanup_result in [:ok] ->
+        persist_fenced_cleanup(state, token, head, now_ms)
+
+      {:ok, _removed} ->
+        persist_fenced_cleanup(state, token, head, now_ms)
+
+      {:error, reason, _path} ->
+        Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+        state
+
+      {:error, reason} ->
+        Logger.warning("Preserving fenced workspace after cleanup failure: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp persist_fenced_cleanup(state, token, head, now_ms) do
     case ExecutionFence.cleanup(state.execution_fence, token, head, now_ms) do
-      {:ok, fence_state, :cleaned} ->
+      {:ok, fence_state, result} when result in [:cleaned, :already_cleaned] ->
         case persist_execution_fence(state, fence_state) do
-          {:ok, next_state} ->
-            cleanup_issue_workspace(issue_or_identifier, entry)
-            next_state
-
-          {:error, persist_reason} ->
-            Logger.error("Execution-fence cleanup was not persisted: #{inspect(persist_reason)}")
-            state
-        end
-
-      {:ok, fence_state, :already_cleaned} ->
-        case persist_execution_fence(state, fence_state) do
-          {:ok, next_state} ->
-            next_state
-
-          {:error, persist_reason} ->
-            Logger.error("Execution-fence cleanup state was not persisted: #{inspect(persist_reason)}")
+          {:ok, next_state} -> next_state
+          {:error, reason} ->
+            Logger.error("Execution-fence cleanup state was not persisted: #{inspect(reason)}")
             state
         end
 

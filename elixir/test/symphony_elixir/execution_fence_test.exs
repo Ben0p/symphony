@@ -151,10 +151,14 @@ defmodule SymphonyElixir.ExecutionFenceTest do
     assert {:ok, state, %{status: :blocked, contradictory: ["worker-1"]}} =
              ExecutionFence.reconcile_sessions(state, [contradictory], 102, 50)
 
-    {:ok, state, %{status: :reconciled, expired: ["worker-1"]}} =
+    {:ok, state, %{status: :blocked, expired: ["worker-1"], unknown: ["worker-1"]}} =
       ExecutionFence.reconcile_sessions(state, [], 200, 50)
 
     assert state.executions[@issue].leases["worker-1"].status == :expired
+    assert state.executions[@issue].ownership == :unknown
+
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 210)
+    assert {:error, :ownership_unreconciled} = ExecutionFence.cleanup(state, token, "abc123", 220)
   end
 
   test "terminal state dominates a stale non-terminal session observation" do

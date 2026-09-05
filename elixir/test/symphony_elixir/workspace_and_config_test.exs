@@ -263,6 +263,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "remote workspace removal rejects paths outside the configured root before SSH" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-workspace-confinement-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root)
+
+    dot_path = test_root <> "/../outside"
+
+    assert {:error, {:workspace_path_unreadable, ^dot_path, :dot_segment}, ""} =
+             Workspace.remove(dot_path, "worker-01:2200")
+
+    outside = Path.join(System.tmp_dir!(), "outside")
+
+    assert {:error, {:workspace_outside_root, ^outside, configured_root}, ""} =
+             Workspace.remove(outside, "worker-01:2200")
+
+    assert configured_root == test_root
+  end
+
   test "workspace canonicalizes symlinked workspace roots before creating issue directories" do
     test_root =
       Path.join(

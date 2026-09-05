@@ -155,21 +155,27 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+    case validate_remote_workspace_path(workspace) do
+      :ok ->
+        maybe_run_before_remove_hook(workspace, worker_host)
 
-    script =
-      [
-        remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
-      ]
-      |> Enum.join("\n")
+        script =
+          [
+            remote_shell_assign("workspace", workspace),
+            "rm -rf -- \"$workspace\""
+          ]
+          |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
+        case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+          {:ok, {_output, 0}} ->
+            {:ok, []}
 
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+          {:ok, {output, status}} ->
+            {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+
+          {:error, reason} ->
+            {:error, reason, ""}
+        end
 
       {:error, reason} ->
         {:error, reason, ""}
@@ -614,6 +620,41 @@ defmodule SymphonyElixir.Workspace do
 
   defp validate_recorded_workspace_path(workspace) when is_binary(workspace) do
     validate_local_workspace_path(workspace, Path.dirname(workspace))
+  end
+
+  defp validate_remote_workspace_path(workspace) when is_binary(workspace) do
+    root = Config.settings!().workspace.root
+
+    with :ok <- validate_remote_path_text(workspace),
+         :ok <- validate_remote_path_text(root),
+         {:ok, root_segments} <- remote_path_segments(root),
+         {:ok, workspace_segments} <- remote_path_segments(workspace) do
+      if length(workspace_segments) > length(root_segments) and
+           Enum.take(workspace_segments, length(root_segments)) == root_segments do
+        :ok
+      else
+        {:error, {:workspace_outside_root, workspace, root}}
+      end
+    end
+  end
+
+  defp validate_remote_path_text(path) when is_binary(path) do
+    cond do
+      String.trim(path) == "" -> {:error, {:workspace_path_unreadable, path, :empty}}
+      String.contains?(path, ["\n", "\r", <<0>>]) ->
+        {:error, {:workspace_path_unreadable, path, :invalid_characters}}
+      true -> :ok
+    end
+  end
+
+  defp remote_path_segments(path) when is_binary(path) do
+    segments = String.split(String.replace(path, "\\", "/"), "/", trim: true)
+
+    if Enum.any?(segments, &(&1 in [".", ".."])) do
+      {:error, {:workspace_path_unreadable, path, :dot_segment}}
+    else
+      {:ok, segments}
+    end
   end
 
   defp validate_local_workspace_path(workspace, workspace_root)

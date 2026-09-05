@@ -1071,7 +1071,9 @@ defmodule SymphonyElixir.ExecutionFence do
 
       now_ms - lease.last_heartbeat_at >= ttl_ms ->
         expired_state = expire_lease(state, execution, session_id)
-        {expired_state, add_reason(summary, :expired, session_id)}
+        blocked_state = mark_ownership(expired_state, issue_id, :unknown)
+        blocked_summary = add_reason(summary, :unknown, session_id)
+        {blocked_state, add_reason(blocked_summary, :expired, session_id)}
 
       true ->
         unknown_state = mark_ownership(state, issue_id, :unknown)
