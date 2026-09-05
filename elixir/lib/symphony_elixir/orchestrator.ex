@@ -11,11 +11,14 @@ defmodule SymphonyElixir.Orchestrator do
     AgentRunner,
     Config,
     ExecutionFence,
+    ExecutionSupervisor,
     GlobalPause,
     ResponsibilityGraph,
     StartupMaintenance,
     StatusDashboard,
     Tracker,
+    WorkPackageClaim,
+    WorkPackageCleanupReceipt,
     Workspace
   }
 
@@ -64,6 +67,8 @@ defmodule SymphonyElixir.Orchestrator do
       execution_fence_path: nil,
       responsibility_graph: ResponsibilityGraph.new(),
       responsibility_graph_path: nil,
+      execution_supervisor: nil,
+      work_package_runtime: nil,
       stall_restarts: %{},
       codex_totals: nil,
       codex_issue_totals: %{},
@@ -101,6 +106,8 @@ defmodule SymphonyElixir.Orchestrator do
                   execution_fence_path: config.execution_fence.state_path,
                   responsibility_graph: responsibility_graph,
                   responsibility_graph_path: graph_path,
+                  execution_supervisor: Keyword.get(opts, :execution_supervisor),
+                  work_package_runtime: Keyword.get(opts, :work_package_runtime),
                   codex_totals: @empty_codex_totals,
                   codex_issue_totals: %{},
                   codex_rate_limits: nil
@@ -241,6 +248,7 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
         state = release_execution_lease(state, running_entry, reason)
+        state = maybe_confirm_execution_supervisor(state, running_entry, session_id)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
 
@@ -727,6 +735,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         stop_running_task(pid, ref, state.task_supervisor)
         state = release_execution_lease(state, running_entry, :orchestrator_stop)
+        state = maybe_confirm_execution_supervisor(state, running_entry, identifier)
 
         state =
           if cleanup_workspace do
@@ -1301,17 +1310,34 @@ defmodule SymphonyElixir.Orchestrator do
     else
       case admit_execution(state, issue, worker_host) do
         {:ok, state, token, session_id, responsibility_delegation_id, runtime_lease} ->
-          spawn_fenced_issue(
-            state,
-            issue,
-            attempt,
-            recipient,
-            worker_host,
-            token,
-            session_id,
-            responsibility_delegation_id,
-            runtime_lease
-          )
+          case claim_work_package(state, issue, token, worker_host) do
+            {:ok, state} ->
+              spawn_fenced_issue(
+                state,
+                issue,
+                attempt,
+                recipient,
+                worker_host,
+                token,
+                session_id,
+                responsibility_delegation_id,
+                runtime_lease
+              )
+
+            {:error, reason} ->
+              Logger.warning("Skipping mutable dispatch without a durable work-package claim for #{issue_context(issue)}: #{inspect(reason)}")
+
+              release_execution_lease(
+                state,
+                %{
+                  execution_token: token,
+                  execution_session_id: session_id,
+                  responsibility_delegation_id: responsibility_delegation_id,
+                  responsibility_runtime_lease: runtime_lease
+                },
+                :spawn_failed
+              )
+          end
 
         {:error, reason} ->
           Logger.warning("Skipping fenced dispatch for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1331,6 +1357,9 @@ defmodule SymphonyElixir.Orchestrator do
          responsibility_delegation_id,
          runtime_lease
        ) do
+    supervisor_identity = execution_supervisor_identity(state, issue, token, session_id, worker_host)
+    runtime = if is_map(state.work_package_runtime), do: state.work_package_runtime, else: %{}
+
     if GlobalPause.paused?() do
       Logger.debug("Global mutable admission paused immediately before worker spawn for #{issue_context(issue)}")
 
@@ -1351,6 +1380,15 @@ defmodule SymphonyElixir.Orchestrator do
                worker_host: worker_host,
                execution_token: token,
                execution_session_id: session_id,
+               execution_supervisor: supervisor_identity,
+               secret_environment_names: Map.get(runtime, :secret_environment_names, []),
+               execution_supervisor_recorder: fn identity ->
+                 GenServer.call(
+                   recipient,
+                   {:execution_fence_supervisor, token, session_id, identity},
+                   @execution_authorization_timeout_ms
+                 )
+               end,
                execution_fence_guard: fn ->
                  GenServer.call(
                    recipient,
@@ -1432,6 +1470,55 @@ defmodule SymphonyElixir.Orchestrator do
             execution_session_id: session_id
           })
       end
+    end
+  end
+
+  defp execution_supervisor_identity(%State{execution_supervisor: :systemd_user}, issue, token, session_id, nil) do
+    ExecutionSupervisor.identity(issue.id, token.generation, session_id, session_id, execution_fence_now_ms())
+  end
+
+  defp execution_supervisor_identity(_state, _issue, _token, _session_id, _worker_host), do: nil
+
+  defp claim_work_package(%State{work_package_runtime: nil, execution_supervisor: nil} = state, _issue, _token, _worker_host),
+    do: {:ok, state}
+
+  defp claim_work_package(%State{work_package_runtime: nil}, _issue, _token, _worker_host),
+    do: {:error, :work_package_runtime_required}
+
+  defp claim_work_package(%State{work_package_runtime: runtime, execution_supervisor: :systemd_user} = state, issue, _token, nil)
+       when is_map(runtime) do
+    repository_ref = get_in(state.execution_fence, [:executions, issue.id, :repository])
+
+    input =
+      runtime
+      |> Map.merge(%{
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        repository_ref: repository_ref,
+        fence_state: state.execution_fence,
+        responsibility_graph: state.responsibility_graph
+      })
+
+    claim_opts =
+      []
+      |> maybe_claim_option(runtime, :request_fun)
+      |> maybe_claim_option(runtime, :now_fun)
+
+    with :ok <- ExecutionSupervisor.available?(),
+         {:ok, _claim} <- WorkPackageClaim.claim(input, claim_opts) do
+      {:ok, state}
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp claim_work_package(%State{work_package_runtime: _runtime}, _issue, _token, _worker_host),
+    do: {:error, :execution_supervisor_required_for_claim}
+
+  defp maybe_claim_option(options, runtime, key) do
+    case Map.get(runtime, key) do
+      value when is_function(value) -> Keyword.put(options, key, value)
+      _ -> options
     end
   end
 
@@ -1565,6 +1652,94 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp maybe_confirm_execution_supervisor(%State{} = state, running_entry, session_id) do
+    token = Map.get(running_entry, :execution_token)
+
+    case supervisor_identity_for(state.execution_fence, token, session_id) do
+      identity when is_map(identity) ->
+        case ExecutionSupervisor.terminate(identity) do
+          {:ok, evidence} ->
+            now_ms = execution_fence_now_ms()
+
+            case ExecutionFence.confirm_termination(state.execution_fence, token, session_id, evidence, now_ms) do
+              {:ok, fence_state, _result} ->
+                case persist_execution_fence(state, fence_state) do
+                  {:ok, next_state} ->
+                    submit_termination_cleanup_receipt(next_state, running_entry, evidence)
+
+                  {:error, reason} ->
+                    Logger.error("Execution supervisor proof could not be persisted: #{inspect(reason)}")
+                    state
+                end
+
+              {:error, reason} ->
+                Logger.warning("Execution supervisor proof rejected: #{inspect(reason)}")
+                state
+            end
+
+          {:error, reason} ->
+            Logger.warning("Execution supervisor termination could not be proven: #{inspect(reason)}")
+            state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp supervisor_identity_for(fence_state, %{issue_id: issue_id, generation: generation}, session_id)
+       when is_binary(issue_id) and is_integer(generation) and is_binary(session_id) do
+    case get_in(fence_state, [:executions, issue_id]) do
+      %{generation: ^generation, leases: leases} ->
+        case Map.get(leases, session_id) do
+          %{generation: ^generation, session_id: ^session_id, supervisor_identity: identity} -> identity
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp supervisor_identity_for(_fence_state, _token, _session_id), do: nil
+
+  defp submit_termination_cleanup_receipt(%State{work_package_runtime: nil} = state, _entry, _evidence),
+    do: state
+
+  defp submit_termination_cleanup_receipt(%State{work_package_runtime: runtime} = state, entry, evidence)
+       when is_map(runtime) and is_map(evidence) do
+    issue_id = Map.get(entry.execution_token, :issue_id) || entry.issue.id
+    execution = get_in(state.execution_fence, [:executions, issue_id])
+    accepted_head = get_in(execution, [:terminal, :accepted_head]) || get_in(execution, [:leases, entry.execution_session_id, :head])
+
+    if is_map(execution) and is_binary(accepted_head) and accepted_head != "unobserved" do
+      input =
+        runtime
+        |> Map.merge(%{
+          issue_id: issue_id,
+          repository_ref: execution.repository,
+          fence_state: state.execution_fence
+        })
+
+      attrs = %{terminal_outcome: :completed, accepted_head: accepted_head}
+      opts = [] |> maybe_claim_option(runtime, :request_fun) |> maybe_claim_option(runtime, :now_fun)
+
+      case WorkPackageCleanupReceipt.termination_confirmed(input, attrs, opts) do
+        {:ok, _result} ->
+          state
+
+        {:error, reason} ->
+          Logger.warning("Trusted termination receipt was not accepted for #{issue_context(entry.issue)}: #{inspect(reason)}")
+          state
+      end
+    else
+      Logger.warning("Trusted termination receipt was not sent without an exact accepted head for #{issue_context(entry.issue)}")
+      state
+    end
+  end
+
+  defp submit_termination_cleanup_receipt(state, _entry, _evidence), do: state
 
   defp release_responsibility_lease(
          %State{} = state,
@@ -1769,7 +1944,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, fence_state, result} when result in [:cleaned, :already_cleaned] ->
         case persist_execution_fence(state, fence_state) do
           {:ok, next_state} ->
-            next_state
+            submit_repository_cleanup_receipt(next_state, token, head)
 
           {:error, reason} ->
             Logger.error("Execution-fence cleanup state was not persisted: #{inspect(reason)}")
@@ -1780,6 +1955,56 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Preserving fenced workspace after cleanup rejection: #{inspect(reason)}")
         state
     end
+  end
+
+  defp submit_repository_cleanup_receipt(%State{work_package_runtime: runtime} = state, token, head)
+       when is_map(runtime) do
+    case cleanup_evidence_ref(runtime, state, token, head) do
+      {:ok, evidence_ref} ->
+        execution = get_in(state.execution_fence, [:executions, token.issue_id])
+
+        input =
+          runtime
+          |> Map.merge(%{
+            issue_id: token.issue_id,
+            repository_ref: execution.repository,
+            fence_state: state.execution_fence
+          })
+
+        attrs = %{terminal_outcome: :completed, accepted_head: head, evidence_ref: evidence_ref}
+        opts = [] |> maybe_claim_option(runtime, :request_fun) |> maybe_claim_option(runtime, :now_fun)
+
+        case WorkPackageCleanupReceipt.repository_cleanup_verified(input, attrs, opts) do
+          {:ok, _result} ->
+            state
+
+          {:error, reason} ->
+            Logger.warning("Trusted repository cleanup receipt was not accepted for issue_id=#{token.issue_id}: #{inspect(reason)}")
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning("Repository cleanup evidence was not sent without an independent verification record for issue_id=#{token.issue_id}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp submit_repository_cleanup_receipt(state, _token, _head), do: state
+
+  defp cleanup_evidence_ref(runtime, state, token, head) do
+    case Map.get(runtime, :cleanup_evidence_fun) do
+      verifier when is_function(verifier, 3) ->
+        case verifier.(state, token, head) do
+          {:ok, evidence_ref} when is_binary(evidence_ref) and evidence_ref != "" -> {:ok, evidence_ref}
+          {:error, _reason} = error -> error
+          _ -> {:error, :invalid_cleanup_evidence}
+        end
+
+      _ ->
+        {:error, :cleanup_evidence_verifier_missing}
+    end
+  rescue
+    error -> {:error, {:cleanup_evidence_verifier_failed, error}}
   end
 
   defp record_head_divergence(state, token, expected_head, observed_head) do
@@ -2429,6 +2654,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec record_execution_supervisor(GenServer.server(), map(), String.t(), map()) ::
+          {:ok, :recorded} | {:error, term()} | :unavailable
+  def record_execution_supervisor(server, token, session_id, identity) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:execution_fence_supervisor, token, session_id, identity})
+      catch
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc false
   @spec heartbeat_execution_session(GenServer.server(), map(), String.t(), non_neg_integer()) ::
           {:ok, :persisted} | {:error, term()} | :unavailable
   def heartbeat_execution_session(server, token, session_id, now_ms) do
@@ -2672,6 +2912,19 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, fence_state, result} ->
         case persist_execution_fence(state, fence_state) do
           {:ok, next_state} -> {:reply, {:ok, result}, next_state}
+          {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:execution_fence_supervisor, token, session_id, identity}, _from, %State{} = state) do
+    case ExecutionFence.record_supervisor(state.execution_fence, token, session_id, identity) do
+      {:ok, fence_state} ->
+        case persist_execution_fence(state, fence_state) do
+          {:ok, next_state} -> {:reply, {:ok, :recorded}, next_state}
           {:error, reason} -> {:reply, {:error, {:execution_fence_persistence_failed, reason}}, state}
         end
 

@@ -153,10 +153,11 @@ before sending, so the provider can reject replayed or out-of-order observations
 reservation contract. It requires a validated current execution-fence generation and its active
 responsible runtime lease, plus an active responsible delegation for the exact issue and repository.
 The reservation nonce and authority tuple are written to a private atomic journal before claim; a
-lost response or restart therefore reuses the same reservation and generation. The adapter is
-intentionally separate from worker dispatch (the scheduler integration is a later slice). Runner
-tokens and attestation keys are supplied by the host and are never logged or placed in workflow
-files.
+lost response or restart therefore reuses the same reservation and generation. When the
+orchestrator is started with its admitted Linux supervisor and work-package runtime callbacks,
+it claims this reservation before launching the mutable worker and posts termination and verified
+cleanup receipts from the same fence. Runner tokens and attestation keys are supplied by the host
+and are never logged or placed in workflow files.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.

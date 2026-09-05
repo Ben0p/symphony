@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
+
   import SymphonyElixir.TestSupport,
     only: [
       path_env: 2,
@@ -1068,7 +1069,7 @@ defmodule SymphonyElixir.AppServerTest do
       {:ok, guard_state} = Agent.start_link(fn -> 0 end)
 
       on_exit(fn ->
-        Agent.stop(guard_state)
+        if Process.alive?(guard_state), do: Agent.stop(guard_state)
         System.delete_env("SYMP_TEST_CODEx_TRACE")
       end)
 
@@ -1564,14 +1565,20 @@ defmodule SymphonyElixir.AppServerTest do
 
     custom_secret_env = "SYMP_CUSTOM_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
     profile_marker_env = "SYMP_TEST_BASH_PROFILE_LOADED_#{System.unique_integer([:positive])}"
+    runner_token_env = "DAHLIA_RUNNER_TOKEN"
+    attestation_key_env = "DAHLIA_RUNNER_ATTESTATION_KEY"
     previous_secret = System.get_env("LINEAR_API_KEY")
     previous_custom_secret = System.get_env(custom_secret_env)
+    previous_runner_token = System.get_env(runner_token_env)
+    previous_attestation_key = System.get_env(attestation_key_env)
     previous_home = System.get_env("HOME")
     previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
 
     on_exit(fn ->
       restore_env("LINEAR_API_KEY", previous_secret)
       restore_env(custom_secret_env, previous_custom_secret)
+      restore_env(runner_token_env, previous_runner_token)
+      restore_env(attestation_key_env, previous_attestation_key)
       restore_env("HOME", previous_home)
       restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
     end)
@@ -1589,11 +1596,15 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(Path.join(bash_home, ".bash_profile"), """
       export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
       export #{custom_secret_env}='profile-custom-secret-that-must-not-reach-child'
+      export #{runner_token_env}='profile-runner-token-that-must-not-reach-child'
+      export #{attestation_key_env}='profile-attestation-key-that-must-not-reach-child'
       export #{profile_marker_env}=1
       """)
 
       System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
       System.put_env(custom_secret_env, "custom-secret-that-must-not-reach-child")
+      System.put_env(runner_token_env, "runner-token-that-must-not-reach-child")
+      System.put_env(attestation_key_env, "attestation-key-that-must-not-reach-child")
       System.put_env("HOME", bash_home)
       System.put_env("SYMP_TEST_CODEx_TRACE", shell_path(trace_file))
 
@@ -1603,6 +1614,8 @@ defmodule SymphonyElixir.AppServerTest do
       printf 'PROFILE_LOADED:%s\n' "$#{profile_marker_env}" >> "$trace_file"
       printf 'CANONICAL_SECRET:%s\n' "$LINEAR_API_KEY" >> "$trace_file"
       printf 'CUSTOM_SECRET:%s\n' "$#{custom_secret_env}" >> "$trace_file"
+      printf 'RUNNER_TOKEN:%s\n' "$#{runner_token_env}" >> "$trace_file"
+      printf 'ATTESTATION_KEY:%s\n' "$#{attestation_key_env}" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -1651,6 +1664,8 @@ defmodule SymphonyElixir.AppServerTest do
       assert File.read!(trace_file) =~ "PROFILE_LOADED:1\n"
       assert File.read!(trace_file) =~ "CANONICAL_SECRET:\n"
       assert File.read!(trace_file) =~ "CUSTOM_SECRET:\n"
+      assert File.read!(trace_file) =~ "RUNNER_TOKEN:\n"
+      assert File.read!(trace_file) =~ "ATTESTATION_KEY:\n"
       refute File.read!(trace_file) =~ "secret-that-must-not-reach-child"
     after
       File.rm_rf(test_root)
@@ -1747,7 +1762,10 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ remote_workspace
       assert argv_line =~ "unset LINEAR_API_KEY"
       assert argv_line =~ "exec "
-      assert argv_line =~ "fake-remote-codex app-server"
+      assert argv_line =~ "fake-remote-codex"
+      assert argv_line =~ "gpt-5.6-luna"
+      assert argv_line =~ "model_reasoning_effort=high"
+      assert argv_line =~ "app-server"
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
