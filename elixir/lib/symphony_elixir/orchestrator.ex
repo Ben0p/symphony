@@ -2529,6 +2529,7 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, fence_state, _result} ->
             case Persistence.save(state.execution_fence_path, fence_state) do
               :ok ->
+                replay_persisted_cleanup_receipts(%{state | execution_fence: fence_state})
                 send(owner, {:startup_cleanup_fence_updated, fence_state})
                 :ok
 

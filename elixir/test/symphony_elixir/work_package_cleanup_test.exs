@@ -48,6 +48,8 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
     assert String.contains?(manifest["git"]["status"], "untracked.txt")
     assert [%{"number" => 350, "headRefName" => "codex/hgs-350"}] = manifest["open_pull_requests"]
     assert File.exists?(Path.join(archive_dir, "workspace/untracked.txt"))
+    assert File.exists?(Path.join(archive_dir, "repository.bundle"))
+    refute File.exists?(Path.join(archive_dir, "workspace/.git"))
 
     assert {:ok, same_evidence_ref} =
              WorkPackageCleanup.prepare(
@@ -60,6 +62,112 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
              )
 
     assert same_evidence_ref == evidence_ref
+  end
+
+  test "does not reuse an archive after the workspace content changes", context do
+    head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
+    {fence, token} = admitted_fence(context.workspace)
+    state = %{execution_fence: fence}
+    opts = [archive_root: context.archive_root, command_runner: command_runner()]
+
+    assert {:ok, _evidence_ref} = WorkPackageCleanup.prepare(state, token, head, %{workspace_path: context.workspace, worker_host: nil}, opts)
+
+    File.write!(Path.join(context.workspace, "untracked.txt"), "first\n")
+
+    assert {:error, :cleanup_archive_state_changed} =
+             WorkPackageCleanup.prepare(state, token, head, %{workspace_path: context.workspace, worker_host: nil}, opts)
+  end
+
+  test "rebuilds an interrupted archive staging directory", context do
+    head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
+    {fence, token} = admitted_fence(context.workspace)
+    opts = [archive_root: context.archive_root, command_runner: command_runner()]
+    archive_dir = archive_dir(context.archive_root, @issue_id, 1, "codex/hgs-350", head)
+    File.mkdir_p!(Path.join(archive_dir <> ".staging", "workspace"))
+    File.write!(Path.join(archive_dir <> ".staging", "workspace/partial.txt"), "partial\n")
+
+    assert {:ok, _evidence_ref} =
+             WorkPackageCleanup.prepare(
+               %{execution_fence: fence},
+               token,
+               head,
+               %{workspace_path: context.workspace, worker_host: nil},
+               opts
+             )
+
+    refute File.exists?(archive_dir <> ".staging")
+  end
+
+  test "rebuilds a final archive left without its manifest", context do
+    head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
+    {fence, token} = admitted_fence(context.workspace)
+    opts = [archive_root: context.archive_root, command_runner: command_runner()]
+    archive_dir = archive_dir(context.archive_root, @issue_id, 1, "codex/hgs-350", head)
+    File.mkdir_p!(archive_dir)
+    File.write!(Path.join(archive_dir, "partial.txt"), "partial\n")
+
+    assert {:ok, _evidence_ref} =
+             WorkPackageCleanup.prepare(
+               %{execution_fence: fence},
+               token,
+               head,
+               %{workspace_path: context.workspace, worker_host: nil},
+               opts
+             )
+
+    assert File.exists?(Path.join(archive_dir, "manifest.json"))
+  end
+
+  test "archives a linked git worktree with recoverable refs", context do
+    source = Path.join(context.root, "source")
+    File.rm_rf!(context.workspace)
+    File.mkdir_p!(source)
+    git!(source, ["init"])
+    git!(source, ["config", "user.email", "symphony-tests@example.test"])
+    git!(source, ["config", "user.name", "Symphony tests"])
+    File.write!(Path.join(source, "tracked.txt"), "source\n")
+    git!(source, ["add", "tracked.txt"])
+    git!(source, ["commit", "-m", "initial"])
+    git!(source, ["worktree", "add", "-b", "codex/hgs-350", context.workspace])
+
+    head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
+    {fence, token} = admitted_fence(context.workspace)
+
+    assert {:ok, _evidence_ref} =
+             WorkPackageCleanup.prepare(
+               %{execution_fence: fence},
+               token,
+               head,
+               %{workspace_path: context.workspace, worker_host: nil},
+               archive_root: context.archive_root,
+               command_runner: command_runner()
+             )
+
+    archive_dir = archive_dir(context.archive_root, @issue_id, 1, "codex/hgs-350", head)
+    recovery = Path.join(context.root, "recovery")
+    git!(context.root, ["clone", Path.join(archive_dir, "repository.bundle"), recovery])
+    assert git!(recovery, ["rev-parse", "HEAD"]) |> String.trim() == head
+    refute File.exists?(Path.join(archive_dir, "workspace/.git"))
+  end
+
+  test "verification rejects a modified archived file", context do
+    head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
+    {fence, token} = admitted_fence(context.workspace)
+    state = %{execution_fence: fence}
+    opts = [archive_root: context.archive_root, command_runner: command_runner()]
+
+    assert {:ok, evidence_ref} = WorkPackageCleanup.prepare(state, token, head, %{workspace_path: context.workspace, worker_host: nil}, opts)
+    {:ok, fence, :released} = ExecutionFence.release(fence, token, "worker:HGS-350:1", :completed)
+    {:ok, fence, :fenced} = ExecutionFence.fence(fence, token, %{terminal_state: "Done", accepted_head: head}, 10)
+    {:ok, fence, :prepared} = ExecutionFence.prepare_cleanup(fence, token, head, 20, :completed)
+    {:ok, fence} = ExecutionFence.record_cleanup_evidence(fence, token, head, evidence_ref, 21)
+    state = %{execution_fence: fence}
+    archive_dir = archive_dir(context.archive_root, @issue_id, 1, "codex/hgs-350", head)
+    File.write!(Path.join(archive_dir, "workspace/tracked.txt"), "tampered\n")
+    File.rm_rf!(context.workspace)
+
+    assert {:error, :cleanup_archive_content_mismatch} =
+             WorkPackageCleanup.verify(state, token, head, archive_root: context.archive_root)
   end
 
   test "verification requires the durable evidence and workspace absence", context do

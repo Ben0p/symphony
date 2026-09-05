@@ -359,7 +359,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
-  test "restarting the orchestrator does not overlap redispatched work" do
+  test "restarting the orchestrator keeps unproven work fenced" do
     issue_suffix = System.unique_integer([:positive])
 
     test_root =
@@ -468,19 +468,15 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(GenServer.call(restarted_pid, :snapshot))
     refute Process.alive?(first_worker_pid)
 
-    second_worker_pid =
-      eventually_value(fn ->
-        children = Task.Supervisor.children(task_supervisor_name)
-        assert length(children) <= 1
+    assert eventually_value(fn ->
+             if Task.Supervisor.children(task_supervisor_name) == [], do: true
+           end)
 
-        case children do
-          [pid] when pid != first_worker_pid -> pid
-          _ -> nil
-        end
-      end)
+    snapshot = GenServer.call(restarted_pid, :snapshot)
+    execution = Enum.find(snapshot.execution_fence.executions, &(&1.issue_id == issue.id))
 
-    assert is_pid(second_worker_pid)
-    assert Process.alive?(second_worker_pid)
+    assert execution.ownership == :unknown
+    assert execution.cleanup == :pending
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do

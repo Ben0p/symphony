@@ -54,6 +54,9 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
     assert lease.status == :released
     assert lease.termination_confirmed_at_ms == 200
     assert reconciled.executions["HGS-294"].termination_unconfirmed == false
+    assert reconciled.executions["HGS-294"].ownership == :reconciled
+    assert {:ok, _next_state, next_token} = ExecutionFence.admit(reconciled, admission, 210)
+    assert next_token.generation == 2
   end
 
   test "orchestrator mutation guard follows the current generation snapshot" do

@@ -34,8 +34,7 @@ defmodule SymphonyElixir.WorkPackageCleanup do
          {:ok, git_state} <- collect_git_state(target.workspace, opts),
          {:ok, open_prs} <- collect_open_prs(target.branch, target.workspace, opts),
          metadata = build_metadata(target, git_state, open_prs),
-         {:ok, evidence_ref} <- write_archive(archive_root, target, metadata),
-         :ok <- persist_manifest_metadata(archive_root, target, metadata, evidence_ref) do
+         {:ok, evidence_ref} <- write_archive(archive_root, target, metadata, opts) do
       {:ok, evidence_ref}
     end
   end
@@ -51,6 +50,7 @@ defmodule SymphonyElixir.WorkPackageCleanup do
          {:ok, receipt} <- cleanup_receipt(state, token),
          {:ok, manifest} <- read_manifest(archive_root, target),
          :ok <- manifest_matches(manifest, target, expected_head, receipt),
+         :ok <- verify_archive_contents(manifest, archive_root, target, opts),
          :ok <- workspace_absent?(target.workspace) do
       {:ok, receipt.evidence_ref}
     end
@@ -188,40 +188,47 @@ defmodule SymphonyElixir.WorkPackageCleanup do
     }
   end
 
-  defp write_archive(archive_root, target, metadata) do
+  defp write_archive(archive_root, target, metadata, opts) do
     archive_dir = archive_dir(archive_root, target)
     manifest_path = Path.join(archive_dir, "manifest.json")
-    workspace_archive = Path.join(archive_dir, "workspace")
+    staging_dir = archive_dir <> ".staging"
 
     cond do
       File.exists?(manifest_path) ->
         with {:ok, manifest} <- read_json(manifest_path),
              :ok <- manifest_matches_target(manifest, target),
-             true <- File.dir?(workspace_archive) do
+             :ok <- current_archive_state_matches?(manifest, target, opts),
+             :ok <- verify_archive_contents(manifest, archive_root, target, opts) do
           {:ok, manifest["evidence_ref"]}
         else
-          false -> {:error, :cleanup_archive_missing_workspace}
           {:error, _reason} = error -> error
         end
 
       File.exists?(archive_dir) ->
-        {:error, :cleanup_archive_incomplete}
+        case File.rm_rf(archive_dir) do
+          {:ok, _removed} -> write_archive(archive_root, target, metadata, opts)
+          {:error, reason, _path} -> {:error, {:cleanup_archive_incomplete, reason}}
+        end
 
       true ->
-        with :ok <- File.mkdir_p(archive_dir),
-             {:ok, _files} <- File.cp_r(target.workspace, workspace_archive) do
-          evidence_ref = evidence_ref(metadata)
+        _ = File.rm_rf(staging_dir)
+
+        with :ok <- File.mkdir_p(staging_dir),
+             {:ok, _files} <- File.cp_r(target.workspace, Path.join(staging_dir, "workspace")),
+             :ok <- remove_archived_git_metadata(Path.join(staging_dir, "workspace")),
+             :ok <- create_repository_bundle(target.workspace, staging_dir, opts),
+             {:ok, content} <- archive_content(staging_dir),
+             final_metadata = Map.put(metadata, :content, content),
+             evidence_ref = evidence_ref(final_metadata),
+             :ok <- atomic_write(Path.join(staging_dir, "manifest.json"), Jason.encode!(Map.put(final_metadata, :evidence_ref, evidence_ref))),
+             :ok <- File.rename(staging_dir, archive_dir) do
           {:ok, evidence_ref}
         else
-          {:error, reason} -> {:error, {:cleanup_archive_copy_failed, reason}}
+          {:error, reason} ->
+            _ = File.rm_rf(staging_dir)
+            {:error, {:cleanup_archive_build_failed, reason}}
         end
     end
-  end
-
-  defp persist_manifest_metadata(archive_root, target, metadata, evidence_ref) do
-    archive_dir = archive_dir(archive_root, target)
-    manifest = Map.put(metadata, :evidence_ref, evidence_ref)
-    atomic_write(Path.join(archive_dir, "manifest.json"), Jason.encode!(manifest))
   end
 
   defp read_manifest(archive_root, target) do
@@ -259,6 +266,197 @@ defmodule SymphonyElixir.WorkPackageCleanup do
       false -> {:error, :cleanup_manifest_mismatch}
       {:error, _reason} = error -> error
     end
+  end
+
+  defp current_archive_state_matches?(manifest, target, opts) do
+    with {:ok, git_state} <- collect_git_state(target.workspace, opts),
+         {:ok, open_prs} <- collect_open_prs(target.branch, target.workspace, opts),
+         {:ok, workspace_files} <- archive_content_files(target.workspace) do
+      expected_git = Jason.decode!(Jason.encode!(git_state))
+      expected_files = get_in(manifest, ["content", "workspace_files"])
+
+      if manifest["git"] == expected_git and manifest["open_pull_requests"] == open_prs and
+           expected_files == workspace_files,
+         do: :ok,
+         else: {:error, :cleanup_archive_state_changed}
+    end
+  end
+
+  defp verify_archive_contents(manifest, archive_root, target, opts) do
+    archive_dir = archive_dir(archive_root, target)
+    content = manifest["content"]
+
+    with {:ok, expected_files} <- content_files(content),
+         {:ok, actual_files} <- archive_content_files(Path.join(archive_dir, "workspace")),
+         true <- expected_files == actual_files,
+         {:ok, bundle} <- content_bundle(content),
+         :ok <- verify_file_digest(Path.join(archive_dir, bundle["path"]), bundle),
+         :ok <- verify_repository_bundle(Path.join(archive_dir, bundle["path"]), target.expected_head, opts) do
+      :ok
+    else
+      false -> {:error, :cleanup_archive_content_mismatch}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp content_files(%{"workspace_files" => files}) when is_list(files), do: {:ok, files}
+  defp content_files(_content), do: {:error, :cleanup_archive_content_missing}
+
+  defp content_bundle(%{"repository_bundle" => bundle}) when is_map(bundle) do
+    if bundle["path"] == "repository.bundle", do: {:ok, bundle}, else: {:error, :cleanup_archive_bundle_missing}
+  end
+
+  defp content_bundle(_content), do: {:error, :cleanup_archive_bundle_missing}
+
+  defp archive_content(staging_dir) do
+    with {:ok, workspace_files} <- archive_content_files(Path.join(staging_dir, "workspace")),
+         {:ok, bundle} <- file_digest(Path.join(staging_dir, "repository.bundle")) do
+      bundle = bundle |> Map.put(:path, "repository.bundle") |> Map.put(:type, "regular")
+      {:ok, %{workspace_files: workspace_files, repository_bundle: bundle}}
+    end
+  end
+
+  defp archive_content_files(root) do
+    case File.lstat(root) do
+      {:ok, %File.Stat{type: :directory}} -> archive_content_entries(root, root, "")
+      {:error, reason} -> {:error, {:cleanup_archive_workspace_unreadable, reason}}
+      _ -> {:error, :cleanup_archive_workspace_missing}
+    end
+  end
+
+  defp archive_content_entries(root, path, relative) do
+    case File.ls(path) do
+      {:ok, names} ->
+        names = if relative == "", do: Enum.reject(names, &(&1 == ".git")), else: names
+
+        case Enum.reduce_while(Enum.sort(names), {:ok, []}, fn name, {:ok, acc} ->
+               child = Path.join(path, name)
+               child_relative = if relative == "", do: name, else: Path.join(relative, name)
+
+               case archive_content_entry(root, child, child_relative) do
+                 {:ok, child_entries} -> {:cont, {:ok, acc ++ child_entries}}
+                 {:error, _reason} = error -> {:halt, error}
+               end
+             end) do
+          {:ok, entries} -> {:ok, Enum.sort_by(entries, & &1["path"])}
+          {:error, reason} -> {:error, {:cleanup_archive_workspace_unreadable, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:cleanup_archive_workspace_unreadable, reason}}
+    end
+  end
+
+  defp archive_content_entry(root, path, relative) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        archive_content_entries(root, path, relative)
+
+      {:ok, %File.Stat{type: :regular}} ->
+        with {:ok, digest} <- file_digest(path) do
+          {:ok, [%{"path" => normalize_relative_path(relative), "type" => "regular", "size" => digest.size, "sha256" => digest.sha256}]}
+        end
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        case File.read_link(path) do
+          {:ok, target} ->
+            [%{"path" => normalize_relative_path(relative), "type" => "symlink", "target" => target, "sha256" => digest_bytes(target), "size" => byte_size(target)}]
+            |> then(&{:ok, &1})
+
+          {:error, reason} ->
+            {:error, {:cleanup_archive_symlink_unreadable, reason}}
+        end
+
+      {:ok, stat} ->
+        {:ok, [%{"path" => normalize_relative_path(relative), "type" => Atom.to_string(stat.type), "size" => stat.size, "mode" => stat.mode}]}
+
+      {:error, reason} ->
+        {:error, {:cleanup_archive_entry_unreadable, relative, reason}}
+    end
+  end
+
+  defp file_digest(path) do
+    with {:ok, contents} <- File.read(path) do
+      {:ok, %{size: byte_size(contents), sha256: digest_bytes(contents)}}
+    else
+      {:error, reason} -> {:error, {:cleanup_archive_file_unreadable, path, reason}}
+    end
+  end
+
+  defp verify_file_digest(path, %{"type" => "regular", "size" => size, "sha256" => sha256}) do
+    with {:ok, digest} <- file_digest(path),
+         true <- digest.size == size and digest.sha256 == sha256 do
+      :ok
+    else
+      false -> {:error, :cleanup_archive_file_mismatch}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp verify_file_digest(path, %{"type" => "symlink", "target" => target, "size" => size, "sha256" => sha256}) do
+    with {:ok, observed} <- File.read_link(path),
+         true <- observed == target and byte_size(observed) == size and digest_bytes(observed) == sha256 do
+      :ok
+    else
+      false -> {:error, :cleanup_archive_symlink_mismatch}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp verify_file_digest(_path, _entry), do: :ok
+
+  defp verify_repository_bundle(path, expected_head, opts) do
+    recovery = Path.join(System.tmp_dir!(), "symphony-cleanup-bundle-#{System.unique_integer([:positive])}")
+
+    try do
+      case command(opts).("git", ["clone", "--quiet", path, recovery], cd: Path.dirname(path), stderr_to_stdout: true) do
+        {_output, 0} ->
+          case command(opts).("git", ["rev-parse", "HEAD"], cd: recovery, stderr_to_stdout: true) do
+            {output, 0} when is_binary(output) ->
+              if String.trim(output) == expected_head,
+                do: :ok,
+                else: {:error, :cleanup_archive_bundle_head_mismatch}
+
+            {_output, status} ->
+              {:error, {:cleanup_archive_bundle_invalid, status}}
+          end
+
+        {_output, status} ->
+          {:error, {:cleanup_archive_bundle_invalid, status}}
+      end
+    after
+      _ = File.rm_rf(recovery)
+    end
+  rescue
+    error -> {:error, {:cleanup_archive_bundle_invalid, error}}
+  end
+
+  defp create_repository_bundle(workspace, archive_dir, opts) do
+    bundle_path = Path.join(archive_dir, "repository.bundle")
+
+    case command(opts).("git", ["bundle", "create", bundle_path, "--all"], cd: workspace, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {_output, status} -> {:error, {:cleanup_archive_bundle_failed, status}}
+    end
+  rescue
+    error -> {:error, {:cleanup_archive_bundle_failed, error}}
+  end
+
+  defp remove_archived_git_metadata(workspace_archive) do
+    case File.rm_rf(Path.join(workspace_archive, ".git")) do
+      {:ok, _removed} -> :ok
+      {:error, reason, _path} -> {:error, {:cleanup_archive_git_metadata_failed, reason}}
+    end
+  end
+
+  defp normalize_relative_path(path) when is_binary(path) do
+    path
+    |> String.replace("\\", "/")
+    |> String.trim_leading("./")
+  end
+
+  defp digest_bytes(value) when is_binary(value) do
+    :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
   end
 
   defp manifest_matches_target(manifest, target) do
