@@ -112,6 +112,23 @@ defmodule SymphonyElixir.WorkPackageCleanupReceiptTest do
     assert {:ok, acknowledgement} = Journal.cleanup_receipt_ack(journal, @reservation_key, "termination_confirmed")
     assert acknowledgement.receipt_id == result.receipt_id
     assert acknowledgement.scope_state == "held"
+
+    {:ok, invalid_journal} =
+      Journal.put_cleanup_receipt_ack(
+        journal,
+        @reservation_key,
+        "termination_confirmed",
+        %{scope_state: "held"}
+      )
+
+    assert :ok = Journal.save(input.journal_path, invalid_journal)
+
+    assert {:error, :invalid_cleanup_acknowledgement} =
+             WorkPackageCleanupReceipt.termination_confirmed(
+               input,
+               %{terminal_outcome: :completed, accepted_head: "abc123"},
+               request_fun: fn _url, _options -> flunk("a malformed acknowledgement must fail closed") end
+             )
   end
 
   test "journals the semantic receipt before a lost response and refreshes only freshness fields" do

@@ -221,17 +221,17 @@ defmodule SymphonyElixir.WorkPackageCleanupReceipt do
 
   defp acknowledgement_wire(acknowledgement) do
     %{
-      "projectionId" => acknowledgement.projection_id,
-      "reservationId" => acknowledgement.reservation_id,
-      "receiptId" => acknowledgement.receipt_id,
-      "receiptKind" => acknowledgement.receipt_kind,
-      "executionCapacityState" => acknowledgement.execution_capacity_state,
-      "scopeState" => acknowledgement.scope_state,
-      "reservationState" => acknowledgement.reservation_state,
-      "generation" => acknowledgement.generation,
-      "evidenceRef" => acknowledgement.evidence_ref,
-      "acceptedHead" => acknowledgement.accepted_head,
-      "replayed" => acknowledgement.replayed
+      "projectionId" => Map.get(acknowledgement, :projection_id),
+      "reservationId" => Map.get(acknowledgement, :reservation_id),
+      "receiptId" => Map.get(acknowledgement, :receipt_id),
+      "receiptKind" => Map.get(acknowledgement, :receipt_kind),
+      "executionCapacityState" => Map.get(acknowledgement, :execution_capacity_state),
+      "scopeState" => Map.get(acknowledgement, :scope_state),
+      "reservationState" => Map.get(acknowledgement, :reservation_state),
+      "generation" => Map.get(acknowledgement, :generation),
+      "evidenceRef" => Map.get(acknowledgement, :evidence_ref),
+      "acceptedHead" => Map.get(acknowledgement, :accepted_head),
+      "replayed" => Map.get(acknowledgement, :replayed)
     }
   end
 
