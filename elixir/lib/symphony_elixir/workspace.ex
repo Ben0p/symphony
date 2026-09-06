@@ -244,9 +244,91 @@ defmodule SymphonyElixir.Workspace do
 
   defp remove_local_workspace(workspace) do
     case maybe_run_before_remove_hook(workspace, nil) do
-      :ok -> File.rm_rf(workspace)
-      {:error, reason} -> {:error, reason, workspace}
+      :ok ->
+        case detach_local_reparse_points(workspace) do
+          :ok -> File.rm_rf(workspace)
+          {:error, reason} -> {:error, reason, workspace}
+        end
+
+      {:error, reason} ->
+        {:error, reason, workspace}
     end
+  end
+
+  defp detach_local_reparse_points(workspace) do
+    case :os.type() do
+      {:win32, _name} ->
+        detach_windows_reparse_points(workspace)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp detach_windows_reparse_points(workspace) do
+    case System.find_executable("pwsh") || System.find_executable("powershell.exe") do
+      nil ->
+        {:error, {:workspace_reparse_inspection_failed, workspace, :powershell_unavailable}}
+
+      executable ->
+        script = """
+        $ErrorActionPreference = 'Stop'
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $root = [System.IO.Path]::GetFullPath($env:SYMPHONY_WORKSPACE).TrimEnd([char[]]('/\'))
+        $rootPrefix = $root + [System.IO.Path]::DirectorySeparatorChar
+        $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+        $pending.Push([System.IO.DirectoryInfo]::new($root))
+        while ($pending.Count -gt 0) {
+          $directory = $pending.Pop()
+          foreach ($entry in $directory.EnumerateFileSystemInfos('*', [System.IO.SearchOption]::TopDirectoryOnly)) {
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              $entryPath = [System.IO.Path]::GetFullPath($entry.FullName)
+              if ($entryPath.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or
+                  -not $entryPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Reparse entry is outside the validated workspace: $entryPath"
+              }
+
+              $linkInfo = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
+              $linkType = [string]$linkInfo.LinkType
+              if ($linkType -notin @('Junction', 'SymbolicLink')) {
+                throw "Unsupported or unknown reparse entry type '$linkType': $entryPath"
+              }
+
+              $isDirectory = $linkInfo -is [System.IO.DirectoryInfo]
+              $isFile = $linkInfo -is [System.IO.FileInfo]
+              if (-not $isDirectory -and -not $isFile) {
+                throw "Unable to determine reparse entry type: $entryPath"
+              }
+
+              # Native Delete receives only the link path and never the target;
+              # the shell therefore cannot recurse through the reparse entry.
+              if ($isDirectory) {
+                [System.IO.Directory]::Delete($entryPath, $false)
+              } else {
+                [System.IO.File]::Delete($entryPath)
+              }
+              if ($null -ne (Get-Item -LiteralPath $entryPath -Force -ErrorAction SilentlyContinue)) {
+                throw "Reparse entry remains after unlink: $entryPath"
+              }
+              continue
+            }
+            if ($entry -is [System.IO.DirectoryInfo]) {
+              $pending.Push($entry)
+            }
+          }
+        }
+        """
+
+        case System.cmd(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+               stderr_to_stdout: true,
+               env: [{"SYMPHONY_WORKSPACE", workspace}]
+             ) do
+          {_output, 0} -> :ok
+          {output, status} -> {:error, {:workspace_reparse_detach_failed, workspace, status, output}}
+        end
+    end
+  rescue
+    error -> {:error, {:workspace_reparse_inspection_failed, workspace, error.__struct__}}
   end
 
   defp remove_remote_workspace(workspace, worker_host) do
@@ -264,9 +346,11 @@ defmodule SymphonyElixir.Workspace do
     if File.exists?(workspace) do
       with :ok <- validate_workspace_path(workspace, nil) do
         with :ok <- maybe_run_before_remove_hook(workspace, nil) do
-          # The hook already ran above. Remove directly so startup cleanup does
-          # not invoke the before_remove hook a second time.
-          remove_local_workspace_out_of_process(workspace)
+          with :ok <- detach_local_reparse_points(workspace) do
+            # The hook already ran above. Remove directly so startup cleanup does
+            # not invoke the before_remove hook a second time.
+            remove_local_workspace_out_of_process(workspace)
+          end
         end
       end
     else
