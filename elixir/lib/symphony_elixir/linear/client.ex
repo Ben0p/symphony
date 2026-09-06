@@ -207,17 +207,6 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   @doc false
-  @spec request_options_for_test() :: keyword()
-  def request_options_for_test, do: request_options()
-
-  @doc false
-  @spec fetch_issues_by_states_for_test([String.t()], (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
-          {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_states_for_test(state_names, graphql_fun) when is_list(state_names) and is_function(graphql_fun, 2) do
-    do_fetch_by_states_page("test-project", Enum.map(state_names, &to_string/1), nil, nil, [], 1, graphql_fun)
-  end
-
-  @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
   def normalize_issue_for_test(issue) when is_map(issue) do
     normalize_issue(issue, nil)
