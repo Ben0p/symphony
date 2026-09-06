@@ -39,6 +39,17 @@ codex:
     networkAccess: true
 ---
 
+The optional private runner call-home reporter is configured only by host-side `DAHLIA_*`
+environment variables. Keep its bearer token out of this file and out of child-agent environment
+inheritance. The reporter remains disabled unless the runner URL, token, runner identity, managed
+project profile, and registered pool key are all valid.
+
+Managed Linux runners additionally require the complete work-package tuple documented in
+`README.md`: `DAHLIA_WORK_PACKAGE_PROVIDER_URL`, `DAHLIA_WORK_PACKAGE_RUNNER_TOKEN`,
+`DAHLIA_WORK_PACKAGE_ATTESTATION_KEY`, `DAHLIA_RUNNER_ID`, and
+`DAHLIA_MANAGED_PROJECT_PROFILE_ID`. Keep these values out of this workflow file; the runtime
+scrubs the provider token and attestation key before launching Codex.
+
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}

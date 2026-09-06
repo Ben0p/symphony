@@ -359,7 +359,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
-  test "restarting the orchestrator does not overlap redispatched work" do
+  test "restarting the orchestrator keeps unproven work fenced" do
     issue_suffix = System.unique_integer([:positive])
 
     test_root =
@@ -410,7 +410,7 @@ defmodule SymphonyElixir.CoreTest do
       workspace_root: test_root,
       poll_interval_ms: 10,
       hook_before_run:
-        "mkfifo #{shell_escape(hook_fifo)}; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
+        "if [ ! -p #{shell_escape(hook_fifo)} ]; then rm -f #{shell_escape(hook_fifo)}; mkfifo #{shell_escape(hook_fifo)}; fi; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
       hook_timeout_ms: 60_000
     )
 
@@ -468,19 +468,15 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(GenServer.call(restarted_pid, :snapshot))
     refute Process.alive?(first_worker_pid)
 
-    second_worker_pid =
-      eventually_value(fn ->
-        children = Task.Supervisor.children(task_supervisor_name)
-        assert length(children) <= 1
+    assert eventually_value(fn ->
+             if Task.Supervisor.children(task_supervisor_name) == [], do: true
+           end)
 
-        case children do
-          [pid] when pid != first_worker_pid -> pid
-          _ -> nil
-        end
-      end)
+    snapshot = GenServer.call(restarted_pid, :snapshot)
+    execution = Enum.find(snapshot.execution_fence.executions, &(&1.issue_id == issue.id))
 
-    assert is_pid(second_worker_pid)
-    assert Process.alive?(second_worker_pid)
+    assert execution.ownership == :unknown
+    assert execution.cleanup == :pending
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -2244,7 +2240,7 @@ defmodule SymphonyElixir.CoreTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
-      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" app-server")
+      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" --config model=\"gpt-5.6-luna\" --config model_reasoning_effort=high app-server")
       refute String.contains?(argv_line, "--ask-for-approval never")
       refute String.contains?(argv_line, "--sandbox danger-full-access")
     after

@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.SSH do
   @moduledoc false
 
+  alias SymphonyElixir.Shell
+
   @spec run(String.t(), String.t(), keyword()) :: {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
   def run(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
     with {:ok, executable, executable_args} <- ssh_executable() do
@@ -34,7 +36,7 @@ defmodule SymphonyElixir.SSH do
   defp ssh_executable do
     case System.get_env("SYMPHONY_TEST_SSH_SHIM") do
       shim when is_binary(shim) and shim != "" ->
-        case System.find_executable("sh") do
+        case Shell.shim_executable() do
           nil -> {:error, :ssh_not_found}
           executable -> {:ok, executable, [shim]}
         end

@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Workspace}
+  alias SymphonyElixir.{Config, GlobalPause, Orchestrator, StatusDashboard, Workspace}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -23,8 +23,13 @@ defmodule SymphonyElixirWeb.Presenter do
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits,
+          pause_gate: Map.get(snapshot, :pause_gate, GlobalPause.snapshot()),
           startup_maintenance: Map.get(snapshot, :startup_maintenance)
         }
+        |> put_optional_snapshot_field(snapshot, :runtime_identity)
+        |> put_optional_snapshot_field(snapshot, :execution_authority)
+        |> put_optional_snapshot_field(snapshot, :managed_work_package)
+        |> put_optional_snapshot_field(snapshot, :readiness)
 
       :timeout ->
         %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
@@ -32,6 +37,10 @@ defmodule SymphonyElixirWeb.Presenter do
       :unavailable ->
         %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
     end
+  end
+
+  defp put_optional_snapshot_field(payload, snapshot, field) do
+    if Map.has_key?(snapshot, field), do: Map.put(payload, field, Map.get(snapshot, field)), else: payload
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}

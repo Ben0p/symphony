@@ -120,6 +120,7 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
     %{
       "issue_id" => execution.issue_id,
       "repository" => execution.repository,
+      "worker_host" => Map.get(execution, :worker_host),
       "generation" => execution.generation,
       "branch" => execution.branch,
       "worktree" => execution.worktree,
@@ -128,6 +129,8 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
       "leases" => Map.new(execution.leases, fn {session_id, lease} -> {session_id, encode_lease(lease)} end),
       "terminal" => encode_terminal(execution.terminal),
       "cleanup" => Atom.to_string(execution.cleanup),
+      "cleanup_receipt" => encode_cleanup_receipt(Map.get(execution, :cleanup_receipt)),
+      "termination_unconfirmed" => Map.get(execution, :termination_unconfirmed, false),
       "admitted_at_ms" => execution.admitted_at_ms,
       "cleaned_at_ms" => Map.get(execution, :cleaned_at_ms)
     }
@@ -149,7 +152,29 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
       "linear_state" => lease.linear_state,
       "pr_state" => lease.pr_state,
       "head" => lease.head,
+      "termination_required" => Map.get(lease, :termination_required, lease.status == :expired),
+      "termination_confirmed_at_ms" => Map.get(lease, :termination_confirmed_at_ms),
+      "termination_evidence_ref" => Map.get(lease, :termination_evidence_ref),
+      "termination_evidence" => encode_termination_evidence(Map.get(lease, :termination_evidence)),
+      "supervisor_identity" => encode_supervisor_identity(Map.get(lease, :supervisor_identity)),
       "release_reason" => encode_optional_reason(Map.get(lease, :release_reason))
+    }
+  end
+
+  defp encode_supervisor_identity(nil), do: nil
+
+  defp encode_supervisor_identity(identity) do
+    %{
+      "supervisor" => Atom.to_string(identity.supervisor),
+      "unit" => identity.unit,
+      "issue_id" => identity.issue_id,
+      "generation" => identity.generation,
+      "session_id" => identity.session_id,
+      "process_id" => identity.process_id,
+      "launched_at_ms" => identity.launched_at_ms,
+      "control_group" => Map.get(identity, :control_group),
+      "launch_processes" => Map.get(identity, :launch_processes),
+      "main_pid" => Map.get(identity, :main_pid)
     }
   end
 
@@ -203,22 +228,37 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
          {:ok, leases} <- decode_map(Map.get(payload, "leases"), &decode_lease/1),
          {:ok, terminal} <- decode_terminal(Map.get(payload, "terminal")),
          {:ok, cleanup} <- decode_status(Map.get(payload, "cleanup"), [:pending, :cleaned]),
+         {:ok, cleanup_receipt} <- decode_cleanup_receipt(Map.get(payload, "cleanup_receipt")),
          {:ok, admitted_at_ms} <- required(payload, "admitted_at_ms") do
-      execution = %{
-        issue_id: issue_id,
-        repository: repository,
-        generation: generation,
-        branch: branch,
-        worktree: worktree,
-        status: status,
-        ownership: ownership,
-        leases: leases,
-        terminal: terminal,
-        cleanup: cleanup,
-        admitted_at_ms: admitted_at_ms
-      }
+      termination_unconfirmed =
+        case Map.fetch(payload, "termination_unconfirmed") do
+          {:ok, value} when is_boolean(value) -> value
+          {:ok, _value} -> nil
+          :error -> legacy_expired_lease?(leases)
+        end
 
-      {:ok, maybe_put_decoded(execution, :cleaned_at_ms, Map.get(payload, "cleaned_at_ms"))}
+      if is_boolean(termination_unconfirmed) do
+        execution = %{
+          issue_id: issue_id,
+          repository: repository,
+          worker_host: Map.get(payload, "worker_host"),
+          generation: generation,
+          branch: branch,
+          worktree: worktree,
+          status: status,
+          ownership: ownership,
+          leases: leases,
+          terminal: terminal,
+          cleanup: cleanup,
+          cleanup_receipt: cleanup_receipt,
+          termination_unconfirmed: termination_unconfirmed,
+          admitted_at_ms: admitted_at_ms
+        }
+
+        {:ok, maybe_put_decoded(execution, :cleaned_at_ms, Map.get(payload, "cleaned_at_ms"))}
+      else
+        {:error, :invalid_termination_unconfirmed}
+      end
     end
   end
 
@@ -240,28 +280,168 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
          {:ok, linear_state} <- required(payload, "linear_state"),
          {:ok, pr_state} <- required(payload, "pr_state"),
          {:ok, head} <- required(payload, "head") do
-      lease = %{
-        issue_id: issue_id,
-        repository: repository,
-        generation: generation,
-        role: role,
-        session_id: session_id,
-        process_id: process_id,
-        branch: branch,
-        worktree: worktree,
-        status: status,
-        registered_at_ms: registered_at_ms,
-        last_heartbeat_at: last_heartbeat_at,
-        linear_state: linear_state,
-        pr_state: pr_state,
-        head: head
-      }
+      termination_required =
+        case Map.fetch(payload, "termination_required") do
+          {:ok, value} when is_boolean(value) -> value
+          {:ok, _value} -> nil
+          :error -> status == :expired or Map.get(payload, "release_reason") == "orchestrator_stop"
+        end
 
-      {:ok, maybe_put_decoded(lease, :release_reason, Map.get(payload, "release_reason"))}
+      if not is_boolean(termination_required) do
+        {:error, :invalid_termination_required}
+      else
+        lease = %{
+          issue_id: issue_id,
+          repository: repository,
+          generation: generation,
+          role: role,
+          session_id: session_id,
+          process_id: process_id,
+          branch: branch,
+          worktree: worktree,
+          status: status,
+          registered_at_ms: registered_at_ms,
+          last_heartbeat_at: last_heartbeat_at,
+          linear_state: linear_state,
+          pr_state: pr_state,
+          head: head,
+          termination_required: termination_required
+        }
+
+        lease =
+          lease
+          |> maybe_put_decoded(:termination_confirmed_at_ms, Map.get(payload, "termination_confirmed_at_ms"))
+          |> maybe_put_decoded(:termination_evidence_ref, Map.get(payload, "termination_evidence_ref"))
+          |> maybe_put_decoded(:termination_evidence, decode_termination_evidence(Map.get(payload, "termination_evidence")))
+          |> maybe_put_decoded(:supervisor_identity, decode_supervisor_identity(Map.get(payload, "supervisor_identity")))
+
+        {:ok, maybe_put_decoded(lease, :release_reason, Map.get(payload, "release_reason"))}
+      end
     end
   end
 
   defp decode_lease(_payload), do: {:error, :invalid_lease}
+
+  defp decode_supervisor_identity(nil), do: nil
+
+  defp decode_supervisor_identity(
+         identity_payload = %{
+           "supervisor" => "systemd_user",
+           "unit" => unit,
+           "issue_id" => issue_id,
+           "generation" => generation,
+           "session_id" => session_id,
+           "process_id" => process_id,
+           "launched_at_ms" => launched_at_ms
+         }
+       )
+       when is_binary(unit) and is_binary(issue_id) and is_integer(generation) and
+              is_binary(session_id) and is_binary(process_id) and is_integer(launched_at_ms) do
+    identity = %{
+      supervisor: :systemd_user,
+      unit: unit,
+      issue_id: issue_id,
+      generation: generation,
+      session_id: session_id,
+      process_id: process_id,
+      launched_at_ms: launched_at_ms
+    }
+
+    case decode_supervisor_identity_attestation(identity, identity_payload) do
+      {:ok, identity} -> identity
+      :invalid -> :invalid
+    end
+  end
+
+  defp decode_supervisor_identity(_identity), do: :invalid
+
+  defp decode_supervisor_identity_attestation(identity, payload) when is_map(payload) do
+    control_group = Map.get(payload, "control_group")
+    launch_processes = Map.get(payload, "launch_processes")
+    main_pid = Map.get(payload, "main_pid")
+
+    cond do
+      Enum.all?(["control_group", "launch_processes", "main_pid"], &(not Map.has_key?(payload, &1))) ->
+        {:ok, identity}
+
+      is_nil(control_group) and is_nil(launch_processes) and is_nil(main_pid) ->
+        {:ok,
+         identity
+         |> Map.put(:control_group, nil)
+         |> Map.put(:launch_processes, nil)
+         |> Map.put(:main_pid, nil)}
+
+      is_binary(control_group) and control_group != "" and
+        is_list(launch_processes) and Enum.all?(launch_processes, &(is_integer(&1) and &1 > 0)) and
+          (is_nil(main_pid) or (is_integer(main_pid) and main_pid >= 0)) ->
+        {:ok,
+         identity
+         |> Map.put(:control_group, control_group)
+         |> Map.put(:launch_processes, launch_processes)
+         |> Map.put(:main_pid, main_pid)}
+
+      true ->
+        :invalid
+    end
+  end
+
+  defp decode_supervisor_identity_attestation(_identity, _payload), do: :invalid
+
+  defp encode_termination_evidence(nil), do: nil
+
+  defp encode_termination_evidence(evidence) when is_map(evidence) do
+    Map.new(evidence, fn
+      {:process_tree, value} -> {"process_tree", encode_optional_atom(value)}
+      {:supervisor, value} -> {"supervisor", encode_optional_atom(value)}
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp encode_termination_evidence(_evidence), do: nil
+
+  defp decode_termination_evidence(nil), do: nil
+
+  defp decode_termination_evidence(payload) when is_map(payload) do
+    Enum.reduce(payload, %{}, fn
+      {"process_tree", value}, acc ->
+        Map.put(acc, :process_tree, decode_optional_atom(value))
+
+      {"supervisor", value}, acc ->
+        Map.put(acc, :supervisor, decode_optional_atom(value))
+
+      {key, value}, acc
+      when key in [
+             "session_id",
+             "process_id",
+             "unit",
+             "pre_active_state",
+             "pre_control_group",
+             "pre_processes",
+             "main_pid",
+             "active_state",
+             "control_group",
+             "remaining_processes",
+             "observed_at_ms",
+             "evidence_ref"
+           ] ->
+        Map.put(acc, String.to_existing_atom(key), value)
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp decode_termination_evidence(_payload), do: :invalid
+
+  defp encode_optional_atom(nil), do: nil
+  defp encode_optional_atom(value) when is_atom(value), do: Atom.to_string(value)
+  defp encode_optional_atom(value), do: value
+
+  defp decode_optional_atom(nil), do: nil
+  defp decode_optional_atom("terminated"), do: :terminated
+  defp decode_optional_atom("systemd_user"), do: :systemd_user
+  defp decode_optional_atom(value), do: value
 
   defp decode_terminal(nil), do: {:ok, nil}
 
@@ -280,6 +460,62 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
   end
 
   defp decode_terminal(_payload), do: {:error, :invalid_terminal}
+
+  defp encode_cleanup_receipt(nil), do: nil
+
+  defp encode_cleanup_receipt(receipt) do
+    encoded = %{
+      "phase" => Atom.to_string(receipt.phase),
+      "expected_head" => receipt.expected_head,
+      "prepared_at_ms" => receipt.prepared_at_ms,
+      "verified_at_ms" => Map.get(receipt, :verified_at_ms),
+      "evidence_ref" => Map.get(receipt, :evidence_ref),
+      "evidence_recorded_at_ms" => Map.get(receipt, :evidence_recorded_at_ms)
+    }
+
+    if Map.has_key?(receipt, :terminal_outcome) do
+      Map.put(encoded, "terminal_outcome", encode_optional_atom(Map.get(receipt, :terminal_outcome)))
+    else
+      encoded
+    end
+  end
+
+  defp decode_cleanup_receipt(nil), do: {:ok, nil}
+
+  defp decode_cleanup_receipt(payload) when is_map(payload) do
+    with {:ok, phase} <- decode_status(Map.get(payload, "phase"), [:removal_started, :verified]),
+         {:ok, expected_head} <- required(payload, "expected_head"),
+         {:ok, prepared_at_ms} <- required(payload, "prepared_at_ms") do
+      receipt = %{
+        phase: phase,
+        expected_head: expected_head,
+        prepared_at_ms: prepared_at_ms
+      }
+
+      receipt =
+        receipt
+        |> maybe_put_decoded(:verified_at_ms, Map.get(payload, "verified_at_ms"))
+        |> maybe_put_decoded(:evidence_ref, Map.get(payload, "evidence_ref"))
+        |> maybe_put_decoded(:evidence_recorded_at_ms, Map.get(payload, "evidence_recorded_at_ms"))
+
+      case Map.get(payload, "terminal_outcome") do
+        nil ->
+          {:ok, receipt}
+
+        outcome when outcome in ["completed", "failed", "blocked"] ->
+          {:ok, Map.put(receipt, :terminal_outcome, String.to_existing_atom(outcome))}
+
+        _ ->
+          {:error, :invalid_cleanup_terminal_outcome}
+      end
+    end
+  end
+
+  defp decode_cleanup_receipt(_payload), do: {:error, :invalid_cleanup_receipt}
+
+  defp legacy_expired_lease?(leases) when is_map(leases) do
+    Enum.any?(leases, fn {_session_id, lease} -> Map.get(lease, :status) == :expired end)
+  end
 
   defp encode_triage_record(record) do
     %{

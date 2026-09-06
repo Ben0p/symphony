@@ -4,6 +4,7 @@ defmodule SymphonyElixir.CLITest do
   alias SymphonyElixir.CLI
 
   @ack_flag "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
+  @activate_flag "--activate-responsibility-graph"
 
   test "returns the guardrails acknowledgement banner when the flag is missing" do
     parent = self()
@@ -135,5 +136,42 @@ defmodule SymphonyElixir.CLITest do
     }
 
     assert :ok = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
+  end
+
+  test "activates responsibility graph only after the runtime starts" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn ->
+        send(parent, :runtime_started)
+        {:ok, [:symphony_elixir]}
+      end,
+      activate_responsibility_graph: fn now_ms ->
+        send(parent, {:activation_requested, now_ms})
+        :ok
+      end
+    }
+
+    assert :ok = CLI.evaluate([@ack_flag, @activate_flag, "WORKFLOW.md"], deps)
+    assert_received :runtime_started
+    assert_received {:activation_requested, now_ms}
+    assert is_integer(now_ms)
+  end
+
+  test "activation fails closed when the local callback is unavailable" do
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    assert {:error, "Responsibility graph activation is unavailable"} =
+             CLI.evaluate([@ack_flag, @activate_flag, "WORKFLOW.md"], deps)
   end
 end

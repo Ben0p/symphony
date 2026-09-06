@@ -197,6 +197,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:stall_timeout_ms, :integer, default: 300_000)
       field(:max_stall_retries, :integer, default: 3)
       field(:max_no_progress_tokens, :integer, default: 0)
+      field(:max_total_tokens, :integer, default: 0)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -213,7 +214,8 @@ defmodule SymphonyElixir.Config.Schema do
           :read_timeout_ms,
           :stall_timeout_ms,
           :max_stall_retries,
-          :max_no_progress_tokens
+          :max_no_progress_tokens,
+          :max_total_tokens
         ],
         empty_values: []
       )
@@ -230,6 +232,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:max_stall_retries, greater_than_or_equal_to: 0)
       |> validate_number(:max_no_progress_tokens, greater_than_or_equal_to: 0)
+      |> validate_number(:max_total_tokens, greater_than_or_equal_to: 0)
     end
   end
 

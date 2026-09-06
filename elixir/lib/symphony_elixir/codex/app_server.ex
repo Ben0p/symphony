@@ -4,13 +4,22 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, ExecutionSupervisor, PathSafety, Shell, SSH}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @runner_secret_environment_names [
+    "DAHLIA_RUNNER_TOKEN",
+    "DAHLIA_RUNNER_CALL_HOME_TOKEN",
+    "DAHLIA_RUNNER_ATTESTATION_KEY",
+    "DAHLIA_WORK_PACKAGE_RUNNER_TOKEN",
+    "DAHLIA_WORK_PACKAGE_ATTESTATION_KEY",
+    "DAHLIA_WORK_PACKAGE_CLAIM_TOKEN",
+    "DAHLIA_CLEANUP_ATTESTATION_KEY"
+  ]
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -23,7 +32,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           worker_host: String.t() | nil,
           dynamic_tool_binding: map(),
           execution_fence_guard: (-> term()) | nil,
-          model_route: map()
+          model_route: map(),
+          execution_supervisor: ExecutionSupervisor.identity() | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -53,36 +63,96 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     dynamic_tool_binding = DynamicTool.bind()
     execution_fence_guard = Keyword.get(opts, :execution_fence_guard)
+    execution_supervisor = Keyword.get(opts, :execution_supervisor)
+    execution_supervisor_recorder = Keyword.get(opts, :execution_supervisor_recorder)
+    secret_environment_names = secret_environment_names(Keyword.get(opts, :secret_environment_names, []))
 
     with :ok <- execution_fence_preflight(execution_fence_guard),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, model_route) do
-      metadata = port_metadata(port, worker_host)
+         {:ok, port} <-
+           start_port(
+             expanded_workspace,
+             worker_host,
+             dynamic_tool_binding,
+             model_route,
+             execution_supervisor,
+             secret_environment_names
+           ) do
+      case record_execution_supervisor(execution_supervisor, execution_supervisor_recorder) do
+        :ok ->
+          start_session_on_port(
+            port,
+            expanded_workspace,
+            worker_host,
+            dynamic_tool_binding,
+            execution_fence_guard,
+            model_route,
+            execution_supervisor
+          )
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
-        {:ok,
-         %{
-           port: port,
-           metadata: metadata,
-           approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
-           thread_sandbox: session_policies.thread_sandbox,
-           turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
-           workspace: expanded_workspace,
-           worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding,
-           execution_fence_guard: execution_fence_guard,
-           model_route: model_route
-         }}
-      else
-        {:error, reason} ->
-          stop_port(port)
-          {:error, reason}
+        {:error, reason} = error ->
+          # A supervisor identity is part of the admission fence. If it cannot
+          # be journaled immediately after launch, terminate the child before
+          # returning so an unrecorded execution cannot mutate the workspace.
+          stop_port_with_supervisor(port, execution_supervisor)
+          Logger.warning("Execution supervisor identity was not persisted: #{inspect(reason)}")
+          error
       end
+    else
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp start_session_on_port(
+         port,
+         expanded_workspace,
+         worker_host,
+         dynamic_tool_binding,
+         execution_fence_guard,
+         model_route,
+         execution_supervisor
+       ) do
+    metadata = port_metadata(port, worker_host)
+
+    with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+         {:ok, thread_id} <-
+           do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+      {:ok,
+       %{
+         port: port,
+         metadata: metadata,
+         approval_policy: session_policies.approval_policy,
+         auto_approve_requests: session_policies.approval_policy == "never",
+         thread_sandbox: session_policies.thread_sandbox,
+         turn_sandbox_policy: session_policies.turn_sandbox_policy,
+         thread_id: thread_id,
+         workspace: expanded_workspace,
+         worker_host: worker_host,
+         dynamic_tool_binding: dynamic_tool_binding,
+         execution_fence_guard: execution_fence_guard,
+         model_route: model_route,
+         execution_supervisor: execution_supervisor
+       }}
+    else
+      {:error, reason} ->
+        stop_port_with_supervisor(port, execution_supervisor)
+        {:error, reason}
+    end
+  end
+
+  defp stop_port_with_supervisor(port, nil) do
+    stop_port(port)
+  end
+
+  defp stop_port_with_supervisor(port, identity) when is_map(identity) do
+    case ExecutionSupervisor.terminate(identity) do
+      {:ok, _evidence} -> :ok
+      {:error, reason} -> Logger.warning("Unable to prove supervisor termination after session setup failure: #{inspect(reason)}")
+      other -> Logger.warning("Unexpected supervisor termination result after session setup failure: #{inspect(other)}")
+    end
+
+    stop_port(port)
   end
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -161,10 +231,28 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
+  @spec stop_session(session()) :: :ok | {:error, term()}
+  def stop_session(%{port: port, execution_supervisor: supervisor}) when is_port(port) do
+    result =
+      case supervisor do
+        nil ->
+          :ok
+
+        identity when is_map(identity) ->
+          case ExecutionSupervisor.terminate(identity) do
+            {:ok, _evidence} -> :ok
+            {:error, reason} -> {:error, {:execution_supervisor_termination_failed, reason}}
+          end
+
+        _invalid ->
+          {:error, :invalid_execution_supervisor}
+      end
+
     stop_port(port)
+    result
   end
+
+  def stop_session(%{port: port}) when is_port(port), do: stop_port(port)
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
@@ -208,8 +296,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding, model_route) do
-    executable = System.find_executable("bash")
+  defp start_port(workspace, nil, dynamic_tool_binding, model_route, nil, secret_names) do
+    executable = Shell.bash_executable()
 
     if is_nil(executable) do
       {:error, :bash_not_found}
@@ -221,9 +309,9 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, model_route))],
+            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, model_route, secret_names))],
             cd: String.to_charlist(workspace),
-            env: tracker_secret_port_env(dynamic_tool_binding),
+            env: tracker_secret_port_env(dynamic_tool_binding, secret_names),
             line: @port_line_bytes
           ]
         )
@@ -232,24 +320,56 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding, model_route) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding, model_route)
+  defp start_port(workspace, nil, dynamic_tool_binding, model_route, supervisor, secret_names)
+       when is_map(supervisor) do
+    executable = ExecutionSupervisor.executable()
+    command = local_launch_command(dynamic_tool_binding, model_route, secret_names)
+
+    with :ok <- ExecutionSupervisor.validate(supervisor),
+         executable when is_binary(executable) <- executable,
+         {:ok, args} <- ExecutionSupervisor.launch_args(supervisor.unit, workspace, command) do
+      port =
+        Port.open(
+          {:spawn_executable, String.to_charlist(executable)},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            args: Enum.map(args, &String.to_charlist/1),
+            env: tracker_secret_port_env(dynamic_tool_binding, secret_names),
+            line: @port_line_bytes
+          ]
+        )
+
+      {:ok, port}
+    else
+      nil -> {:error, :systemd_run_not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp start_port(workspace, worker_host, dynamic_tool_binding, model_route, nil, secret_names)
+       when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, dynamic_tool_binding, model_route, secret_names)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp local_launch_command(dynamic_tool_binding, model_route) do
+  defp start_port(_workspace, _worker_host, _dynamic_tool_binding, _model_route, _supervisor, _secret_names),
+    do: {:error, :remote_execution_supervisor_unsupported}
+
+  defp local_launch_command(dynamic_tool_binding, model_route, secret_names) do
     [
-      tracker_secret_unset_command(dynamic_tool_binding),
+      tracker_secret_unset_command(dynamic_tool_binding, secret_names),
       "exec #{Config.settings!().codex.command |> routed_command(model_route) |> local_shell_command()}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp remote_launch_command(workspace, dynamic_tool_binding, model_route) when is_binary(workspace) do
+  defp remote_launch_command(workspace, dynamic_tool_binding, model_route, secret_names) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      tracker_secret_unset_command(dynamic_tool_binding),
+      tracker_secret_unset_command(dynamic_tool_binding, secret_names),
       "exec #{routed_command(Config.settings!().codex.command, model_route)}"
     ]
     |> Enum.reject(&is_nil/1)
@@ -276,18 +396,29 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp tracker_secret_port_env(dynamic_tool_binding) do
-    dynamic_tool_binding.secret_environment_names
+  defp tracker_secret_port_env(dynamic_tool_binding, secret_names) do
+    (dynamic_tool_binding.secret_environment_names ++ secret_names)
+    |> Enum.uniq()
     |> valid_environment_names()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
-  defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
+  defp tracker_secret_unset_command(dynamic_tool_binding, secret_names) do
+    names = (dynamic_tool_binding.secret_environment_names ++ secret_names) |> Enum.uniq() |> valid_environment_names()
+
+    case names do
       [] -> nil
       names -> "unset " <> Enum.join(names, " ")
     end
   end
+
+  defp secret_environment_names(extra_names) when is_list(extra_names) do
+    (@runner_secret_environment_names ++ extra_names)
+    |> Enum.uniq()
+    |> valid_environment_names()
+  end
+
+  defp secret_environment_names(_extra_names), do: @runner_secret_environment_names
 
   defp execution_fence_preflight(nil), do: :ok
 
@@ -301,6 +432,20 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp execution_fence_preflight(_invalid), do: {:error, :invalid_execution_fence_guard}
+
+  defp record_execution_supervisor(nil, _recorder), do: :ok
+
+  defp record_execution_supervisor(identity, recorder) when is_map(identity) and is_function(recorder, 1) do
+    case recorder.(identity) do
+      :ok -> :ok
+      {:ok, _result} -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:invalid_execution_supervisor_record_result, other}}
+    end
+  end
+
+  defp record_execution_supervisor(_identity, nil), do: {:error, :execution_supervisor_recorder_missing}
+  defp record_execution_supervisor(_identity, _recorder), do: {:error, :invalid_execution_supervisor_recorder}
 
   defp valid_environment_names(names) do
     Enum.filter(names, fn name ->

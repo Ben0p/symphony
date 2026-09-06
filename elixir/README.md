@@ -74,6 +74,21 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+### Global mutable-admission pause
+
+Repository-pool operators can prevent new workers from being admitted by setting
+`SYMPHONY_GLOBAL_PAUSE_FILE` to a host-local state file. A configured gate is
+fail-closed: only the exact file contents `running` permit new workers; missing,
+unreadable, or invalid contents remain paused. The orchestrator checks the gate
+while polling, before retry dispatch, before execution-fence admission, and
+immediately before spawning a worker. Existing workers are not terminated by the
+gate.
+
+Startup terminal-workspace cleanup is fence-aware: a terminal issue with no
+recorded execution generation in the current pool, or a generation already
+marked cleaned, can use the existing path-safe cleanup path. Any recorded
+non-cleaned generation remains deferred for explicit fence reconciliation.
+
 ## Burrito releases
 
 Symphony ships self-contained executables built with
@@ -111,6 +126,91 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
+- `--activate-responsibility-graph` performs the one-time local transition from manual to
+  machine-enforced responsibility admission after the runtime starts
+
+The activation switch is intended for the current COO or explicitly delegated runtime owner
+while the global mutable-admission gate is paused. It requires a declared managed pool, the
+complete `DAHLIA_WORK_PACKAGE_*` runtime tuple, and an exact `paused` global pause file. The
+default remains manual, and an already enforced graph returns success without changing its
+persisted state. The launcher never enables this switch implicitly; the authorized local start
+command is:
+
+```bash
+./bin/symphony \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --activate-responsibility-graph \
+  /path/to/WORKFLOW.md
+```
+
+The command only changes the existing responsibility graph snapshot. It does not clear the
+pause gate, create delegations, admit an issue, or start a worker. Restarting with the same
+switch reloads the persisted `enforced` graph and is idempotent; remove the switch to retain the
+manual default for a fresh graph.
+
+### Private runner call-home
+
+The runtime can report a fixed, sanitized Symphony posture projection to a private Dahlia provider
+endpoint. The reporter is disabled when any required setting is absent or invalid. Configure these
+values in the runner host environment, not in a repository-owned `WORKFLOW.md`:
+
+```text
+DAHLIA_RUNNER_CALL_HOME_URL=https://provider.example/runner/v1/symphony/observations
+DAHLIA_RUNNER_CALL_HOME_TOKEN=<host-injected secret>
+DAHLIA_RUNNER_ID=<scoped runner identity>
+DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
+DAHLIA_SYMPHONY_POOL_KEY=<registered pool key>
+```
+
+`DAHLIA_RESPONSIBLE_DELEGATION_ID` and `DAHLIA_EXECUTION_FENCE_ID` are required for active-run
+observations. `DAHLIA_RUNNER_OBSERVATION_INTERVAL_MS` defaults to 5 seconds and is capped at 60
+seconds; `DAHLIA_RUNNER_OBSERVATION_STATE_PATH` can override the local sequence state file. Each
+observation contains only the versioned contract fields and the reporter persists its sequence
+before sending, so the provider can reject replayed or out-of-order observations.
+
+### Work-package runtime claim
+
+`SymphonyElixir.WorkPackageClaim` is a bounded operator adapter for the provider's v1 runner
+reservation contract. It requires a validated current execution-fence generation and its active
+responsible runtime lease, plus an active responsible delegation for the exact issue and repository.
+The reservation nonce and authority tuple are written to a private atomic journal before claim; a
+lost response or restart therefore reuses the same reservation and generation. When the
+orchestrator is started with its admitted Linux supervisor and work-package runtime callbacks,
+it claims this reservation before launching the mutable worker and posts termination and verified
+cleanup receipts from the same fence. Runner tokens and attestation keys are supplied by the host
+and are never logged or placed in workflow files.
+
+To enable this managed runtime on a Linux runner, the host must provide the complete tuple below;
+the service rejects a partial tuple during supervisor startup and leaves the adapter disabled when
+all five values are absent. A host that declares `SYMPHONY_POOL_KEY` or
+`SYMPHONY_REPOSITORY_REF` is treated as a managed pool and must provide the tuple:
+
+```text
+DAHLIA_WORK_PACKAGE_PROVIDER_URL=https://provider.example
+DAHLIA_WORK_PACKAGE_RUNNER_TOKEN=<host-injected secret>
+DAHLIA_WORK_PACKAGE_ATTESTATION_KEY=<host-injected secret>
+DAHLIA_RUNNER_ID=<scoped runner identity>
+DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
+
+# Launcher identity (required for managed-pool readiness)
+SYMPHONY_ACCEPTED_SOURCE_HEAD=<launcher-attested 40-character Git object ID>
+```
+
+`DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
+private reservation journal and archive root. The archive root must be outside active workspaces.
+The `/api/v1/state` response reports the effective `SYMPHONY_POOL_KEY`,
+`SYMPHONY_REPOSITORY_REF`, workflow workspace root, `SYMPHONY_GLOBAL_PAUSE_FILE`, and the accepted
+source head under `runtime_identity`. The launcher must provide `SYMPHONY_CURRENT_SOURCE_HEAD` as
+the matching 40-character observed revision from its executable attestation; an absent or malformed
+observation leaves the source unverified and makes managed-pool readiness fail, while a mismatch
+marks the identity stale.
+The same response reports `execution_authority.fence` (`hgs294`) and `execution_authority.delegation`
+(`hgs300`) together with their posture derived from the durable fence and responsibility graph.
+No provider or attestation credential is included in this projection.
+The local Linux path uses the systemd user supervisor and records the claim, process-tree proof,
+and archive evidence before releasing provider capacity. Remote SSH workers remain held when this
+proof or the independent archive verifier is unavailable. These provider credentials are scrubbed
+from the Codex child environment.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
@@ -211,6 +311,13 @@ codex:
 - Scope and paging: candidate reads filter the configured project slug and requested state names,
   following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
   state/ID lists return `{:ok, []}` without a Linear request.
+- Rate limiting: host-local Symphony processes share a provider rate-limit state file and lock.
+  HTTP `Retry-After` headers and Linear GraphQL rate-limit bodies both persist a bounded cooldown;
+  a one-hour provider window therefore fails closed locally instead of being retried against the
+  exhausted API bucket.
+  Managed Linux requires the util-linux `flock` executable for this lock. Hosts without that
+  kernel primitive, including Windows hosts, fail closed rather than using an unverified stale-lock
+  fallback.
 - Identity and normalization: `issue.id` is the Linear issue ID and `issue.native_ref` is currently
   `nil`. Records missing a nonblank ID, identifier, title, or state are dropped from candidate
   pages and fail ID refreshes. State keeps Linear's spelling; integer priorities are preserved and
