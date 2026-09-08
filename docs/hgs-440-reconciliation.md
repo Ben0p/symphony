@@ -64,8 +64,8 @@ qualification.
 
 ## Cross-platform qualification repairs
 
-The 2026-09-08 qualification retains all production code from the accepted
-runtime. Explicit LF attributes prevent Windows checkout/archive settings from
+The 2026-09-08 qualification starts from the accepted production runtime.
+Explicit LF attributes prevent Windows checkout/archive settings from
 converting embedded Unix shell fixtures to CRLF. The committed source blobs
 already used LF; this fixes delivery of those bytes to the Linux test host.
 
@@ -85,3 +85,18 @@ HGS-440 evidence linked from Linear. A fresh test request with durable output
 and no evidence deletion was admitted through the same execution review path.
 Source validation, fork merge, runtime installation, and managed acceptance
 remain distinct milestones.
+
+## Termination-confirmation defect found during qualification
+
+The complete static-analysis gate exposed a real handler defect inherited from
+the accepted runtime. `Orchestrator.confirm_execution_termination/5` reached a
+handler that passed the enclosing orchestrator state to the execution-fence
+validator. Valid termination evidence therefore returned `{:error, :invalid_state}`.
+The handler now passes `state.execution_fence`, matching the other confirmation
+paths and preserving the existing persistence and response handling.
+
+A regression runs through a real GenServer and the public API. It reproduces the
+failure before the fix, verifies durable confirmation and idempotent replay,
+and rejects mismatched process identity and generation without changing live
+fence state or persisted bytes. This source repair supports HGS-350; it does not
+establish installed-runtime or managed terminal-cleanup acceptance.

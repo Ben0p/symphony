@@ -3243,7 +3243,7 @@ defmodule SymphonyElixir.Orchestrator do
         %State{} = state
       ) do
     case ExecutionFence.confirm_termination(
-           state,
+           state.execution_fence,
            token,
            session_id,
            evidence,

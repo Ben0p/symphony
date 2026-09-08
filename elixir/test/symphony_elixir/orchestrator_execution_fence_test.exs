@@ -5,6 +5,60 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
   alias SymphonyElixir.ExecutionFence.Persistence
   alias SymphonyElixir.WorkPackageClaim.Journal
 
+  test "termination confirmation through the server persists only valid generation-bound evidence" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_concurrent_agents: 0
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    fence_path = Path.join(System.tmp_dir!(), "symphony-termination-api-#{System.unique_integer([:positive])}.json")
+    on_exit(fn -> File.rm(fence_path) end)
+    name = Module.concat(__MODULE__, "TerminationApi#{System.unique_integer([:positive])}")
+    pid = start_supervised!({Orchestrator, name: name})
+
+    {:ok, fence, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, fence, :registered} = ExecutionFence.register(fence, token, :worker, session(), 100)
+    {:ok, fence, :released} = ExecutionFence.release(fence, token, "worker-1", :orchestrator_stop)
+    :sys.replace_state(pid, &%{&1 | execution_fence: fence, execution_fence_path: fence_path})
+
+    evidence = %{
+      session_id: "worker-1",
+      process_id: "logical-process-1",
+      process_tree: :terminated,
+      evidence_ref: "termination-api-test",
+      observed_at_ms: 110
+    }
+
+    assert {:ok, :confirmed} =
+             Orchestrator.confirm_execution_termination(pid, token, "worker-1", evidence, 110)
+
+    assert {:ok, persisted} = Persistence.load(fence_path)
+    execution = persisted.executions["HGS-294"]
+    assert execution.leases["worker-1"].termination_confirmed_at_ms == 110
+    assert execution.ownership == :reconciled
+    assert execution.termination_unconfirmed == false
+    live_fence = :sys.get_state(pid).execution_fence
+    assert live_fence.executions["HGS-294"].leases["worker-1"].termination_confirmed_at_ms == 110
+    persisted_bytes = File.read!(fence_path)
+
+    assert {:ok, :already_confirmed} =
+             Orchestrator.confirm_execution_termination(pid, token, "worker-1", evidence, 111)
+
+    assert File.read!(fence_path) == persisted_bytes
+
+    for {rejected_token, rejected_evidence} <- [
+          {token, %{evidence | process_id: "wrong-process"}},
+          {%{token | generation: token.generation + 1}, evidence}
+        ] do
+      assert {:error, _reason} =
+               Orchestrator.confirm_execution_termination(pid, rejected_token, "worker-1", rejected_evidence, 112)
+
+      assert File.read!(fence_path) == persisted_bytes
+      assert :sys.get_state(pid).execution_fence == live_fence
+    end
+  end
+
   test "an ordinary poll retries a failed cleanup receipt and permits the next generation" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
