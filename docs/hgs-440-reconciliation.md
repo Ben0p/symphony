@@ -75,6 +75,10 @@ Their original response, logging, and bound-settings assertions still run on
 Linux. The restart-fencing fixture uses a bounded release-marker loop instead
 of an unbounded FIFO read, so aborting a test cannot leave its shell waiting
 indefinitely. The production lock and execution fences are unchanged.
+The restart test identifies the issue's admitted worker from orchestrator state;
+the task supervisor also owns a short-lived startup-maintenance task, so its
+first child is not a reliable worker identity. Teardown releases the hook and
+waits boundedly for the shell to release its fixture directory before removal.
 
 Original automatic denials and failed qualification logs are retained in the
 HGS-440 evidence linked from Linear. A fresh test request with durable output
