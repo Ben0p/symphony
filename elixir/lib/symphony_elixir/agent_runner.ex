@@ -123,18 +123,25 @@ defmodule SymphonyElixir.AgentRunner do
       "Codex model route selected for #{issue_context(issue)} model=#{route.model} tier=#{route.tier} effort=#{route.effort} attempt=#{route.attempt} escalated=#{route.escalated} reason=#{inspect(route.reason)}"
     )
 
-    with {:ok, session} <-
-           AppServer.start_session(
-             workspace,
-             worker_host: worker_host,
-             model_route: route,
-             execution_fence_guard: Keyword.get(opts, :execution_fence_guard)
-           ) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
-      end
+    session_opts = [
+      worker_host: worker_host,
+      model_route: route,
+      execution_fence_guard: Keyword.get(opts, :execution_fence_guard),
+      execution_supervisor: Keyword.get(opts, :execution_supervisor),
+      execution_supervisor_recorder: Keyword.get(opts, :execution_supervisor_recorder),
+      secret_environment_names: Keyword.get(opts, :secret_environment_names, [])
+    ]
+
+    case AppServer.start_session(workspace, session_opts) do
+      {:ok, session} ->
+        try do
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        after
+          AppServer.stop_session(session)
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

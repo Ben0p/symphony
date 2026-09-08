@@ -155,21 +155,15 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+    case validate_remote_workspace_path(workspace) do
+      :ok ->
+        case maybe_run_before_remove_hook(workspace, worker_host) do
+          :ok ->
+            remove_remote_workspace(workspace, worker_host)
 
-    script =
-      [
-        remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
-      ]
-      |> Enum.join("\n")
-
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
-
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+          {:error, reason} ->
+            {:error, reason, workspace}
+        end
 
       {:error, reason} ->
         {:error, reason, ""}
@@ -200,16 +194,164 @@ defmodule SymphonyElixir.Workspace do
     {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
   end
 
+  @doc false
+  @spec remote_cleanup_script_for_test(Path.t(), Path.t()) :: String.t()
+  def remote_cleanup_script_for_test(workspace, root)
+      when is_binary(workspace) and is_binary(root) do
+    [
+      "set -eu",
+      remote_workspace_confinement_script(root, workspace),
+      "rm -rf -- \"$workspace\""
+    ]
+    |> Enum.join("\n")
+  end
+
+  @doc false
+  @spec path_exists?(Path.t(), worker_host()) :: {:ok, boolean()} | {:error, term()}
+  def path_exists?(workspace, nil) when is_binary(workspace) do
+    case File.lstat(workspace) do
+      {:ok, _stat} -> {:ok, true}
+      {:error, :enoent} -> {:ok, false}
+      {:error, reason} -> {:error, {:workspace_presence_failed, reason}}
+    end
+  end
+
+  def path_exists?(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
+    with :ok <- validate_remote_workspace_path(workspace),
+         {:ok, {output, 0}} <-
+           run_remote_command(
+             worker_host,
+             [
+               "set -eu",
+               remote_workspace_confinement_script(Config.settings!().workspace.root, workspace),
+               "if [ -e \"$workspace\" ] || [ -L \"$workspace\" ]; then printf '1\\n'; else printf '0\\n'; fi"
+             ]
+             |> Enum.join("\n"),
+             Config.settings!().hooks.timeout_ms
+           ) do
+      case String.trim(IO.iodata_to_binary(output)) do
+        "1" -> {:ok, true}
+        "0" -> {:ok, false}
+        _ -> {:error, {:workspace_presence_failed, :invalid_output}}
+      end
+    else
+      {:ok, {_output, status}} -> {:error, {:workspace_presence_failed, status}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def path_exists?(_workspace, _worker_host), do: {:error, :invalid_workspace}
+
   defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
-    File.rm_rf(workspace)
+    case maybe_run_before_remove_hook(workspace, nil) do
+      :ok ->
+        case detach_local_reparse_points(workspace) do
+          :ok -> File.rm_rf(workspace)
+          {:error, reason} -> {:error, reason, workspace}
+        end
+
+      {:error, reason} ->
+        {:error, reason, workspace}
+    end
+  end
+
+  defp detach_local_reparse_points(workspace) do
+    case :os.type() do
+      {:win32, _name} ->
+        detach_windows_reparse_points(workspace)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp detach_windows_reparse_points(workspace) do
+    case System.find_executable("pwsh") || System.find_executable("powershell.exe") do
+      nil ->
+        {:error, {:workspace_reparse_inspection_failed, workspace, :powershell_unavailable}}
+
+      executable ->
+        script = """
+        $ErrorActionPreference = 'Stop'
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $root = [System.IO.Path]::GetFullPath($env:SYMPHONY_WORKSPACE).TrimEnd([char[]]('/\'))
+        $rootPrefix = $root + [System.IO.Path]::DirectorySeparatorChar
+        $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+        $pending.Push([System.IO.DirectoryInfo]::new($root))
+        while ($pending.Count -gt 0) {
+          $directory = $pending.Pop()
+          foreach ($entry in $directory.EnumerateFileSystemInfos('*', [System.IO.SearchOption]::TopDirectoryOnly)) {
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              $entryPath = [System.IO.Path]::GetFullPath($entry.FullName)
+              if ($entryPath.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or
+                  -not $entryPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Reparse entry is outside the validated workspace: $entryPath"
+              }
+
+              $linkInfo = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
+              $linkType = [string]$linkInfo.LinkType
+              if ($linkType -notin @('Junction', 'SymbolicLink')) {
+                throw "Unsupported or unknown reparse entry type '$linkType': $entryPath"
+              }
+
+              $isDirectory = $linkInfo -is [System.IO.DirectoryInfo]
+              $isFile = $linkInfo -is [System.IO.FileInfo]
+              if (-not $isDirectory -and -not $isFile) {
+                throw "Unable to determine reparse entry type: $entryPath"
+              }
+
+              # Native Delete receives only the link path and never the target;
+              # the shell therefore cannot recurse through the reparse entry.
+              if ($isDirectory) {
+                [System.IO.Directory]::Delete($entryPath, $false)
+              } else {
+                [System.IO.File]::Delete($entryPath)
+              }
+              if ($null -ne (Get-Item -LiteralPath $entryPath -Force -ErrorAction SilentlyContinue)) {
+                throw "Reparse entry remains after unlink: $entryPath"
+              }
+              continue
+            }
+            if ($entry -is [System.IO.DirectoryInfo]) {
+              $pending.Push($entry)
+            }
+          }
+        }
+        """
+
+        case System.cmd(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+               stderr_to_stdout: true,
+               env: [{"SYMPHONY_WORKSPACE", workspace}]
+             ) do
+          {_output, 0} -> :ok
+          {output, status} -> {:error, {:workspace_reparse_detach_failed, workspace, status, output}}
+        end
+    end
+  rescue
+    error -> {:error, {:workspace_reparse_inspection_failed, workspace, error.__struct__}}
+  end
+
+  defp remove_remote_workspace(workspace, worker_host) do
+    root = Config.settings!().workspace.root
+    script = remote_cleanup_script_for_test(workspace, root)
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> {:ok, []}
+      {:ok, {output, status}} -> {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+      {:error, reason} -> {:error, reason, ""}
+    end
   end
 
   defp remove_startup_workspace(workspace, nil) do
     if File.exists?(workspace) do
       with :ok <- validate_workspace_path(workspace, nil) do
-        maybe_run_before_remove_hook(workspace, nil)
-        remove_local_workspace_out_of_process(workspace)
+        with :ok <- maybe_run_before_remove_hook(workspace, nil) do
+          with :ok <- detach_local_reparse_points(workspace) do
+            # The hook already ran above. Remove directly so startup cleanup does
+            # not invoke the before_remove hook a second time.
+            remove_local_workspace_out_of_process(workspace)
+          end
+        end
       end
     else
       :ok
@@ -255,57 +397,83 @@ defmodule SymphonyElixir.Workspace do
     error -> {:error, {:workspace_remove_failed, error.__struct__}}
   end
 
-  @spec remove_issue_workspaces(term()) :: :ok
+  @spec remove_issue_workspaces(term()) :: :ok | {:error, term()}
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 
-  @spec remove_issue_workspaces(term(), worker_host()) :: :ok
+  @spec remove_issue_workspaces(term(), worker_host()) :: :ok | {:error, term()}
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, worker_host)
       when is_binary(worker_host) do
     case workspace_path_for_issue(workspace_key(issue), worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
-    end
+      {:ok, workspace} ->
+        case remove(workspace, worker_host) do
+          {:ok, _removed} -> :ok
+          {:error, reason, path} -> {:error, {reason, path}}
+        end
 
-    :ok
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
         case workspace_path_for_issue(workspace_key(issue), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
+          {:ok, workspace} ->
+            case remove(workspace, nil) do
+              {:ok, _removed} -> :ok
+              {:error, reason, path} -> {:error, {reason, path}}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
+        Enum.reduce_while(worker_hosts, :ok, fn worker_host, :ok ->
+          case remove_issue_workspaces(issue, worker_host) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, {worker_host, reason}}}
+          end
+        end)
     end
-
-    :ok
   end
 
   def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
     case workspace_path_for_issue(workspace_key(identifier), worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
-    end
+      {:ok, workspace} ->
+        case remove(workspace, worker_host) do
+          {:ok, _removed} -> :ok
+          {:error, reason, path} -> {:error, {reason, path}}
+        end
 
-    :ok
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
         case workspace_path_for_issue(workspace_key(identifier), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
+          {:ok, workspace} ->
+            case remove(workspace, nil) do
+              {:ok, _removed} -> :ok
+              {:error, reason, path} -> {:error, {reason, path}}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
+        Enum.reduce_while(worker_hosts, :ok, fn worker_host, :ok ->
+          case remove_issue_workspaces(identifier, worker_host) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, {worker_host, reason}}}
+          end
+        end)
     end
-
-    :ok
   end
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
@@ -481,7 +649,6 @@ defmodule SymphonyElixir.Workspace do
               "before_remove",
               nil
             )
-            |> ignore_hook_failure()
         end
 
       false ->
@@ -499,6 +666,8 @@ defmodule SymphonyElixir.Workspace do
       command ->
         script =
           [
+            "set -eu",
+            remote_workspace_confinement_script(Config.settings!().workspace.root, workspace),
             remote_shell_assign("workspace", workspace),
             "if [ -d \"$workspace\" ]; then",
             "  cd \"$workspace\"",
@@ -523,7 +692,6 @@ defmodule SymphonyElixir.Workspace do
           {:error, reason} ->
             {:error, reason}
         end
-        |> ignore_hook_failure()
     end
   end
 
@@ -614,6 +782,80 @@ defmodule SymphonyElixir.Workspace do
 
   defp validate_recorded_workspace_path(workspace) when is_binary(workspace) do
     validate_local_workspace_path(workspace, Path.dirname(workspace))
+  end
+
+  defp validate_remote_workspace_path(workspace) when is_binary(workspace) do
+    root = Config.settings!().workspace.root
+
+    with :ok <- validate_remote_path_text(workspace),
+         :ok <- validate_remote_path_text(root),
+         {:ok, root_segments} <- remote_path_segments(root),
+         {:ok, workspace_segments} <- remote_path_segments(workspace),
+         :ok <- validate_remote_absolute_path(workspace),
+         :ok <- validate_remote_absolute_path(root) do
+      if remote_path_kind(root) != remote_path_kind(workspace) or
+           (length(workspace_segments) > length(root_segments) and
+              Enum.take(workspace_segments, length(root_segments)) == root_segments) do
+        :ok
+      else
+        {:error, {:workspace_outside_root, workspace, root}}
+      end
+    end
+  end
+
+  defp validate_remote_absolute_path(path) do
+    normalized = String.replace(path, "\\", "/")
+
+    if String.starts_with?(normalized, "/") or normalized == "~" or
+         String.starts_with?(normalized, "~/") do
+      :ok
+    else
+      {:error, {:workspace_path_unreadable, path, :not_absolute}}
+    end
+  end
+
+  defp validate_remote_path_text(path) when is_binary(path) do
+    cond do
+      String.trim(path) == "" ->
+        {:error, {:workspace_path_unreadable, path, :empty}}
+
+      String.contains?(path, ["\n", "\r", <<0>>]) ->
+        {:error, {:workspace_path_unreadable, path, :invalid_characters}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp remote_path_segments(path) when is_binary(path) do
+    segments = String.split(String.replace(path, "\\", "/"), "/", trim: true)
+
+    if Enum.any?(segments, &(&1 in [".", ".."])) do
+      {:error, {:workspace_path_unreadable, path, :dot_segment}}
+    else
+      {:ok, segments}
+    end
+  end
+
+  defp remote_path_kind(path) when is_binary(path) do
+    normalized = String.replace(path, "\\", "/")
+    if normalized == "~" or String.starts_with?(normalized, "~/"), do: :home, else: :absolute
+  end
+
+  defp remote_workspace_confinement_script(root, workspace)
+       when is_binary(root) and is_binary(workspace) do
+    [
+      remote_shell_assign("root", root),
+      remote_shell_assign("workspace", workspace),
+      "if ! canonical_root=$(realpath -m -- \"$root\"); then exit 72; fi",
+      "if ! canonical_workspace=$(realpath -m -- \"$workspace\"); then exit 72; fi",
+      "case \"$canonical_workspace/\" in",
+      "  \"$canonical_root/\"*) ;;",
+      "  *) exit 73 ;;",
+      "esac",
+      "if [ \"$canonical_workspace\" = \"$canonical_root\" ]; then exit 74; fi"
+    ]
+    |> Enum.join("\n")
   end
 
   defp validate_local_workspace_path(workspace, workspace_root)

@@ -1438,6 +1438,121 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            } = loop_state.retry_attempts[loop_issue_id].stall_diagnostic
   end
 
+  test "orchestrator enforces a cumulative token budget across worker attempts" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 0,
+      codex_max_no_progress_tokens: 0,
+      codex_max_total_tokens: 100
+    )
+
+    issue_id = "issue-total-token-budget"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TOTAL-BUDGET",
+      title: "Cumulative token budget test",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-TOTAL-BUDGET",
+      dispatchable: true
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TotalTokenBudgetOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    first_worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    initial_state = :sys.get_state(pid)
+
+    first_entry = %{
+      pid: first_worker_pid,
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-total-budget-first",
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now(),
+      last_codex_event: :notification
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => first_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{"inputTokens" => 45, "outputTokens" => 15, "totalTokens" => 60}
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    first_state = :sys.get_state(pid)
+    assert first_state.codex_issue_totals[issue_id] == 60
+    assert first_state.running[issue_id].codex_issue_total_tokens == 60
+    refute Map.has_key?(first_state.blocked, issue_id)
+
+    Process.exit(first_worker_pid, :normal)
+    second_worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    second_entry = %{first_entry | pid: second_worker_pid, session_id: "thread-total-budget-second"}
+
+    :sys.replace_state(pid, fn current ->
+      %{current | running: %{issue_id => second_entry}}
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{"inputTokens" => 30, "outputTokens" => 10, "totalTokens" => 40}
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(second_worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+    assert state.codex_issue_totals[issue_id] == 100
+
+    assert %{
+             reason: "codex_total_token_budget_exhausted",
+             issue_total_tokens: 100,
+             total_token_threshold: 100,
+             current_attempt_total_tokens: 40
+           } = state.blocked[issue_id].stall_diagnostic
+
+    assert state.blocked[issue_id].error ==
+             "codex total token budget exhausted at 100 tokens (threshold 100)"
+  end
+
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

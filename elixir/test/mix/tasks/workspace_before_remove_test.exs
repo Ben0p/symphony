@@ -311,9 +311,12 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
       Enum.each(scripts, fn {name, script} ->
         script_path = Path.join(bin_dir, "#{name}.sh")
         shim_path = Path.join(bin_dir, "#{name}.cmd")
+        executable_path = Path.join(bin_dir, name)
 
         File.write!(script_path, script)
         File.chmod!(script_path, 0o755)
+        File.write!(executable_path, script)
+        File.chmod!(executable_path, 0o755)
 
         File.write!(shim_path, "@echo off\r\nsh \"#{shell_path(script_path)}\" %*\r\n")
       end)

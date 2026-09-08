@@ -77,6 +77,104 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
     assert [%{observed_head: "def456"}] = Map.values(restored.triage_records)
   end
 
+  test "persists the termination safety flag and cleanup receipt", %{path: path} do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1"), 100)
+
+    {:ok, state, %{status: :blocked, expired: ["worker-1"]}} =
+      ExecutionFence.reconcile_sessions(state, [], 200, 50)
+
+    assert :ok = Persistence.save(path, state)
+    assert {:ok, state} = Persistence.load(path)
+    assert state.executions[@issue].termination_unconfirmed
+
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 210)
+
+    evidence = %{
+      session_id: "worker-1",
+      process_id: "process-worker-1",
+      process_tree: :terminated,
+      evidence_ref: "process-tree-check-1",
+      observed_at_ms: 220
+    }
+
+    {:ok, state, :confirmed} =
+      ExecutionFence.confirm_termination(state, token, "worker-1", evidence, 220)
+
+    {:ok, state, :prepared} = ExecutionFence.prepare_cleanup(state, token, "abc123", 230)
+
+    assert :ok = Persistence.save(path, state)
+    assert {:ok, restored} = Persistence.load(path)
+    assert restored == state
+    refute restored.executions[@issue].termination_unconfirmed
+    assert restored.executions[@issue].cleanup_receipt.phase == :removal_started
+    assert restored.executions[@issue].leases["worker-1"].termination_confirmed_at_ms == 220
+    assert restored.executions[@issue].leases["worker-1"].termination_evidence_ref == "process-tree-check-1"
+    assert restored.executions[@issue].leases["worker-1"].termination_evidence == evidence
+  end
+
+  test "persists released lease termination uncertainty through restart", %{path: path} do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1"), 100)
+
+    {:ok, state, :released} =
+      ExecutionFence.release(state, token, "worker-1", :orchestrator_stop)
+
+    assert :ok = Persistence.save(path, state)
+    assert {:ok, restored} = Persistence.load(path)
+    assert restored.executions[@issue].termination_unconfirmed
+    assert restored.executions[@issue].leases["worker-1"].termination_required
+
+    assert {:ok, restored} = ExecutionFence.mark_unreconciled_after_restart(restored)
+    assert restored.executions[@issue].ownership == :unknown
+
+    evidence = %{
+      session_id: "worker-1",
+      process_id: "process-worker-1",
+      process_tree: :terminated,
+      evidence_ref: "process-tree-check-restart",
+      observed_at_ms: 120
+    }
+
+    assert {:ok, restored, :confirmed} =
+             ExecutionFence.confirm_termination(restored, token, "worker-1", evidence, 120)
+
+    refute restored.executions[@issue].termination_unconfirmed
+    assert restored.executions[@issue].ownership == :reconciled
+    assert :ok = Persistence.save(path, restored)
+    assert {:ok, reloaded} = Persistence.load(path)
+    assert reloaded.executions[@issue].leases["worker-1"].termination_required
+    assert reloaded.executions[@issue].leases["worker-1"].termination_confirmed_at_ms == 120
+  end
+
+  test "legacy snapshots with expired leases migrate to unconfirmed termination", %{path: path} do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+
+    {:ok, state, :registered} =
+      ExecutionFence.register(state, token, :worker, session("worker-1"), 100)
+
+    {:ok, state, _summary} = ExecutionFence.reconcile_sessions(state, [], 200, 50)
+    assert :ok = Persistence.save(path, state)
+
+    payload =
+      path
+      |> File.read!()
+      |> Jason.decode!()
+
+    legacy_execution = Map.delete(payload["executions"][@issue], "termination_unconfirmed")
+    legacy_payload = put_in(payload, ["executions", @issue], legacy_execution)
+
+    File.write!(path, Jason.encode!(legacy_payload))
+
+    assert {:ok, restored} = Persistence.load(path)
+    assert restored.executions[@issue].termination_unconfirmed
+    refute Map.has_key?(restored.executions[@issue].leases["worker-1"], :termination_confirmed_at_ms)
+  end
+
   defp admission(issue_id \\ @issue) do
     %{
       issue_id: issue_id,

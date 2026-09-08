@@ -35,6 +35,17 @@ bind its HGS-294 runtime lease before the worker starts. The worker's side-effec
 guard then authorizes through both contracts; an active worker exit releases the
 binding so a bounded retry can receive a fresh generation.
 
+The running escript exposes that transition through the local
+`--activate-responsibility-graph` boot switch. The switch is opt-in and is accepted
+only when `SYMPHONY_POOL_KEY` or `SYMPHONY_REPOSITORY_REF` declares a managed pool,
+the complete work-package runtime tuple is present, and
+`SYMPHONY_GLOBAL_PAUSE_FILE` contains the exact operator state `paused`. It invokes
+the existing orchestrator transition after startup, so the graph snapshot is
+validated and persisted by its normal owner. A repeated boot against an already
+enforced snapshot is idempotent. This is a local control reserved to the current
+COO or an explicitly delegated runtime owner; there is no activation HTTP endpoint
+and the launcher does not enable the switch automatically.
+
 The orchestrator persists the graph as a versioned, sanitized JSON snapshot at
 `responsibility-graph.json` beside the execution-fence snapshot. On restart,
 delegations already bound to a runtime lease are blocked until that lease is

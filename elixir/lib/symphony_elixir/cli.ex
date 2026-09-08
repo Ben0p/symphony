@@ -3,18 +3,25 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.LogFile
+  alias SymphonyElixir.{LogFile, ResponsibilityBootstrap}
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
-  @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
+  @activation_switch :activate_responsibility_graph
+  @switches [
+    {@acknowledgement_switch, :boolean},
+    {@activation_switch, :boolean},
+    logs_root: :string,
+    port: :integer
+  ]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
   @type deps :: %{
-          file_regular?: (String.t() -> boolean()),
-          set_workflow_file_path: (String.t() -> :ok | {:error, term()}),
-          set_logs_root: (String.t() -> :ok | {:error, term()}),
-          set_server_port_override: (non_neg_integer() | nil -> :ok | {:error, term()}),
-          ensure_all_started: (-> ensure_started_result())
+          required(:file_regular?) => (String.t() -> boolean()),
+          required(:set_workflow_file_path) => (String.t() -> :ok | {:error, term()}),
+          required(:set_logs_root) => (String.t() -> :ok | {:error, term()}),
+          required(:set_server_port_override) => (non_neg_integer() | nil -> :ok | {:error, term()}),
+          required(:ensure_all_started) => (-> ensure_started_result()),
+          optional(:activate_responsibility_graph) => (non_neg_integer() -> :ok | {:error, term()})
         }
 
   @spec main([String.t()]) :: no_return()
@@ -42,14 +49,14 @@ defmodule SymphonyElixir.CLI do
         with :ok <- require_guardrails_acknowledgement(opts),
              :ok <- maybe_set_logs_root(opts, deps),
              :ok <- maybe_set_server_port(opts, deps) do
-          run(Path.expand("WORKFLOW.md"), deps)
+          run(Path.expand("WORKFLOW.md"), deps, opts)
         end
 
       {opts, [workflow_path], []} ->
         with :ok <- require_guardrails_acknowledgement(opts),
              :ok <- maybe_set_logs_root(opts, deps),
              :ok <- maybe_set_server_port(opts, deps) do
-          run(workflow_path, deps)
+          run(workflow_path, deps, opts)
         end
 
       _ ->
@@ -58,7 +65,10 @@ defmodule SymphonyElixir.CLI do
   end
 
   @spec run(String.t(), deps()) :: :ok | {:error, String.t()}
-  def run(workflow_path, deps) do
+  def run(workflow_path, deps), do: run(workflow_path, deps, [])
+
+  @spec run(String.t(), deps(), keyword()) :: :ok | {:error, String.t()}
+  def run(workflow_path, deps, opts) do
     expanded_path = Path.expand(workflow_path)
 
     if deps.file_regular?.(expanded_path) do
@@ -66,7 +76,7 @@ defmodule SymphonyElixir.CLI do
 
       case deps.ensure_all_started.() do
         {:ok, _started_apps} ->
-          :ok
+          maybe_activate_responsibility_graph(opts, deps)
 
         {:error, reason} ->
           {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
@@ -78,7 +88,7 @@ defmodule SymphonyElixir.CLI do
 
   @spec usage_message() :: String.t()
   defp usage_message do
-    "Usage: symphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
+    "Usage: symphony [--logs-root <path>] [--port <port>] [--activate-responsibility-graph] [path-to-WORKFLOW.md]"
   end
 
   @spec runtime_deps() :: deps()
@@ -88,8 +98,32 @@ defmodule SymphonyElixir.CLI do
       set_workflow_file_path: &SymphonyElixir.Workflow.set_workflow_file_path/1,
       set_logs_root: &set_logs_root/1,
       set_server_port_override: &set_server_port_override/1,
+      activate_responsibility_graph: &ResponsibilityBootstrap.activate/1,
       ensure_all_started: ensure_all_started
     }
+  end
+
+  defp maybe_activate_responsibility_graph(opts, deps) do
+    if Keyword.get(opts, @activation_switch, false) do
+      case Map.get(deps, :activate_responsibility_graph) do
+        callback when is_function(callback, 1) ->
+          case callback.(System.system_time(:millisecond)) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              {:error, "Failed to activate responsibility graph: #{inspect(reason)}"}
+
+            result ->
+              {:error, "Failed to activate responsibility graph: #{inspect(result)}"}
+          end
+
+        _ ->
+          {:error, "Responsibility graph activation is unavailable"}
+      end
+    else
+      :ok
+    end
   end
 
   defp maybe_set_logs_root(opts, deps) do

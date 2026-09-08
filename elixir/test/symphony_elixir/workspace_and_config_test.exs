@@ -263,6 +263,69 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "remote workspace removal rejects paths outside the configured root before SSH" do
+    configured_root = "/tmp/symphony-elixir-remote-root-#{System.unique_integer([:positive])}"
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: configured_root)
+
+    dot_path = configured_root <> "/../outside"
+
+    assert {:error, {:workspace_path_unreadable, ^dot_path, :dot_segment}, ""} =
+             Workspace.remove(dot_path, "worker-01:2200")
+
+    outside = "/tmp/symphony-elixir-remote-outside"
+
+    assert {:error, {:workspace_outside_root, ^outside, ^configured_root}, ""} =
+             Workspace.remove(outside, "worker-01:2200")
+  end
+
+  test "generated POSIX remote cleanup shell removes only a confined child" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-cleanup-shell-#{System.unique_integer([:positive])}"
+      )
+
+    root = Path.join(test_root, "root")
+    outside = Path.join(test_root, "outside")
+    child = Path.join(root, "child")
+
+    try do
+      if match?({:win32, _}, :os.type()) do
+        :ok
+      else
+        File.mkdir_p!(child)
+        File.mkdir_p!(outside)
+        File.write!(Path.join(child, "keep.txt"), "remove")
+
+        script = Workspace.remote_cleanup_script_for_test(child, root)
+        {_output, status} = System.cmd("sh", ["-c", script], stderr_to_stdout: true)
+
+        assert status == 0
+        refute File.exists?(child)
+        assert File.exists?(root)
+
+        symlink = Path.join(root, "escape")
+
+        case symlink_or_skip!(outside, symlink) do
+          :ok ->
+            File.write!(Path.join(outside, "keep.txt"), "preserve")
+            escaped_child = Path.join(symlink, "child")
+            escape_script = Workspace.remote_cleanup_script_for_test(escaped_child, root)
+            {_output, status} = System.cmd("sh", ["-c", escape_script], stderr_to_stdout: true)
+
+            assert status == 73
+            assert File.exists?(outside)
+            assert File.exists?(Path.join(outside, "keep.txt"))
+
+          {:symlink_unavailable, _reason} ->
+            :ok
+        end
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace canonicalizes symlinked workspace roots before creating issue directories" do
     test_root =
       Path.join(
@@ -680,32 +743,48 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "linear client logs response bodies for non-200 graphql responses" do
+    parent = self()
+
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert {:error, {:linear_api_status, 400}} =
-                 Client.graphql(
-                   "query Viewer { viewer { id } }",
-                   %{},
-                   request_fun: fn _payload, _headers ->
-                     {:ok,
-                      %{
-                        status: 400,
-                        body: %{
-                          "errors" => [
-                            %{
-                              "message" => "Variable \"$ids\" got invalid value",
-                              "extensions" => %{"code" => "BAD_USER_INPUT"}
-                            }
-                          ]
-                        }
-                      }}
-                   end
-                 )
+        result =
+          Client.graphql(
+            "query Viewer { viewer { id } }",
+            %{},
+            request_fun: fn _payload, _headers ->
+              send(parent, :linear_error_transport_called)
+
+              {:ok,
+               %{
+                 status: 400,
+                 body: %{
+                   "errors" => [
+                     %{
+                       "message" => "Variable \"$ids\" got invalid value",
+                       "extensions" => %{"code" => "BAD_USER_INPUT"}
+                     }
+                   ]
+                 }
+               }}
+            end
+          )
+
+        if linear_lock_supported?() do
+          assert {:error, {:linear_api_status, 400}} = result
+        else
+          assert {:error, {:linear_api_request, {:linear_rate_limit, :linear_rate_limit_lock_unsupported}}} = result
+        end
       end)
 
-    assert log =~ "Linear GraphQL request failed status=400"
-    assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
-    assert log =~ "Variable \\\"$ids\\\" got invalid value"
+    if linear_lock_supported?() do
+      assert_receive :linear_error_transport_called
+      assert log =~ "Linear GraphQL request failed status=400"
+      assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
+      assert log =~ "Variable \\\"$ids\\\" got invalid value"
+    else
+      refute_receive :linear_error_transport_called
+      assert log =~ "linear_rate_limit_lock_unsupported"
+    end
   end
 
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
@@ -730,21 +809,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     Workflow.set_workflow_file_path(missing_workflow_path)
 
-    assert {:ok, %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}} =
-             Client.graphql(
-               "query Viewer { viewer { id } }",
-               %{},
-               tracker_settings: %{
-                 api_key: "bound-token",
-                 endpoint: "https://bound.example.test/graphql"
-               },
-               request_fun: fn payload, headers ->
-                 send(parent, {:bound_graphql_request, payload, headers})
-                 {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
-               end
-             )
+    result =
+      Client.graphql(
+        "query Viewer { viewer { id } }",
+        %{},
+        tracker_settings: %{
+          api_key: "bound-token",
+          endpoint: "https://bound.example.test/graphql"
+        },
+        request_fun: fn payload, headers ->
+          send(parent, {:bound_graphql_request, payload, headers})
+          {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
+        end
+      )
 
-    assert_receive {:bound_graphql_request, %{"query" => "query Viewer { viewer { id } }"}, [{"Authorization", "bound-token"}, {"Content-Type", "application/json"}]}
+    if linear_lock_supported?() do
+      assert {:ok, %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}} = result
+      assert_receive {:bound_graphql_request, %{"query" => "query Viewer { viewer { id } }"}, [{"Authorization", "bound-token"}, {"Content-Type", "application/json"}]}
+    else
+      assert {:error, {:linear_api_request, {:linear_rate_limit, :linear_rate_limit_lock_unsupported}}} = result
+      refute_receive {:bound_graphql_request, _, _}
+    end
+  end
+
+  defp linear_lock_supported? do
+    match?({:unix, _name}, :os.type()) and is_binary(System.find_executable("flock"))
   end
 
   test "orchestrator sorts dispatch by priority then oldest created_at" do
@@ -991,7 +1080,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace remove continues when before_remove hook fails" do
+  test "workspace remove preserves the workspace when before_remove hook fails" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1009,14 +1098,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
-      refute File.exists?(workspace)
+
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, _}, ^workspace} =
+               Workspace.remove(workspace)
+
+      assert File.exists?(workspace)
+
+      assert {:error, {{:workspace_hook_failed, "before_remove", 17, _}, ^workspace}} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook fails with large output" do
+  test "workspace remove preserves the workspace when before_remove hook fails with large output" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1034,26 +1129,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
-      refute File.exists?(workspace)
+
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, _}, ^workspace} =
+               Workspace.remove(workspace)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook times out" do
-    previous_timeout = Application.get_env(:symphony_elixir, :workspace_hook_timeout_ms)
-
-    on_exit(fn ->
-      if is_nil(previous_timeout) do
-        Application.delete_env(:symphony_elixir, :workspace_hook_timeout_ms)
-      else
-        Application.put_env(:symphony_elixir, :workspace_hook_timeout_ms, previous_timeout)
-      end
-    end)
-
-    Application.put_env(:symphony_elixir, :workspace_hook_timeout_ms, 10)
-
+  test "workspace remove preserves the workspace when before_remove hook times out" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1067,12 +1153,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
+        hook_timeout_ms: 10,
         hook_before_remove: "sleep 1"
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
-      refute File.exists?(workspace)
+
+      assert {:error, {:workspace_hook_timeout, "before_remove", _}, ^workspace} =
+               Workspace.remove(workspace)
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
@@ -1133,6 +1223,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
     assert config.codex.max_no_progress_tokens == 0
+    assert config.codex.max_total_tokens == 0
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_required_labels: [" Symphony ", "SYMPHONY", "JavaScript"]
@@ -1208,6 +1299,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_max_no_progress_tokens: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.max_no_progress_tokens"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_max_total_tokens: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.max_total_tokens"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
@@ -1706,6 +1801,90 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.workflow_prompt() == workflow_prompt
   end
 
+  test "local cleanup remains idempotent when the issue workspace is absent" do
+    write_workflow_file!(Workflow.workflow_file_path())
+
+    assert :ok = Workspace.remove_issue_workspaces("HGS-ABSENT")
+    assert :ok = Workspace.remove_issue_workspaces_for_startup("HGS-ABSENT")
+  end
+
+  test "local cleanup detaches nested dependency links before removing a workspace" do
+    for {route, cleanup} <- [
+          {"terminal", &Workspace.remove_issue_workspaces/1},
+          {"startup", &Workspace.remove_issue_workspaces_for_startup/1}
+        ] do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-elixir-junction-cleanup-#{route}-#{System.unique_integer([:positive])}"
+        )
+
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace_path = Path.join(workspace_root, "HGS-JUNCTION")
+      shared_cache = Path.join(test_root, "shared-cache")
+      canonical_repo = Path.join(test_root, "canonical-app")
+      node_modules = Path.join(workspace_path, "node_modules")
+      shared_workspace = Path.join(shared_cache, "workspace")
+      shared_marker = Path.join(shared_cache, "shared-marker.txt")
+      canonical_marker = Path.join(canonical_repo, "tracked-marker.txt")
+      file_link = Path.join(workspace_path, "shared-marker-link.txt")
+
+      try do
+        File.mkdir_p!(workspace_root)
+        File.mkdir_p!(shared_cache)
+        File.mkdir_p!(canonical_repo)
+        File.write!(shared_marker, "shared-cache-marker\n")
+        File.write!(canonical_marker, "canonical-tracked-marker\n")
+
+        assert {_output, 0} = System.cmd("git", ["-C", canonical_repo, "init", "-b", "main"], stderr_to_stdout: true)
+        assert {_output, 0} = System.cmd("git", ["-C", canonical_repo, "config", "user.name", "Symphony Test"], stderr_to_stdout: true)
+        assert {_output, 0} = System.cmd("git", ["-C", canonical_repo, "config", "user.email", "symphony-test@example.com"], stderr_to_stdout: true)
+        assert {_output, 0} = System.cmd("git", ["-C", canonical_repo, "add", "tracked-marker.txt"], stderr_to_stdout: true)
+        assert {_output, 0} = System.cmd("git", ["-C", canonical_repo, "commit", "-m", "seed marker"], stderr_to_stdout: true)
+
+        write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+        assert {:ok, workspace} = Workspace.create_for_issue("HGS-JUNCTION")
+
+        case create_directory_link_for_test(shared_cache, node_modules) do
+          :ok ->
+            case create_directory_link_for_test(canonical_repo, shared_workspace) do
+              :ok ->
+                file_link_result =
+                  case :os.type() do
+                    {:win32, _name} -> :ok
+                    _other -> create_file_link_for_test(shared_marker, file_link)
+                  end
+
+                assert file_link_result == :ok
+                shared_hash = sha256_file(shared_marker)
+                canonical_hash = sha256_file(canonical_marker)
+
+                assert :ok = cleanup.("HGS-JUNCTION")
+                refute File.exists?(workspace)
+                assert File.read!(shared_marker) == "shared-cache-marker\n"
+                assert sha256_file(shared_marker) == shared_hash
+                refute File.exists?(file_link)
+                assert File.read!(canonical_marker) == "canonical-tracked-marker\n"
+                assert sha256_file(canonical_marker) == canonical_hash
+                assert {status, 0} = System.cmd("git", ["-C", canonical_repo, "status", "--porcelain"], stderr_to_stdout: true)
+                assert String.trim(status) == ""
+
+              {:link_unavailable, reason} ->
+                ExUnit.Assertions.flunk("nested workspace junction capability unavailable: #{inspect(reason)}")
+            end
+
+          {:link_unavailable, reason} ->
+            ExUnit.Assertions.flunk("nested dependency junction capability unavailable: #{inspect(reason)}")
+        end
+      after
+        remove_directory_link_for_test(shared_workspace)
+        remove_directory_link_for_test(node_modules)
+        remove_directory_link_for_test(file_link)
+        File.rm_rf(test_root)
+      end
+    end
+  end
+
   test "remote workspace lifecycle uses ssh host aliases from worker config" do
     test_root =
       Path.join(
@@ -1776,5 +1955,115 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp create_directory_link_for_test(target, link) do
+    case :os.type() do
+      {:win32, _name} ->
+        arguments = [
+          "/d",
+          "/s",
+          "/c",
+          "mklink",
+          "/J",
+          String.replace(link, "/", "\\"),
+          String.replace(target, "/", "\\")
+        ]
+
+        case System.find_executable("cmd.exe") do
+          nil ->
+            {:link_unavailable, {:windows_mklink, :executable_unavailable}}
+
+          _executable ->
+            case System.cmd("cmd.exe", arguments, stderr_to_stdout: true) do
+              {_output, 0} ->
+                :ok
+
+              {output, status} ->
+                trimmed_output = String.trim(output)
+
+                if windows_link_capability_unavailable?(trimmed_output) do
+                  {:link_unavailable, {:windows_mklink, status, trimmed_output}}
+                else
+                  ExUnit.Assertions.flunk("directory junction capability probe failed: status=#{status} output=#{inspect(trimmed_output)}")
+                end
+            end
+        end
+
+      _other ->
+        case File.ln_s(target, link) do
+          :ok ->
+            :ok
+
+          {:error, reason} when reason in [:eacces, :enotsup, :eperm] ->
+            {:link_unavailable, {:symlink, reason}}
+
+          {:error, reason} ->
+            ExUnit.Assertions.flunk("directory link capability probe failed: #{inspect(reason)}")
+        end
+    end
+  end
+
+  defp windows_link_capability_unavailable?(output) do
+    output =~ ~r/access is denied|privilege|elevation|not supported/i
+  end
+
+  defp create_file_link_for_test(target, link) do
+    case File.ln_s(target, link) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        ExUnit.Assertions.flunk("file symlink capability probe failed: #{inspect(reason)}")
+    end
+  end
+
+  defp remove_directory_link_for_test(path) do
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        :ok
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        File.rm(path)
+
+      {:ok, _stat} ->
+        case :os.type() do
+          {:win32, _name} ->
+            remove_windows_link_for_test(path)
+
+          _other ->
+            File.rm_rf(path)
+        end
+
+      {:error, reason} ->
+        ExUnit.Assertions.flunk("directory link cleanup probe failed: #{inspect(reason)}")
+    end
+
+    :ok
+  end
+
+  defp remove_windows_link_for_test(path) do
+    case System.find_executable("pwsh") || System.find_executable("powershell.exe") do
+      nil ->
+        ExUnit.Assertions.flunk("PowerShell is required to detach the Windows junction fixture")
+
+      executable ->
+        case System.cmd(
+               executable,
+               ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[System.IO.Directory]::Delete($env:SYMPHONY_TEST_LINK, $false)"],
+               stderr_to_stdout: true,
+               env: [{"SYMPHONY_TEST_LINK", path}]
+             ) do
+          {_output, 0} -> :ok
+          {output, status} -> ExUnit.Assertions.flunk("junction fixture detach failed: status=#{status} output=#{inspect(String.trim(output))}")
+        end
+    end
+  end
+
+  defp sha256_file(path) do
+    path
+    |> File.read!()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 end

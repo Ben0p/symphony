@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
+
   import SymphonyElixir.TestSupport,
     only: [
       path_env: 2,
@@ -359,7 +360,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
-  test "restarting the orchestrator does not overlap redispatched work" do
+  test "restarting the orchestrator keeps unproven work fenced" do
     issue_suffix = System.unique_integer([:positive])
 
     test_root =
@@ -369,7 +370,9 @@ defmodule SymphonyElixir.CoreTest do
       )
 
     hook_marker = Path.join(test_root, "before-run-started")
-    hook_fifo = Path.join(test_root, "before-run-blocker")
+    hook_release = Path.join(test_root, "before-run-release")
+    hook_expired = Path.join(test_root, "before-run-expired")
+    hook_finished = Path.join(test_root, "before-run-finished")
     runtime_supervisor_name = Module.concat(__MODULE__, "AgentRuntimeSupervisor#{issue_suffix}")
     task_supervisor_name = Module.concat(__MODULE__, "TaskSupervisor#{issue_suffix}")
     orchestrator_name = Module.concat(__MODULE__, "RestartOrchestrator#{issue_suffix}")
@@ -388,13 +391,23 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     on_exit(fn ->
+      if File.dir?(test_root), do: File.touch(Path.join(test_root, "before-run-release"))
+
       if pid = Process.whereis(runtime_supervisor_name) do
         GenServer.stop(pid)
       end
 
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
       restart_default_runtime!()
-      File.rm_rf(test_root)
+      eventually_value(fn -> if File.exists?(hook_finished), do: true end)
+
+      assert eventually_value(fn ->
+               case File.rm_rf(test_root) do
+                 {:ok, _paths} -> not File.exists?(test_root)
+                 {:error, _reason, _path} -> nil
+               end
+             end),
+             "restart fixture shell did not release #{test_root}"
     end)
 
     if Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
@@ -410,7 +423,7 @@ defmodule SymphonyElixir.CoreTest do
       workspace_root: test_root,
       poll_interval_ms: 10,
       hook_before_run:
-        "mkfifo #{shell_escape(hook_fifo)}; : > #{shell_escape(hook_marker)}; read _ < #{shell_escape(hook_fifo)}",
+        ": > #{shell_escape(hook_marker)}; attempts=0; while [ -d #{shell_escape(test_root)} ] && [ ! -f #{shell_escape(hook_release)} ] && [ \"$attempts\" -lt 200 ]; do sleep 0.05; attempts=$((attempts + 1)); done; if [ \"$attempts\" -ge 200 ]; then : > #{shell_escape(hook_expired)}; fi; : > #{shell_escape(hook_finished)}; exit 1",
       hook_timeout_ms: 60_000
     )
 
@@ -433,15 +446,18 @@ defmodule SymphonyElixir.CoreTest do
 
     first_worker_pid =
       eventually_value(fn ->
-        case Task.Supervisor.children(task_supervisor_name) do
-          [pid] -> pid
+        case Map.get(:sys.get_state(orchestrator_pid).running, issue.id) do
+          %{pid: pid} when is_pid(pid) -> pid
           _ -> nil
         end
       end)
 
     assert is_pid(first_worker_pid)
+    assert first_worker_pid in Task.Supervisor.children(task_supervisor_name)
     assert Process.alive?(first_worker_pid)
     assert eventually_value(fn -> if File.exists?(hook_marker), do: true end)
+    refute File.exists?(hook_expired)
+    assert Process.alive?(first_worker_pid)
 
     monitor_ref = Process.monitor(orchestrator_pid)
     Process.exit(orchestrator_pid, :kill)
@@ -468,19 +484,15 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(GenServer.call(restarted_pid, :snapshot))
     refute Process.alive?(first_worker_pid)
 
-    second_worker_pid =
-      eventually_value(fn ->
-        children = Task.Supervisor.children(task_supervisor_name)
-        assert length(children) <= 1
+    assert eventually_value(fn ->
+             if Task.Supervisor.children(task_supervisor_name) == [], do: true
+           end)
 
-        case children do
-          [pid] when pid != first_worker_pid -> pid
-          _ -> nil
-        end
-      end)
+    snapshot = GenServer.call(restarted_pid, :snapshot)
+    execution = Enum.find(snapshot.execution_fence.executions, &(&1.issue_id == issue.id))
 
-    assert is_pid(second_worker_pid)
-    assert Process.alive?(second_worker_pid)
+    assert execution.ownership == :unknown
+    assert execution.cleanup == :pending
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -568,8 +580,7 @@ defmodule SymphonyElixir.CoreTest do
         workspace_root: test_root,
         tracker_active_states: ["Todo", "In Progress", "In Review"],
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
-        hook_before_remove:
-          "if [ -f #{shell_escape(worker_alive_marker)} ]; then printf alive > #{shell_escape(cleanup_marker)}; else printf stopped > #{shell_escape(cleanup_marker)}; fi"
+        hook_before_remove: "if [ -f #{shell_escape(worker_alive_marker)} ]; then printf alive > #{shell_escape(cleanup_marker)}; else printf stopped > #{shell_escape(cleanup_marker)}; fi"
       )
 
       File.mkdir_p!(workspace)
@@ -2244,7 +2255,7 @@ defmodule SymphonyElixir.CoreTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
-      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" app-server")
+      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" --config model=\"gpt-5.6-luna\" --config model_reasoning_effort=high app-server")
       refute String.contains?(argv_line, "--ask-for-approval never")
       refute String.contains?(argv_line, "--sandbox danger-full-access")
     after
