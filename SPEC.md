@@ -729,6 +729,10 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- The managed Elixir work-package extension preserves a generation-bound recovery archive before
+  terminal removal. Its version 2 archive stores link targets as metadata rather than traversing
+  or recreating them; legacy version 1 evidence remains readable. A damaged published archive
+  remains held for investigation, and cannot be silently replaced during retry.
 
 ## 8. Polling, Scheduling, and Reconciliation
 

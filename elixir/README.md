@@ -198,6 +198,10 @@ SYMPHONY_ACCEPTED_SOURCE_HEAD=<launcher-attested 40-character Git object ID>
 
 `DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
 private reservation journal and archive root. The archive root must be outside active workspaces.
+Archives now use version 2: regular file bytes and empty directories are copied, while junctions
+and symbolic links remain evidence-bound path/target metadata. Verification never recreates or
+follows those links. Version 1 archives retain their original verification and evidence references.
+See [workspace recovery archives](docs/workspace-recovery-archives.md) for recovery and retry rules.
 The `/api/v1/state` response reports the effective `SYMPHONY_POOL_KEY`,
 `SYMPHONY_REPOSITORY_REF`, workflow workspace root, `SYMPHONY_GLOBAL_PAUSE_FILE`, and the accepted
 source head under `runtime_identity`. The launcher must provide `SYMPHONY_CURRENT_SOURCE_HEAD` as
