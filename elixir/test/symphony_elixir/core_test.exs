@@ -371,6 +371,7 @@ defmodule SymphonyElixir.CoreTest do
 
     hook_marker = Path.join(test_root, "before-run-started")
     hook_release = Path.join(test_root, "before-run-release")
+    hook_expired = Path.join(test_root, "before-run-expired")
     runtime_supervisor_name = Module.concat(__MODULE__, "AgentRuntimeSupervisor#{issue_suffix}")
     task_supervisor_name = Module.concat(__MODULE__, "TaskSupervisor#{issue_suffix}")
     orchestrator_name = Module.concat(__MODULE__, "RestartOrchestrator#{issue_suffix}")
@@ -413,7 +414,7 @@ defmodule SymphonyElixir.CoreTest do
       workspace_root: test_root,
       poll_interval_ms: 10,
       hook_before_run:
-        ": > #{shell_escape(hook_marker)}; attempts=0; while [ -d #{shell_escape(test_root)} ] && [ ! -f #{shell_escape(hook_release)} ] && [ \"$attempts\" -lt 200 ]; do sleep 0.05; attempts=$((attempts + 1)); done; exit 1",
+        ": > #{shell_escape(hook_marker)}; attempts=0; while [ -d #{shell_escape(test_root)} ] && [ ! -f #{shell_escape(hook_release)} ] && [ \"$attempts\" -lt 200 ]; do sleep 0.05; attempts=$((attempts + 1)); done; if [ \"$attempts\" -ge 200 ]; then : > #{shell_escape(hook_expired)}; fi; exit 1",
       hook_timeout_ms: 60_000
     )
 
@@ -445,6 +446,8 @@ defmodule SymphonyElixir.CoreTest do
     assert is_pid(first_worker_pid)
     assert Process.alive?(first_worker_pid)
     assert eventually_value(fn -> if File.exists?(hook_marker), do: true end)
+    refute File.exists?(hook_expired)
+    assert Process.alive?(first_worker_pid)
 
     monitor_ref = Process.monitor(orchestrator_pid)
     Process.exit(orchestrator_pid, :kill)
