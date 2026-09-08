@@ -479,6 +479,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert response["readiness"] == %{"ready?" => true, "status" => "ready", "reasons" => []}
   end
 
+  @tag skip: System.get_env("SYMPHONY_TEST_ROOT_MANIFEST_FILES") != "1"
   test "phoenix state reports live managed readiness after responsibility activation" do
     orchestrator_name = Module.concat(__MODULE__, :LiveRuntimeIdentityOrchestrator)
     state_root = Path.join(System.tmp_dir!(), "symphony-live-runtime-#{System.unique_integer([:positive])}")
@@ -488,6 +489,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     journal_path = Path.join(state_root, "work-package.json")
     archive_root = Path.join(state_root, "cleanup-archives")
     File.write!(pause_path, "paused\n")
+
+    assert {"0\n", 0} = System.cmd("id", ["-u"])
+    manifest_path = Path.join(state_root, "managed-delegations.json")
+
+    manifest_bytes =
+      Jason.encode!(%{
+        schema_version: 1,
+        pool_key: "pool-engineering",
+        repository_ref: "openai/symphony",
+        managed_project_profile_id: "profile-live-test",
+        authority_ref: "test:live-readiness",
+        entries: []
+      })
+
+    File.write!(manifest_path, manifest_bytes)
+    File.chmod!(manifest_path, 0o644)
+    manifest_digest = Base.encode16(:crypto.hash(:sha256, manifest_bytes), case: :lower)
 
     source_head = @runtime_source_head
 
@@ -502,6 +520,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       "DAHLIA_WORK_PACKAGE_ATTESTATION_KEY" => "public-test-attestation-key",
       "DAHLIA_RUNNER_ID" => "runner-live-test",
       "DAHLIA_MANAGED_PROJECT_PROFILE_ID" => "profile-live-test",
+      "DAHLIA_MANAGED_DELEGATION_PATH" => manifest_path,
+      "DAHLIA_MANAGED_DELEGATION_SHA256" => manifest_digest,
       "DAHLIA_WORK_PACKAGE_JOURNAL_PATH" => journal_path,
       "DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT" => archive_root
     }
@@ -567,7 +587,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert before_activation["managed_work_package"] == %{
              "required?" => true,
              "configured?" => true,
-             "state" => "configured"
+             "state" => "configured",
+             "delegation_manifest" => %{
+               "state" => "configured",
+               "sha256" => manifest_digest,
+               "authorized_issue_count" => 0
+             }
            }
 
     assert before_activation["readiness"]["status"] == "not_ready"

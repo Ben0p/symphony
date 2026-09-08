@@ -733,6 +733,12 @@ Distinct terminal reasons are important because retry logic and logs differ.
   terminal removal. Its version 2 archive stores link targets as metadata rather than traversing
   or recreating them; legacy version 1 evidence remains readable. A damaged published archive
   remains held for investigation, and cannot be silently replaced during retry.
+- The managed Elixir extension may load bounded, digest-pinned operator delegation input. It MUST
+  bind exact native issue, owner, pool, repository and profile identities, and MUST NOT infer
+  authority from tracker prose or labels. The existing graph owner admits only the selected
+  current issue; same-repository successor authority remains gated by verified predecessor
+  cleanup and the provider's claim. Loading or replaying configuration cannot revive terminal,
+  revoked or restart-blocked responsibility.
 
 ## 8. Polling, Scheduling, and Reconciliation
 

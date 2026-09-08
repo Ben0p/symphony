@@ -25,6 +25,7 @@ defmodule SymphonyElixir.Orchestrator do
   }
 
   alias SymphonyElixir.ExecutionFence.Persistence
+  alias SymphonyElixir.ManagedResponsibility.Admission, as: ManagedAdmission
   alias SymphonyElixir.WorkPackageClaim.Journal
   alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
   alias SymphonyElixir.Tracker.Issue
@@ -1318,7 +1319,7 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.debug("Global mutable admission paused before execution-fence admission for #{issue_context(issue)}")
       state
     else
-      case admit_execution(state, issue, worker_host) do
+      case admit_execution(state, issue, worker_host, attempt) do
         {:ok, state, token, session_id, responsibility_delegation_id, runtime_lease} ->
           case claim_work_package(state, issue, token, worker_host) do
             {:ok, state} ->
@@ -1532,13 +1533,27 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host)
+  defp admit_execution(state, issue, worker_host, attempt \\ nil)
+
+  defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host, attempt)
        when is_binary(issue_id) do
     now_ms = execution_fence_now_ms()
     attrs = execution_attributes(issue, worker_host)
     session_id_for_generation = fn generation -> execution_session_id(issue_id, generation) end
 
-    with {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),
+    manifest = get_in(state.work_package_runtime || %{}, [:managed_delegations])
+
+    with {:ok, graph} <-
+           ManagedAdmission.prepare(
+             state.responsibility_graph,
+             state.execution_fence,
+             manifest,
+             issue,
+             attempt,
+             now_ms
+           ),
+         state = %{state | responsibility_graph: graph},
+         {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),
          session_id = session_id_for_generation.(token.generation),
          runtime_lease = execution_runtime_lease(issue_id, token, session_id),
          {:ok, fence_state, _result} <-
@@ -1556,7 +1571,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp admit_execution(_state, _issue, _worker_host), do: {:error, :invalid_issue}
+  defp admit_execution(_state, _issue, _worker_host, _attempt), do: {:error, :invalid_issue}
 
   @doc false
   @spec repository_identity() :: String.t()
@@ -3431,7 +3446,8 @@ defmodule SymphonyElixir.Orchestrator do
         state.execution_fence,
         state.responsibility_graph,
         managed_pool?: WorkPackageRuntime.managed_pool?(),
-        managed_runtime_configured?: is_map(state.work_package_runtime)
+        managed_runtime_configured?: is_map(state.work_package_runtime),
+        managed_delegation_manifest: get_in(state.work_package_runtime || %{}, [:managed_delegations])
       )
 
     running =

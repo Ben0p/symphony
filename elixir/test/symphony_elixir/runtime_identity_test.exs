@@ -15,6 +15,25 @@ defmodule SymphonyElixir.RuntimeIdentityTest do
 
   @pause %{configured?: true, paused?: false, state: "running", path: "/run/symphony/pause", reason: nil}
 
+  test "loaded authorization is visible as configuration without inventing active workers" do
+    {:ok, graph, _} = ResponsibilityGraph.activate(ResponsibilityGraph.new(), 1)
+    digest = String.duplicate("a", 64)
+
+    snapshot =
+      RuntimeIdentity.snapshot(ExecutionFence.new(), graph,
+        env: @env,
+        workspace_root: "/srv/symphony/workspaces",
+        pause_snapshot: @pause,
+        managed_pool?: true,
+        managed_runtime_configured?: true,
+        managed_delegation_manifest: %{source_sha256: digest, entries: [%{secret: "not projected"}]}
+      )
+
+    assert snapshot.execution_authority.delegation_posture == "quiescent"
+    assert snapshot.managed_work_package.delegation_manifest == %{state: "configured", sha256: digest, authorized_issue_count: 1}
+    refute inspect(snapshot) =~ "not projected"
+  end
+
   test "configured identity reports the effective paths and real authority posture" do
     snapshot =
       RuntimeIdentity.snapshot(ExecutionFence.new(), enforced_graph(),

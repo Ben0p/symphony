@@ -216,6 +216,35 @@ and archive evidence before releasing provider capacity. Remote SSH workers rema
 proof or the independent archive verifier is unavailable. These provider credentials are scrubbed
 from the Codex child environment.
 
+### Explicit managed responsibility
+
+For an enforced managed Linux pool, the COO/runtime owner must install a non-secret, root-owned manifest
+and set both `DAHLIA_MANAGED_DELEGATION_PATH` and `DAHLIA_MANAGED_DELEGATION_SHA256` in the trusted
+service environment. The file must be regular, at most 256 KiB, not group/world writable, with no
+symlink ancestors. Its SHA-256 must match the pinned lowercase digest. Partial or invalid
+configuration fails startup. A declared managed pool also rejects both settings being absent.
+An empty manifest explicitly authorizes no work; only undeclared legacy operation may omit it.
+The runtime never grants authority from an issue's prose or labels.
+
+The manifest is bounded operator configuration, not another queue. It binds one pool, repository
+and managed profile to at most 20 exact native issues, each with an accountable owner and a bounded
+responsible child. The ordinary fresh-issue admission path checks owner, identity, expiry,
+repository ownership, previous execution cleanup and the selected model/effort/token ceiling.
+The graph remains the only delegation ledger, and provider reservation/claim remains mandatory.
+No workspace or worker is created by loading the manifest.
+
+Pause the existing global gate before replacing the manifest or its digest, then restart the
+supervised pool and verify its readiness before resuming. This is explicit runtime-owner
+configuration, not a worker-editable authorization file. A restart never silently revives a
+previously bound, blocked, revoked or terminal delegation. See the
+[manifest contract](../docs/responsibility-delegation.md#managed-authorization-manifest).
+
+Real root-owned file, managed startup and HTTP readiness qualification runs with
+`SYMPHONY_TEST_ROOT_MANIFEST_FILES=1 mix test` in a qualified Linux fixture as root. Ordinary
+unprivileged test runs skip those seven privileged cases; the pure input, admission, claim,
+restart and failure tests still run. This switch affects tests only and does not relax runtime
+file ownership or digest checks.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 

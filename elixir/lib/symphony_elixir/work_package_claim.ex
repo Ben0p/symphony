@@ -128,6 +128,7 @@ defmodule SymphonyElixir.WorkPackageClaim do
          session_id: session_id,
          process_id: lease.process_id,
          responsible_delegation_id: delegation.id,
+         expected_projection_id: managed_projection(input, delegation),
          execution_fence_token: "#{input.issue_id}:#{generation}",
          runtime_lease_id: session_id,
          journal_path: input.journal_path
@@ -151,6 +152,16 @@ defmodule SymphonyElixir.WorkPackageClaim do
          is_map(Map.get(input, :fence_state)) and is_map(Map.get(input, :responsibility_graph)),
        do: :ok,
        else: {:error, :invalid_claim_input}
+  end
+
+  defp managed_projection(%{managed_delegations: %{}}, delegation), do: delegation.scope.work_package_id
+  defp managed_projection(_input, _delegation), do: nil
+
+  defp projection_matches?(projection_id, authority) do
+    case authority.expected_projection_id do
+      nil -> true
+      expected -> projection_id == expected
+    end
   end
 
   defp repository_matches(%{repository: repository}, repository), do: :ok
@@ -269,7 +280,7 @@ defmodule SymphonyElixir.WorkPackageClaim do
          {:ok, scope_keys} <- response_scope_keys(data, "scopeKeys"),
          true <-
            issue_id == authority.issue_id and profile_id == authority.managed_project_profile_id and
-             repository_ref == authority.repository_ref do
+             repository_ref == authority.repository_ref and projection_matches?(projection_id, authority) do
       {:ok,
        %{
          issue_id: issue_id,
@@ -305,7 +316,8 @@ defmodule SymphonyElixir.WorkPackageClaim do
 
     actual = Map.take(reservation, Map.keys(expected))
 
-    if actual == expected and present_string?(reservation.reservation_nonce) and
+    if actual == expected and projection_matches?(reservation.projection_id, authority) and
+         present_string?(reservation.reservation_nonce) and
          is_list(reservation.scope_keys),
        do: :ok,
        else: {:error, :reservation_authority_mismatch}

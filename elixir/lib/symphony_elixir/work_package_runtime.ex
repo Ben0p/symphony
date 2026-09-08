@@ -8,6 +8,7 @@ defmodule SymphonyElixir.WorkPackageRuntime do
   """
 
   alias SymphonyElixir.{Config, WorkPackageCleanup}
+  alias SymphonyElixir.ManagedResponsibility.Manifest
 
   @provider_url "DAHLIA_WORK_PACKAGE_PROVIDER_URL"
   @runner_token "DAHLIA_WORK_PACKAGE_RUNNER_TOKEN"
@@ -52,7 +53,8 @@ defmodule SymphonyElixir.WorkPackageRuntime do
   defp build_runtime(values, env) do
     with {:ok, base_url} <- valid_base_url(values[@provider_url]),
          {:ok, journal_path} <- configured_path(env, @journal_path, default_journal_path()),
-         {:ok, archive_root} <- configured_path(env, @archive_root, default_archive_root(journal_path)) do
+         {:ok, archive_root} <- configured_path(env, @archive_root, default_archive_root(journal_path)),
+         {:ok, managed_delegations} <- Manifest.load(env, System.system_time(:millisecond)) do
       {:ok,
        %{
          base_url: base_url,
@@ -62,6 +64,7 @@ defmodule SymphonyElixir.WorkPackageRuntime do
          managed_project_profile_id: values[@profile_id],
          journal_path: journal_path,
          archive_root: archive_root,
+         managed_delegations: managed_delegations,
          cleanup_prepare_fun: fn state, token, head, entry ->
            WorkPackageCleanup.prepare(state, token, head, entry, archive_root: archive_root)
          end,

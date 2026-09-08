@@ -88,6 +88,43 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
     assert signature == "eYASgI7yqAih8J9N1Noj0r8Ap8X3H3tVgi__MnwwQkg"
   end
 
+  test "managed authority binds the exact work-package projection on first claim and replay" do
+    path = temp_path()
+    on_exit(fn -> File.rm_rf(path) end)
+    %{input: input} = authority_fixture(path)
+
+    graph =
+      update_in(input.responsibility_graph, [:delegations], fn delegations ->
+        Map.new(delegations, fn {id, delegation} ->
+          {id, put_in(delegation, [:scope, :work_package_id], "projection-349")}
+        end)
+      end)
+
+    managed = input |> Map.put(:managed_delegations, %{}) |> Map.put(:responsibility_graph, graph)
+
+    wrong_projection = fn url, _options ->
+      assert String.ends_with?(url, "/reservations/by-issue")
+      {:ok, response(%{"data" => Map.put(reservation_payload(), "projectionId", "wrong-projection")})}
+    end
+
+    assert {:error, :reservation_scope_mismatch} = WorkPackageClaim.claim(managed, request_fun: wrong_projection)
+    refute File.exists?(path)
+
+    valid_projection = fn url, _options ->
+      payload = if String.ends_with?(url, "/reservations/by-issue"), do: reservation_payload(), else: claim_result_payload()
+      {:ok, response(%{"data" => payload})}
+    end
+
+    assert {:ok, _} = WorkPackageClaim.claim(managed, request_fun: valid_projection)
+    assert {:ok, journal} = Journal.load(path)
+    [{key, reservation}] = Map.to_list(journal.reservations)
+    {:ok, changed} = Journal.put(journal, key, %{reservation | projection_id: "wrong-projection"})
+    assert :ok = Journal.save(path, changed)
+
+    assert {:error, :reservation_authority_mismatch} =
+             WorkPackageClaim.claim(managed, request_fun: fn _url, _options -> flunk("a mismatched replay must not send a request") end)
+  end
+
   test "rejects corrupt journals, profile mismatches, malformed claims, and HTTP errors" do
     path = temp_path()
     on_exit(fn -> File.rm_rf(path) end)
