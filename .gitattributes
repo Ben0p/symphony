@@ -1,0 +1,4 @@
+# Elixir multiline strings generate executable shell fixtures on Unix.
+*.ex text eol=lf
+*.exs text eol=lf
+*.sh text eol=lf

@@ -743,32 +743,48 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "linear client logs response bodies for non-200 graphql responses" do
+    parent = self()
+
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert {:error, {:linear_api_status, 400}} =
-                 Client.graphql(
-                   "query Viewer { viewer { id } }",
-                   %{},
-                   request_fun: fn _payload, _headers ->
-                     {:ok,
-                      %{
-                        status: 400,
-                        body: %{
-                          "errors" => [
-                            %{
-                              "message" => "Variable \"$ids\" got invalid value",
-                              "extensions" => %{"code" => "BAD_USER_INPUT"}
-                            }
-                          ]
-                        }
-                      }}
-                   end
-                 )
+        result =
+          Client.graphql(
+            "query Viewer { viewer { id } }",
+            %{},
+            request_fun: fn _payload, _headers ->
+              send(parent, :linear_error_transport_called)
+
+              {:ok,
+               %{
+                 status: 400,
+                 body: %{
+                   "errors" => [
+                     %{
+                       "message" => "Variable \"$ids\" got invalid value",
+                       "extensions" => %{"code" => "BAD_USER_INPUT"}
+                     }
+                   ]
+                 }
+               }}
+            end
+          )
+
+        if linear_lock_supported?() do
+          assert {:error, {:linear_api_status, 400}} = result
+        else
+          assert {:error, {:linear_api_request, {:linear_rate_limit, :linear_rate_limit_lock_unsupported}}} = result
+        end
       end)
 
-    assert log =~ "Linear GraphQL request failed status=400"
-    assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
-    assert log =~ "Variable \\\"$ids\\\" got invalid value"
+    if linear_lock_supported?() do
+      assert_receive :linear_error_transport_called
+      assert log =~ "Linear GraphQL request failed status=400"
+      assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
+      assert log =~ "Variable \\\"$ids\\\" got invalid value"
+    else
+      refute_receive :linear_error_transport_called
+      assert log =~ "linear_rate_limit_lock_unsupported"
+    end
   end
 
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
@@ -793,21 +809,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     Workflow.set_workflow_file_path(missing_workflow_path)
 
-    assert {:ok, %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}} =
-             Client.graphql(
-               "query Viewer { viewer { id } }",
-               %{},
-               tracker_settings: %{
-                 api_key: "bound-token",
-                 endpoint: "https://bound.example.test/graphql"
-               },
-               request_fun: fn payload, headers ->
-                 send(parent, {:bound_graphql_request, payload, headers})
-                 {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
-               end
-             )
+    result =
+      Client.graphql(
+        "query Viewer { viewer { id } }",
+        %{},
+        tracker_settings: %{
+          api_key: "bound-token",
+          endpoint: "https://bound.example.test/graphql"
+        },
+        request_fun: fn payload, headers ->
+          send(parent, {:bound_graphql_request, payload, headers})
+          {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
+        end
+      )
 
-    assert_receive {:bound_graphql_request, %{"query" => "query Viewer { viewer { id } }"}, [{"Authorization", "bound-token"}, {"Content-Type", "application/json"}]}
+    if linear_lock_supported?() do
+      assert {:ok, %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}} = result
+      assert_receive {:bound_graphql_request, %{"query" => "query Viewer { viewer { id } }"}, [{"Authorization", "bound-token"}, {"Content-Type", "application/json"}]}
+    else
+      assert {:error, {:linear_api_request, {:linear_rate_limit, :linear_rate_limit_lock_unsupported}}} = result
+      refute_receive {:bound_graphql_request, _, _}
+    end
+  end
+
+  defp linear_lock_supported? do
+    match?({:unix, _name}, :os.type()) and is_binary(System.find_executable("flock"))
   end
 
   test "orchestrator sorts dispatch by priority then oldest created_at" do

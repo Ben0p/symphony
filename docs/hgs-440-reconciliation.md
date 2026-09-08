@@ -61,3 +61,23 @@ and `C:\Users\skitt\AppData\Local\mise\installs\erlang\28.5\bin`.
 Toolchain availability and Docker-based isolated fixtures are reported with
 the test evidence; no customer or PostgreSQL fixture is used by this source
 qualification.
+
+## Cross-platform qualification repairs
+
+The 2026-09-08 qualification retains all production code from the accepted
+runtime. Explicit LF attributes prevent Windows checkout/archive settings from
+converting embedded Unix shell fixtures to CRLF. The committed source blobs
+already used LF; this fixes delivery of those bytes to the Linux test host.
+
+Two Linear transport tests now assert the existing fail-closed lock error and
+absence of a transport call on hosts without the supported Unix `flock` path.
+Their original response, logging, and bound-settings assertions still run on
+Linux. The restart-fencing fixture uses a bounded release-marker loop instead
+of an unbounded FIFO read, so aborting a test cannot leave its shell waiting
+indefinitely. The production lock and execution fences are unchanged.
+
+Original automatic denials and failed qualification logs are retained in the
+HGS-440 evidence linked from Linear. A fresh test request with durable output
+and no evidence deletion was admitted through the same execution review path.
+Source validation, fork merge, runtime installation, and managed acceptance
+remain distinct milestones.
