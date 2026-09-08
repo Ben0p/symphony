@@ -8,7 +8,7 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
   test "termination confirmation through the server persists only valid generation-bound evidence" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
-      max_concurrent_agents: 0
+      max_concurrent_agents: 1
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
@@ -62,7 +62,7 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
   test "an ordinary poll retries a failed cleanup receipt and permits the next generation" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
-      max_concurrent_agents: 0
+      max_concurrent_agents: 1
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
@@ -253,6 +253,13 @@ defmodule SymphonyElixir.OrchestratorExecutionFenceTest do
   end
 
   test "ordinary replay filters acknowledged history before applying its batch limit" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_concurrent_agents: 1
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
     journal_path =
       Path.join(System.tmp_dir!(), "symphony-cleanup-starvation-#{System.unique_integer([:positive])}.json")
 
