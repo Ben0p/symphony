@@ -22,6 +22,11 @@ defmodule SymphonyElixir.WorkPackageRuntimeTest do
     assert missing == ["DAHLIA_WORK_PACKAGE_ATTESTATION_KEY"]
   end
 
+  test "declared managed pools cannot omit both manifest settings" do
+    env = Map.put(@required, "SYMPHONY_POOL_KEY", "managed-pool")
+    assert {:error, :managed_delegation_manifest_required} = WorkPackageRuntime.configuration(env: env)
+  end
+
   test "managed runtime builds trusted callbacks and host-only paths" do
     env =
       Map.merge(@required, %{

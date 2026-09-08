@@ -54,11 +54,15 @@ defmodule SymphonyElixir.RuntimeIdentity do
         |> Map.put(:status, identity_status)
         |> Map.put(:source_head_status, source_head_status),
       execution_authority: authority,
-      managed_work_package: %{
-        required?: managed_pool?,
-        configured?: managed_runtime_configured?,
-        state: managed_work_package_state(managed_pool?, managed_runtime_configured?)
-      },
+      managed_work_package:
+        manifest_projection(
+          %{
+            required?: managed_pool?,
+            configured?: managed_runtime_configured?,
+            state: managed_work_package_state(managed_pool?, managed_runtime_configured?)
+          },
+          Keyword.get(opts, :managed_delegation_manifest)
+        ),
       readiness: %{
         ready?: readiness_reasons == [],
         status: if(readiness_reasons == [], do: "ready", else: "not_ready"),
@@ -66,6 +70,13 @@ defmodule SymphonyElixir.RuntimeIdentity do
       }
     }
   end
+
+  defp manifest_projection(projection, %{source_sha256: digest, entries: entries})
+       when is_binary(digest) and is_list(entries) do
+    Map.put(projection, :delegation_manifest, %{state: "configured", sha256: digest, authorized_issue_count: length(entries)})
+  end
+
+  defp manifest_projection(projection, _manifest), do: projection
 
   defp identity(env, opts) do
     pause_snapshot = Keyword.get(opts, :pause_snapshot, GlobalPause.snapshot())

@@ -50,6 +50,12 @@ Managed Linux runners additionally require the complete work-package tuple docum
 `DAHLIA_MANAGED_PROJECT_PROFILE_ID`. Keep these values out of this workflow file; the runtime
 scrubs the provider token and attestation key before launching Codex.
 
+The `DAHLIA_MANAGED_DELEGATION_PATH` and `DAHLIA_MANAGED_DELEGATION_SHA256` settings are required
+for declared managed pools and are
+host-controlled service configuration. Workers must not edit the manifest or graph snapshots.
+Loading this input grants no worker lease: fresh native eligibility, exact responsibility,
+execution fencing and the provider's durable claim remain required before a turn starts.
+
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}

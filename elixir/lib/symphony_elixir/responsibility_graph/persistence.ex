@@ -21,6 +21,52 @@ defmodule SymphonyElixir.ResponsibilityGraph.Persistence do
 
   @type load_result :: {:ok, ResponsibilityGraph.state()} | :missing | {:error, term()}
 
+  @doc "Decodes operator-issued delegation input without accepting runtime history or leases."
+  @spec decode_delegation_input(map()) :: {:ok, map()} | {:error, term()}
+  def decode_delegation_input(payload) when is_map(payload) do
+    fields = ~w(id parent_delegation_id role actor_id scope authority budget expires_at_ms expected_deliverable expected_evidence return_to_parent)
+
+    with true <- input_keys?(payload, fields),
+         true <- input_keys?(payload["scope"], Enum.map(@scope_identifiers ++ @scope_collections, &Atom.to_string/1)),
+         true <- input_keys?(payload["authority"], ~w(class capabilities environments)),
+         true <- input_keys?(payload["budget"], ~w(model effort max_tokens max_children)),
+         true <- input_keys?(payload["return_to_parent"], ~w(owner_id contract)),
+         {:ok, id} <- required_string(payload, "id"),
+         {:ok, parent_id} <- optional_string(payload, "parent_delegation_id"),
+         {:ok, role} <- decode_atom(Map.get(payload, "role"), @roles),
+         {:ok, actor_id} <- required_string(payload, "actor_id"),
+         {:ok, scope} <- decode_scope(Map.get(payload, "scope")),
+         {:ok, authority} <- decode_authority(Map.get(payload, "authority")),
+         {:ok, budget} <- decode_budget(Map.get(payload, "budget")),
+         {:ok, expiry} <- required_integer(payload, "expires_at_ms"),
+         {:ok, deliverable} <- required_string(payload, "expected_deliverable"),
+         {:ok, evidence} <- required_string(payload, "expected_evidence"),
+         {:ok, return_contract} <- decode_return_contract(Map.get(payload, "return_to_parent")) do
+      {:ok,
+       %{
+         id: id,
+         parent_delegation_id: parent_id,
+         role: role,
+         actor_id: actor_id,
+         scope: scope,
+         authority: authority,
+         budget: budget,
+         expires_at_ms: expiry,
+         expected_deliverable: deliverable,
+         expected_evidence: evidence,
+         return_to_parent: return_contract
+       }}
+    else
+      false -> {:error, :unexpected_delegation_input_field}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def decode_delegation_input(_payload), do: {:error, :invalid_delegation_input}
+
+  defp input_keys?(payload, fields) when is_map(payload), do: Map.keys(payload) -- fields == []
+  defp input_keys?(_payload, _fields), do: false
+
   @spec load(Path.t()) :: load_result()
   def load(path) when is_binary(path) do
     case File.read(path) do

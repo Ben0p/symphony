@@ -54,3 +54,41 @@ no worker has owned them yet; first admission binds their fresh HGS-294
 generation. The orchestrator exposes only a read-only graph projection for
 operations surfaces; delegation mutations remain explicit API calls with
 typed validation.
+
+## Managed authorization manifest
+
+An enforced managed Linux pool must load explicit COO/runtime-owner authorization through
+`DAHLIA_MANAGED_DELEGATION_PATH` plus `DAHLIA_MANAGED_DELEGATION_SHA256`. The trusted service
+environment pins the exact bytes of a root-owned regular file; links, writable-by-others files,
+oversized input, partial configuration and digest mismatches fail closed. The file contains
+authorization inputs, never runtime leases, statuses, clock history or graph events.
+
+The JSON object has `schema_version:1`, `pool_key`, `repository_ref`,
+`managed_project_profile_id`, a nonempty `authority_ref`, and at most 20 `entries`.
+An empty list explicitly authorizes no work. A declared managed pool cannot omit both manifest
+settings to select legacy admission; only an undeclared legacy runtime may omit them.
+Each entry contains `issue_id` (UUID), `identifier`, `owner_id`, and `accountable`/`responsible`
+delegation inputs using the existing graph field names. The accountable actor is the current
+native issue owner; the responsible actor must match the configured `DAHLIA_RUNNER_ID`. Scope identifies
+company, objective, initiative, project, work package, issue and repository without wildcards.
+Paths are explicit repository-relative paths, with `.` allowed for the fresh issue repository;
+environment is `repository`. Both grants use `routine_engineering` authority, future expiry,
+bounded model/effort/token budgets and a deliverable/evidence return contract. The responsible
+child cannot delegate children. This is authority metadata, not a claim of OS sandbox isolation.
+
+Loading validates each intended pair without making it active. A fresh native candidate must
+match its exact UUID, identifier and assignee before the orchestrator constructs a graph
+candidate. Another active or blocked responsible owner in the same repository prevents it.
+Every other execution in that repository must have a terminal, quiescent, validated cleanup
+record. Only the normal admission owner persists the selected pair with its bound runtime lease;
+provider reservation and claim still precede spawn. Exact active replay is idempotent; a partial,
+changed, expired, blocked, revoked or terminal pair cannot be silently recreated.
+The provider reservation's projection must match the authorized work-package ID on first claim
+and journal replay; issue identity alone cannot substitute another work package.
+
+The existing fence and graph are separate persisted files. A write failure leaves the admission
+failed closed; a bound grant is blocked on restart until explicit existing lease reconciliation.
+This manifest path does not claim distributed atomicity or erase unresolved crash evidence.
+Pause before an operator changes authorization configuration, update its pinned digest and
+restart the pool. Do not repair missing authority by editing live graph JSON or changing to
+manual enforcement. Completed graph responsibility alone is not cleanup acceptance.

@@ -14,6 +14,8 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
     "DAHLIA_WORK_PACKAGE_ATTESTATION_KEY",
     "DAHLIA_RUNNER_ID",
     "DAHLIA_MANAGED_PROJECT_PROFILE_ID",
+    "DAHLIA_MANAGED_DELEGATION_PATH",
+    "DAHLIA_MANAGED_DELEGATION_SHA256",
     "DAHLIA_WORK_PACKAGE_JOURNAL_PATH",
     "DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT",
     "SYMPHONY_GLOBAL_PAUSE_FILE"
@@ -27,6 +29,7 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
     assert {:error, :managed_pool_required} = ResponsibilityBootstrap.activate(1)
   end
 
+  @tag skip: System.get_env("SYMPHONY_TEST_ROOT_MANIFEST_FILES") != "1"
   test "requires an explicitly paused global mutable gate" do
     test_root = Path.join(System.tmp_dir!(), "symphony-responsibility-bootstrap-#{System.unique_integer([:positive])}")
     pause_path = Path.join(test_root, "global-mutable-pause.state")
@@ -39,6 +42,7 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
 
     File.mkdir_p!(test_root)
     File.write!(pause_path, "running\n")
+    install_manifest!(test_root)
 
     Enum.each(
       %{
@@ -57,6 +61,7 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
     assert {:error, :global_pause_not_paused} = ResponsibilityBootstrap.activate(1)
   end
 
+  @tag skip: System.get_env("SYMPHONY_TEST_ROOT_MANIFEST_FILES") != "1"
   test "CLI activation persists through an application restart" do
     test_root =
       Path.join(System.tmp_dir!(), "symphony-responsibility-cli-#{System.unique_integer([:positive])}")
@@ -88,6 +93,7 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
 
     File.mkdir_p!(test_root)
     File.write!(pause_path, "paused\n")
+    install_manifest!(test_root)
 
     write_workflow_file!(workflow_path,
       tracker_kind: "memory",
@@ -131,6 +137,27 @@ defmodule SymphonyElixir.ResponsibilityBootstrapTest do
     assert %{responsibility_graph: %{enforcement: :enforced}} = Orchestrator.snapshot()
 
     assert :ok = CLI.evaluate([@ack_flag, @activate_flag, workflow_path], deps)
+  end
+
+  defp install_manifest!(root) do
+    assert {"0\n", 0} = System.cmd("id", ["-u"])
+    path = Path.join(root, "managed-delegations.json")
+
+    payload = %{
+      schema_version: 1,
+      pool_key: "pool-bootstrap",
+      repository_ref: "example/repository",
+      managed_project_profile_id: "profile-bootstrap",
+      authority_ref: "test:bootstrap",
+      entries: []
+    }
+
+    bytes = Jason.encode!(payload)
+    File.write!(path, bytes)
+    File.chmod!(path, 0o644)
+    digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    System.put_env("DAHLIA_MANAGED_DELEGATION_PATH", path)
+    System.put_env("DAHLIA_MANAGED_DELEGATION_SHA256", digest)
   end
 
   defp save_environment(keys), do: Map.new(keys, &{&1, System.get_env(&1)})

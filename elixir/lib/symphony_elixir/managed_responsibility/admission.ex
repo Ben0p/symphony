@@ -1,0 +1,61 @@
+defmodule SymphonyElixir.ManagedResponsibility.Admission do
+  @moduledoc """
+  Applies operator authorization within the existing fenced admission transaction.
+  It returns a graph candidate; only the orchestrator persists a bound delegation.
+  """
+
+  alias SymphonyElixir.{Config, ExecutionFence, ManagedResponsibility, ResponsibilityGraph}
+
+  alias SymphonyElixir.Codex.ModelRouter
+
+  @efforts ~w(none minimal low medium high xhigh max ultra)
+
+  @spec prepare(map(), map(), map() | nil, map(), non_neg_integer() | nil, non_neg_integer()) ::
+          {:ok, map()} | {:error, term()}
+  def prepare(graph, _fence, nil, _issue, _attempt, _now_ms), do: {:ok, graph}
+
+  def prepare(graph, fence, manifest, issue, attempt, now_ms) do
+    with true <- ResponsibilityGraph.enforced?(graph),
+         :ok <- ExecutionFence.validate(fence),
+         :ok <- prior_repository_cleanup(fence, manifest.repository_ref, issue.id),
+         {:ok, next_graph} <- ManagedResponsibility.admit(graph, manifest, issue, now_ms),
+         {:ok, delegation} <- ResponsibilityGraph.admission_delegation(next_graph, issue.id, issue.identifier, manifest.repository_ref),
+         :ok <- route_budget(delegation.budget, ModelRouter.resolve(issue, attempt)) do
+      {:ok, next_graph}
+    else
+      false -> {:error, :managed_responsibility_requires_enforcement}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp prior_repository_cleanup(%{executions: executions} = fence, repository, issue_id) do
+    held =
+      Enum.any?(executions, fn {other_id, execution} ->
+        other_id != issue_id and execution.repository == repository and
+          not cleaned_execution?(fence, other_id, execution)
+      end)
+
+    if held, do: {:error, :previous_repository_cleanup_required}, else: :ok
+  end
+
+  defp cleaned_execution?(fence, issue_id, %{cleanup: :cleaned, status: :terminal, terminal: %{accepted_head: head}} = execution)
+       when is_binary(head) do
+    ExecutionFence.validate_cleanup(fence, %{issue_id: issue_id, generation: execution.generation}, head) == :ok
+  end
+
+  defp cleaned_execution?(_fence, _issue_id, _execution), do: false
+
+  defp route_budget(budget, route) do
+    configured_limit = Config.settings!().codex.max_total_tokens
+    selected_rank = Enum.find_index(@efforts, &(&1 == route.effort))
+    maximum_rank = Enum.find_index(@efforts, &(&1 == Atom.to_string(budget.effort)))
+
+    if route.model == budget.model and is_integer(selected_rank) and is_integer(maximum_rank) and
+         selected_rank <= maximum_rank and is_integer(configured_limit) and configured_limit > 0 and
+         configured_limit <= budget.max_tokens do
+      :ok
+    else
+      {:error, :managed_responsibility_budget_exceeded}
+    end
+  end
+end
