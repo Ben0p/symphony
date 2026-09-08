@@ -98,7 +98,7 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
     refute File.exists?(archive_dir <> ".staging")
   end
 
-  test "rebuilds a final archive left without its manifest", context do
+  test "preserves a final archive left without its manifest", context do
     head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
     {fence, token} = admitted_fence(context.workspace)
     opts = [archive_root: context.archive_root, command_runner: command_runner()]
@@ -106,7 +106,7 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
     File.mkdir_p!(archive_dir)
     File.write!(Path.join(archive_dir, "partial.txt"), "partial\n")
 
-    assert {:ok, _evidence_ref} =
+    assert {:error, :cleanup_archive_incomplete} =
              WorkPackageCleanup.prepare(
                %{execution_fence: fence},
                token,
@@ -115,7 +115,8 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
                opts
              )
 
-    assert File.exists?(Path.join(archive_dir, "manifest.json"))
+    assert File.read!(Path.join(archive_dir, "partial.txt")) == "partial\n"
+    refute File.exists?(Path.join(archive_dir, "manifest.json"))
   end
 
   test "archives a linked git worktree with recoverable refs", context do

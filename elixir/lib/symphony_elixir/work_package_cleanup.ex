@@ -7,9 +7,9 @@ defmodule SymphonyElixir.WorkPackageCleanup do
   the before-remove hook is only one input to this record.
   """
 
-  alias SymphonyElixir.{PathSafety, Workspace}
+  alias SymphonyElixir.{PathSafety, PortableWorkspaceArchive, Workspace}
 
-  @archive_version 1
+  @archive_version 2
 
   @type target :: %{
           issue_id: String.t(),
@@ -56,30 +56,16 @@ defmodule SymphonyElixir.WorkPackageCleanup do
     end
   end
 
-  defp target(state, %{issue_id: issue_id, generation: generation}, expected_head, entry)
-       when is_binary(issue_id) and is_integer(generation) and generation > 0 do
-    execution = get_in(Map.get(state, :execution_fence), [:executions, issue_id])
-    workspace = Map.get(entry, :workspace_path) || get_in(execution, [:worktree])
-    worker_host = Map.get(entry, :worker_host) || get_in(execution, [:worker_host])
+  defp target(state, token, expected_head, entry) do
+    with {:ok, target} <- target_from_state(state, token, expected_head) do
+      workspace = Map.get(entry, :workspace_path) || target.workspace
+      worker_host = Map.get(entry, :worker_host) || target.worker_host
 
-    if is_map(execution) and is_binary(workspace) and is_binary(execution.repository) and
-         is_binary(execution.branch) do
-      {:ok,
-       %{
-         issue_id: issue_id,
-         generation: generation,
-         repository_ref: execution.repository,
-         branch: execution.branch,
-         workspace: Path.expand(workspace),
-         worker_host: worker_host,
-         expected_head: expected_head
-       }}
-    else
-      {:error, :cleanup_target_missing}
+      if is_binary(workspace) and Path.expand(workspace) == target.workspace and worker_host == target.worker_host,
+        do: {:ok, target},
+        else: {:error, :cleanup_target_missing}
     end
   end
-
-  defp target(_state, _token, _expected_head, _entry), do: {:error, :cleanup_target_missing}
 
   defp target_from_state(state, %{issue_id: issue_id, generation: generation}, expected_head)
        when is_binary(issue_id) and is_integer(generation) and generation > 0 do
@@ -208,20 +194,16 @@ defmodule SymphonyElixir.WorkPackageCleanup do
         end
 
       File.exists?(archive_dir) ->
-        case File.rm_rf(archive_dir) do
-          {:ok, _removed} -> write_archive(archive_root, target, metadata, opts)
-          {:error, reason, _path} -> {:error, {:cleanup_archive_incomplete, reason}}
-        end
+        {:error, :cleanup_archive_incomplete}
 
       true ->
-        _ = File.rm_rf(staging_dir)
-
-        with :ok <- File.mkdir_p(staging_dir),
-             {:ok, _files} <- File.cp_r(target.workspace, Path.join(staging_dir, "workspace")),
-             :ok <- remove_archived_git_metadata(Path.join(staging_dir, "workspace")),
+        with {:ok, _removed} <- File.rm_rf(staging_dir),
+             :ok <- File.mkdir_p(staging_dir),
+             {:ok, workspace_files} <- PortableWorkspaceArchive.copy(target.workspace, Path.join(staging_dir, "workspace")),
              :ok <- create_repository_bundle(target.workspace, staging_dir, opts),
-             {:ok, content} <- archive_content(staging_dir),
+             {:ok, content} <- archive_content(staging_dir, workspace_files),
              final_metadata = Map.put(metadata, :content, content),
+             :ok <- current_archive_state_matches?(Jason.decode!(Jason.encode!(final_metadata)), target, opts),
              evidence_ref = evidence_ref(final_metadata),
              :ok <- atomic_write(Path.join(staging_dir, "manifest.json"), Jason.encode!(Map.put(final_metadata, :evidence_ref, evidence_ref))),
              :ok <- File.rename(staging_dir, archive_dir),
@@ -231,6 +213,9 @@ defmodule SymphonyElixir.WorkPackageCleanup do
           {:error, reason} ->
             _ = File.rm_rf(staging_dir)
             {:error, {:cleanup_archive_build_failed, reason}}
+
+          {:error, reason, path} ->
+            {:error, {:cleanup_archive_staging_removal_failed, reason, path}}
         end
     end
   end
@@ -283,9 +268,11 @@ defmodule SymphonyElixir.WorkPackageCleanup do
   end
 
   defp current_archive_state_matches?(manifest, target, opts) do
-    with {:ok, git_state} <- collect_git_state(target.workspace, opts),
+    with {:ok, observed_head} <- git_output(target.workspace, ["rev-parse", "HEAD"], opts),
+         :ok <- exact_head(observed_head, target.expected_head),
+         {:ok, git_state} <- collect_git_state(target.workspace, opts),
          {:ok, open_prs} <- collect_open_prs(target.branch, target.workspace, opts),
-         {:ok, workspace_files} <- archive_content_files(target.workspace) do
+         {:ok, workspace_files} <- source_content_files(target.workspace, manifest["archive_version"]) do
       expected_git = Jason.decode!(Jason.encode!(git_state))
       expected_files = get_in(manifest, ["content", "workspace_files"])
 
@@ -301,14 +288,12 @@ defmodule SymphonyElixir.WorkPackageCleanup do
     content = manifest["content"]
 
     with {:ok, expected_files} <- content_files(content),
-         {:ok, actual_files} <- archive_content_files(Path.join(archive_dir, "workspace")),
-         true <- expected_files == actual_files,
+         :ok <- verify_workspace_content(Path.join(archive_dir, "workspace"), expected_files, manifest["archive_version"]),
          {:ok, bundle} <- content_bundle(content),
          :ok <- verify_file_digest(Path.join(archive_dir, bundle["path"]), bundle),
          :ok <- verify_repository_bundle(Path.join(archive_dir, bundle["path"]), target.expected_head, opts) do
       :ok
     else
-      false -> {:error, :cleanup_archive_content_mismatch}
       {:error, _reason} = error -> error
     end
   end
@@ -340,11 +325,21 @@ defmodule SymphonyElixir.WorkPackageCleanup do
 
   defp content_bundle(_content), do: {:error, :cleanup_archive_bundle_missing}
 
-  defp archive_content(staging_dir) do
-    with {:ok, workspace_files} <- archive_content_files(Path.join(staging_dir, "workspace")),
-         {:ok, bundle} <- file_digest(Path.join(staging_dir, "repository.bundle")) do
+  defp archive_content(staging_dir, workspace_files) do
+    with {:ok, bundle} <- file_digest(Path.join(staging_dir, "repository.bundle")) do
       bundle = bundle |> Map.put(:path, "repository.bundle") |> Map.put(:type, "regular")
       {:ok, %{workspace_files: workspace_files, repository_bundle: bundle}}
+    end
+  end
+
+  defp source_content_files(workspace, 2), do: PortableWorkspaceArchive.inventory(workspace)
+  defp source_content_files(workspace, 1), do: archive_content_files(workspace)
+
+  defp verify_workspace_content(workspace, expected, 2), do: PortableWorkspaceArchive.verify(workspace, expected)
+
+  defp verify_workspace_content(workspace, expected, 1) do
+    with {:ok, actual} <- archive_content_files(workspace) do
+      if expected == actual, do: :ok, else: {:error, :cleanup_archive_content_mismatch}
     end
   end
 
@@ -485,13 +480,6 @@ defmodule SymphonyElixir.WorkPackageCleanup do
     error -> {:error, {:cleanup_archive_bundle_failed, error}}
   end
 
-  defp remove_archived_git_metadata(workspace_archive) do
-    case File.rm_rf(Path.join(workspace_archive, ".git")) do
-      {:ok, _removed} -> :ok
-      {:error, reason, _path} -> {:error, {:cleanup_archive_git_metadata_failed, reason}}
-    end
-  end
-
   defp normalize_relative_path(path) when is_binary(path) do
     path
     |> String.replace("\\", "/")
@@ -503,9 +491,10 @@ defmodule SymphonyElixir.WorkPackageCleanup do
   end
 
   defp manifest_matches_target(manifest, target) do
-    if manifest["archive_version"] == @archive_version and manifest["issue_id"] == target.issue_id and
+    if manifest["archive_version"] in [1, @archive_version] and manifest["issue_id"] == target.issue_id and
          manifest["generation"] == target.generation and manifest["repository_ref"] == target.repository_ref and
-         manifest["branch"] == target.branch do
+         manifest["branch"] == target.branch and manifest["expected_head"] == target.expected_head and
+         manifest["observed_head"] == target.expected_head do
       :ok
     else
       {:error, :cleanup_manifest_mismatch}

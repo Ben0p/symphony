@@ -14,6 +14,8 @@ profile ID tuple; partial configuration fails startup, while a declared `SYMPHON
 `SYMPHONY_REPOSITORY_REF` without it fails startup as well. The Elixir runtime archives dirty and unmerged work, retains open PR
 candidates, and releases provider scope only after independently verified supervisor termination
 and workspace cleanup. See [elixir/README.md](elixir/README.md) for the host environment contract.
+Recovery archives retain junctions and symbolic links as verified metadata, without following their
+targets or requiring link-creation privileges on the archive host.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
