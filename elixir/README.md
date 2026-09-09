@@ -180,6 +180,10 @@ it claims this reservation before launching the mutable worker and posts termina
 cleanup receipts from the same fence. Runner tokens and attestation keys are supplied by the host
 and are never logged or placed in workflow files.
 
+Cleanup receipt authority retains the validated reservation generation through journal writes
+and acknowledgement replay. Later generations use their own journal entry even when a legacy
+entry is present; termination and repository-cleanup receipts never fall back to an older claim.
+
 The journal records `submitted`, `confirmed`, and `spawn_started` separately. The last marker is
 synced before attempting a worker task, so a restart can replay a submitted claim only when its
 current generation and unstarted lease still match. Uncertain claims keep their repository and
