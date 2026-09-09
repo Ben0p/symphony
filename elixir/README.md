@@ -259,8 +259,12 @@ and the original journal bytes and provider tuple must match. A spawn marker or 
 blocks adoption. Existing manifest, owner and budget checks still apply; accountable restart
 reconciliation uses the responsibility graph. Normal admission archives the previous generation
 and increments it once. An envelope already passed by a newer generation does not override that
-generation's claim/recovery checks. Failure after admission but before a new journal is written
-remains held for explicit reconciliation; the receipt cannot roll local authority back.
+generation's claim/recovery checks. A reservation lookup that explicitly reports not-ready releases
+only the current never-submitted local lease; old journal entries remain history. After restart,
+a valid journal without that generation and an untouched, unsupervised worker lease allow the normal
+recovery path to release exact responsibility before the fence and admit a higher generation.
+Missing journals for active leases, submitted claims, observed workers and conflicting identity stay
+held. The receipt cannot roll local authority back, and a missing fence never authorizes reuse of history.
 
 `DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
 private reservation journal and archive root. The archive root must be outside active workspaces.

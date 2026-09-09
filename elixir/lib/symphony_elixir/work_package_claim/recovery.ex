@@ -3,10 +3,10 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
 
   alias SymphonyElixir.{ExecutionFence, ResponsibilityGraph}
   alias SymphonyElixir.ManagedResponsibility.Admission
-  alias SymphonyElixir.WorkPackageClaim.{Abandonment, Dispatch, Journal}
+  alias SymphonyElixir.WorkPackageClaim.{Abandonment, Dispatch, Journal, Unsubmitted}
 
   @spec prepare(map(), map(), map(), map(), non_neg_integer() | nil, non_neg_integer()) ::
-          :new | {:new, map()} | {:ok, map(), map(), map()} | {:error, term()}
+          :new | {:new, map()} | {:new, map(), map()} | {:ok, map(), map(), map()} | {:error, term()}
   def prepare(runtime, fence, graph, issue, attempt, now_ms) do
     case fence.executions[issue.id] do
       nil ->
@@ -35,9 +35,10 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
   end
 
   defp prepare_existing_claim(runtime, fence, graph, issue, attempt, now_ms, execution) do
-    if never_submitted?(execution),
-      do: new_without_claim(runtime, issue.id),
-      else: recover(runtime, fence, graph, issue, attempt, now_ms, execution)
+    case Unsubmitted.prepare(runtime, fence, graph, execution, now_ms) do
+      :submitted -> recover(runtime, fence, graph, issue, attempt, now_ms, execution)
+      result -> result
+    end
   end
 
   defp prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms) do
@@ -86,15 +87,6 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
 
   defp unstarted?(%{dispatch: %{phase: phase}}), do: phase in ["submitted", "confirmed", "blocked"]
   defp unstarted?(_reservation), do: false
-
-  defp never_submitted?(%{status: :active, leases: leases}) when map_size(leases) > 0 do
-    Enum.all?(leases, fn {_id, lease} ->
-      lease.status == :released and lease[:release_reason] in [:claim_not_submitted, "claim_not_submitted"] and
-        is_nil(lease[:supervisor_identity]) and lease.head == "unobserved"
-    end)
-  end
-
-  defp never_submitted?(_execution), do: false
 
   defp new_without_claim(runtime, issue_id) do
     case load_journal(runtime) do

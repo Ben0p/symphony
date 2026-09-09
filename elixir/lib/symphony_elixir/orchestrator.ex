@@ -27,10 +27,10 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Codex.Progress
   alias SymphonyElixir.ExecutionFence.Persistence
   alias SymphonyElixir.ManagedResponsibility.Admission, as: ManagedAdmission
-  alias SymphonyElixir.WorkPackageClaim.Journal
-  alias SymphonyElixir.WorkPackageClaim.Recovery, as: ClaimRecovery
   alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.WorkPackageClaim.{Journal, Unsubmitted}
+  alias SymphonyElixir.WorkPackageClaim.Recovery, as: ClaimRecovery
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -530,6 +530,12 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, term(), map(), String.t(), String.t() | nil, map()} | {:error, term()}
   def admit_execution_for_test(%State{} = state, %Issue{} = issue, worker_host) do
     admit_execution(state, issue, worker_host)
+  end
+
+  @doc false
+  @spec handle_claim_failure_for_test(term(), Issue.t(), term(), map()) :: term()
+  def handle_claim_failure_for_test(%State{} = state, %Issue{} = issue, reason, entry) do
+    handle_claim_failure(state, issue, reason, entry)
   end
 
   @doc false
@@ -1477,6 +1483,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host, attempt)
        when is_binary(issue_id) do
     case prepare_claim_recovery(state, issue, attempt) do
+      {:new, fence, graph} ->
+        with {:ok, state} <- persist_responsibility_graph(state, graph),
+             {:ok, state} <- persist_execution_fence(state, fence) do
+          admit_new_execution(state, issue, worker_host, attempt)
+        end
+
       {:new, graph} ->
         admit_new_execution(%{state | responsibility_graph: graph}, issue, worker_host, attempt)
 
@@ -1602,13 +1614,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp retain_claim_error?(_state, _issue, {:claim_indeterminate, _reason}), do: true
   defp retain_claim_error?(%State{work_package_runtime: nil}, _issue, _reason), do: false
 
-  defp retain_claim_error?(state, issue, _reason) do
-    case Journal.load(Map.get(state.work_package_runtime, :journal_path, "")) do
-      :missing -> false
-      {:ok, journal} -> Enum.any?(journal.reservations, fn {_key, reservation} -> reservation.issue_id == issue.id end)
-      {:error, _reason} -> true
-    end
-  end
+  defp retain_claim_error?(state, issue, :reservation_not_ready),
+    do: Unsubmitted.claim_may_exist?(state.work_package_runtime, state.execution_fence, issue.id)
+
+  defp retain_claim_error?(_state, _issue, _reason), do: true
 
   defp retained_claim_slot?(%State{work_package_runtime: nil}, _issue_id), do: false
   defp retained_claim_slot?(state, issue_id), do: ClaimRecovery.held?(state.execution_fence, issue_id)
@@ -1862,7 +1871,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp release_responsibility_lease(state, _running_entry), do: state
 
-  defp normalize_release_reason(reason) when reason in [:spawn_failed, :global_pause], do: reason
+  defp normalize_release_reason(reason) when reason in [:spawn_failed, :global_pause, :claim_not_submitted], do: reason
   defp normalize_release_reason(_reason), do: :orchestrator_stop
 
   defp terminal_outcome_for(entry, reason) do
