@@ -4,6 +4,51 @@ defmodule SymphonyElixir.WorkPackageClaim.Unsubmitted do
   alias SymphonyElixir.{ExecutionFence, ResponsibilityGraph}
   alias SymphonyElixir.WorkPackageClaim.Journal
 
+  @doc "Proves an already released local generation has no claim or workspace blocking another issue."
+  @spec released_without_workspace?(map() | nil, map(), map(), map(), non_neg_integer()) :: boolean()
+  def released_without_workspace?(runtime, fence, graph, %{worker_host: nil, worktree: path} = execution, now_ms)
+      when is_map(runtime) and is_binary(path) do
+    with true <- Path.type(path) == :absolute and Path.expand(path) == path,
+         false <- String.starts_with?(path, ["//", "\\\\"]),
+         {:error, :enoent} <- File.lstat(path),
+         true <- plain_directory_ancestors?(Path.dirname(path)),
+         true <- matching_authorization?(runtime, graph, execution),
+         :absent <- current_claim(runtime, execution),
+         {:new, ^fence, ^graph} <- prepare(runtime, fence, graph, execution, now_ms) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  def released_without_workspace?(_runtime, _fence, _graph, _execution, _now_ms), do: false
+
+  defp matching_authorization?(%{managed_project_profile_id: profile, managed_delegations: manifest}, graph, execution) do
+    with %{managed_project_profile_id: ^profile, repository_ref: repository, entries: entries} <- manifest,
+         true <- repository == execution.repository,
+         entry when is_map(entry) <- Enum.find(entries, &(&1.issue_id == execution.issue_id)) do
+      Enum.all?([entry.accountable, entry.responsible], &immutable_match?(graph.delegations[&1.id], &1))
+    else
+      _ -> false
+    end
+  end
+
+  defp matching_authorization?(_runtime, _graph, _execution), do: false
+
+  defp immutable_match?(current, expected) when is_map(current), do: Map.take(current, Map.keys(expected)) == expected
+  defp immutable_match?(_current, _expected), do: false
+
+  defp plain_directory_ancestors?(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        parent = Path.dirname(path)
+        parent == path or plain_directory_ancestors?(parent)
+
+      _ ->
+        false
+    end
+  end
+
   @spec claim_may_exist?(map(), map(), String.t()) :: boolean()
   def claim_may_exist?(runtime, fence, issue_id) do
     case current_claim(runtime, fence.executions[issue_id]) do

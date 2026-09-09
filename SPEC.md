@@ -739,6 +739,10 @@ Distinct terminal reasons are important because retry logic and logs differ.
   current issue; same-repository successor authority remains gated by verified predecessor
   cleanup and the provider's claim. Loading or replaying configuration cannot revive terminal,
   revoked or restart-blocked responsibility.
+- An already released, never-submitted managed generation MAY cease blocking another issue only
+  when its readable journal has no same-or-newer claim, its exact operator grants still match,
+  and its canonical local workspace is absent with no linked ancestors. The check MUST preserve
+  historical claims and MUST NOT fabricate terminal completion or repository cleanup.
 
 ## 8. Polling, Scheduling, and Reconciliation
 

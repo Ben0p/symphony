@@ -336,6 +336,11 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     assert File.read!(context.runtime.journal_path) == journal_before
     assert next.responsibility_graph.delegations[context.delegation].runtime_lease == nil
     assert Enum.all?(Map.values(next.execution_fence.executions[first].leases), &(&1.release_reason == :claim_not_submitted))
+    File.mkdir_p!(Path.dirname(next.execution_fence.executions[first].worktree))
+    assert {:ok, successor, _, _, "responsible-2", _} = Orchestrator.admit_execution_for_test(next, Fixture.issue(2), nil)
+    assert successor.execution_fence.executions[first] == next.execution_fence.executions[first]
+    assert successor.execution_fence.history == next.execution_fence.history
+    assert File.read!(context.runtime.journal_path) == journal_before
   end
 
   test "real restart recovers an untouched unsubmitted generation without erasing historical claims", context do

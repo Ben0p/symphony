@@ -266,6 +266,13 @@ recovery path to release exact responsibility before the fence and admit a highe
 Missing journals for active leases, submitted claims, observed workers and conflicting identity stay
 held. The receipt cannot roll local authority back, and a missing fence never authorizes reuse of history.
 
+An already released never-submitted generation can also yield to a different eligible issue.
+Both the execution and responsibility admission gates require the same proof: a readable journal
+with no same-or-newer claim, unchanged operator grants, and an absent local workspace whose
+ancestors are plain directories. Recovery must leave the existing fence and graph unchanged;
+missing journals, links, remote workspaces or partly released authority keep the repository held.
+Retained old generations and grants remain history; they are not marked complete or cleaned.
+
 `DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
 private reservation journal and archive root. The archive root must be outside active workspaces.
 Archives now use version 2: regular file bytes and empty directories are copied, while junctions
