@@ -6,6 +6,7 @@ defmodule SymphonyElixir.ManagedResponsibility do
 
   alias SymphonyElixir.ResponsibilityGraph
   alias SymphonyElixir.ResponsibilityGraph.Persistence
+  alias SymphonyElixir.WorkPackageClaim.Unsubmitted
 
   @routing [:pool_key, :repository_ref, :managed_project_profile_id]
   @payload_keys ~w(schema_version pool_key repository_ref managed_project_profile_id authority_ref entries)
@@ -34,15 +35,18 @@ defmodule SymphonyElixir.ManagedResponsibility do
   def decode(_payload, _context, _now_ms), do: {:error, :invalid_managed_delegation_manifest}
 
   @spec admit(map(), map() | nil, map(), non_neg_integer()) :: {:ok, map()} | {:error, term()}
-  def admit(graph, nil, _issue, _now_ms), do: {:ok, graph}
+  def admit(graph, manifest, issue, now_ms), do: admit(graph, manifest, issue, now_ms, nil)
 
-  def admit(graph, %{schema_version: 1, entries: entries, repository_ref: repository}, issue, now_ms)
+  @spec admit(map(), map() | nil, map(), non_neg_integer(), map() | nil) :: {:ok, map()} | {:error, term()}
+  def admit(graph, nil, _issue, _now_ms, _recovery), do: {:ok, graph}
+
+  def admit(graph, %{schema_version: 1, entries: entries, repository_ref: repository}, issue, now_ms, recovery)
       when is_map(graph) and is_list(entries) and is_map(issue) and is_integer(now_ms) and now_ms >= 0 do
     with :ok <- ResponsibilityGraph.validate(graph),
          entry when is_map(entry) <- Enum.find(entries, &(&1.issue_id == issue.id and &1.identifier == issue.identifier)),
          true <- entry.owner_id == issue.assignee_id,
          true <- entry.accountable.expires_at_ms > now_ms and entry.responsible.expires_at_ms > now_ms,
-         false <- repository_busy?(graph, entry.responsible.id, repository) do
+         false <- repository_busy?(graph, entry.responsible.id, repository, recovery, now_ms) do
       ensure_pair(graph, entry, now_ms)
     else
       {:error, _reason} = error -> error
@@ -50,7 +54,7 @@ defmodule SymphonyElixir.ManagedResponsibility do
     end
   end
 
-  def admit(_graph, _manifest, _issue, _now_ms), do: {:error, :invalid_managed_delegation_input}
+  def admit(_graph, _manifest, _issue, _now_ms, _recovery), do: {:error, :invalid_managed_delegation_input}
 
   defp decode_entries(entries, context, now_ms) do
     Enum.reduce_while(entries, {:ok, []}, fn raw, {:ok, acc} ->
@@ -130,12 +134,27 @@ defmodule SymphonyElixir.ManagedResponsibility do
 
   defp immutable_match?(existing, attrs), do: Map.take(existing, Map.keys(attrs)) == attrs
 
-  defp repository_busy?(graph, selected_id, repository) do
+  defp repository_busy?(graph, selected_id, repository, recovery, now_ms) do
     Enum.any?(graph.delegations, fn {id, delegation} ->
       id != selected_id and delegation.role == :responsible and
-        delegation.status in [:active, :blocked] and delegation.scope.repository == repository
+        delegation.status in [:active, :blocked] and delegation.scope.repository == repository and
+        not unsubmitted_delegation?(graph, delegation, recovery, now_ms)
     end)
   end
+
+  defp unsubmitted_delegation?(graph, %{runtime_lease: nil} = delegation, %{runtime: runtime, fence: fence}, now_ms)
+       when is_map(runtime) and is_map(fence) do
+    with %{entries: entries} <- runtime[:managed_delegations],
+         entry when is_map(entry) <- Enum.find(entries, &(&1.issue_id == delegation.scope.issue_id)),
+         true <- entry.responsible.id == delegation.id,
+         execution when is_map(execution) <- fence.executions[delegation.scope.issue_id] do
+      Unsubmitted.released_without_workspace?(runtime, fence, graph, execution, now_ms)
+    else
+      _ -> false
+    end
+  end
+
+  defp unsubmitted_delegation?(_graph, _delegation, _recovery, _now_ms), do: false
 
   defp unique?(entries) do
     ids = Enum.flat_map(entries, &[&1.accountable.id, &1.responsible.id])

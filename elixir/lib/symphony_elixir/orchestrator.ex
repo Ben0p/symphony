@@ -1522,7 +1522,8 @@ defmodule SymphonyElixir.Orchestrator do
              manifest,
              issue,
              attempt,
-             now_ms
+             now_ms,
+             state.work_package_runtime
            ),
          state = %{state | responsibility_graph: graph},
          {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),

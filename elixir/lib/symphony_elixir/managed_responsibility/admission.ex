@@ -7,18 +7,25 @@ defmodule SymphonyElixir.ManagedResponsibility.Admission do
   alias SymphonyElixir.{Config, ExecutionFence, ManagedResponsibility, ResponsibilityGraph}
 
   alias SymphonyElixir.Codex.ModelRouter
+  alias SymphonyElixir.WorkPackageClaim.Unsubmitted
 
   @efforts ~w(none minimal low medium high xhigh max ultra)
 
   @spec prepare(map(), map(), map() | nil, map(), non_neg_integer() | nil, non_neg_integer()) ::
           {:ok, map()} | {:error, term()}
-  def prepare(graph, _fence, nil, _issue, _attempt, _now_ms), do: {:ok, graph}
-
   def prepare(graph, fence, manifest, issue, attempt, now_ms) do
+    prepare(graph, fence, manifest, issue, attempt, now_ms, nil)
+  end
+
+  @spec prepare(map(), map(), map() | nil, map(), non_neg_integer() | nil, non_neg_integer(), map() | nil) ::
+          {:ok, map()} | {:error, term()}
+  def prepare(graph, _fence, nil, _issue, _attempt, _now_ms, _runtime), do: {:ok, graph}
+
+  def prepare(graph, fence, manifest, issue, attempt, now_ms, runtime) do
     with true <- ResponsibilityGraph.enforced?(graph),
          :ok <- ExecutionFence.validate(fence),
-         :ok <- prior_repository_cleanup(fence, manifest.repository_ref, issue.id),
-         {:ok, next_graph} <- ManagedResponsibility.admit(graph, manifest, issue, now_ms),
+         :ok <- prior_repository_cleanup(fence, graph, manifest.repository_ref, issue.id, runtime, now_ms),
+         {:ok, next_graph} <- ManagedResponsibility.admit(graph, manifest, issue, now_ms, %{runtime: runtime, fence: fence}),
          {:ok, delegation} <- ResponsibilityGraph.admission_delegation(next_graph, issue.id, issue.identifier, manifest.repository_ref),
          :ok <- route_budget(delegation.budget, ModelRouter.resolve(issue, attempt)) do
       {:ok, next_graph}
@@ -28,11 +35,12 @@ defmodule SymphonyElixir.ManagedResponsibility.Admission do
     end
   end
 
-  defp prior_repository_cleanup(%{executions: executions} = fence, repository, issue_id) do
+  defp prior_repository_cleanup(%{executions: executions} = fence, graph, repository, issue_id, runtime, now_ms) do
     held =
       Enum.any?(executions, fn {other_id, execution} ->
         other_id != issue_id and execution.repository == repository and
-          not cleaned_execution?(fence, other_id, execution)
+          not (cleaned_execution?(fence, other_id, execution) or
+                 Unsubmitted.released_without_workspace?(runtime, fence, graph, execution, now_ms))
       end)
 
     if held, do: {:error, :previous_repository_cleanup_required}, else: :ok

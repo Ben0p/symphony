@@ -22,6 +22,10 @@ It creates responsibility only for the exact freshly eligible issue, through the
 owner, and keeps successor admission behind predecessor cleanup and provider claims. A ready label
 does not grant execution authority. See [responsibility delegation](docs/responsibility-delegation.md).
 
+A generation released before claim submission does not reserve the repository indefinitely.
+Another eligible issue may proceed only after the journal, exact delegation and absent local
+workspace prove that the released generation has no remaining mutable authority.
+
 Managed claims retain their generation and repository capacity when an acknowledgement is lost.
 The runner journals submission and the first spawn attempt separately, replays only the exact
 current authority, and stops after bounded recovery attempts. A legacy or mismatched claim requires
