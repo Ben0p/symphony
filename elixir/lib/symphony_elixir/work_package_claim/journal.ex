@@ -57,6 +57,10 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
     end
   end
 
+  @doc "Decodes the exact bounded bytes authenticated by a recovery envelope."
+  @spec decode_bytes(binary()) :: {:ok, state()} | {:error, term()}
+  def decode_bytes(contents) when is_binary(contents), do: decode(contents)
+
   @spec put(state(), String.t(), reservation()) :: {:ok, state()} | {:error, term()}
   def put(%{schema_version: @schema_version, reservations: reservations} = state, key, reservation)
       when is_binary(key) and is_map(reservation) do

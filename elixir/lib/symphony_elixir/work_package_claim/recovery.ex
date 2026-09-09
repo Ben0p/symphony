@@ -3,10 +3,10 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
 
   alias SymphonyElixir.{ExecutionFence, ResponsibilityGraph}
   alias SymphonyElixir.ManagedResponsibility.Admission
-  alias SymphonyElixir.WorkPackageClaim.{Dispatch, Journal}
+  alias SymphonyElixir.WorkPackageClaim.{Abandonment, Dispatch, Journal}
 
   @spec prepare(map(), map(), map(), map(), non_neg_integer() | nil, non_neg_integer()) ::
-          :new | {:ok, map(), map(), map()} | {:error, term()}
+          :new | {:new, map()} | {:ok, map(), map(), map()} | {:error, term()}
   def prepare(runtime, fence, graph, issue, attempt, now_ms) do
     case fence.executions[issue.id] do
       nil ->
@@ -16,9 +16,36 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
         completed_claim(runtime, issue.id, execution)
 
       execution ->
-        if never_submitted?(execution),
-          do: new_without_claim(runtime, issue.id),
-          else: recover(runtime, fence, graph, issue, attempt, now_ms, execution)
+        case Abandonment.check(runtime, fence, issue.id) do
+          :authorized ->
+            prepare_abandoned_claim(runtime, fence, graph, issue, attempt, now_ms)
+
+          :missing ->
+            prepare_existing_claim(runtime, fence, graph, issue, attempt, now_ms, execution)
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  end
+
+  defp prepare_existing_claim(runtime, fence, graph, issue, attempt, now_ms, execution) do
+    if never_submitted?(execution),
+      do: new_without_claim(runtime, issue.id),
+      else: recover(runtime, fence, graph, issue, attempt, now_ms, execution)
+  end
+
+  defp prepare_abandoned_claim(runtime, fence, graph, issue, attempt, now_ms) do
+    with %{entries: entries} <- runtime[:managed_delegations],
+         entry when is_map(entry) <- Enum.find(entries, &(&1.issue_id == issue.id)),
+         %{role: :responsible, status: :active, runtime_lease: nil, parent_delegation_id: parent} <- graph.delegations[entry.responsible.id],
+         true <- parent == entry.accountable.id,
+         {:ok, graph} <- reconcile_parent(graph, parent, now_ms),
+         {:ok, graph} <- Admission.prepare(graph, fence, runtime.managed_delegations, issue, attempt, now_ms) do
+      {:new, graph}
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :claim_abandonment_responsibility_changed}
     end
   end
 
@@ -147,7 +174,7 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
 
   defp reconcile_parent(graph, id, now_ms) do
     case graph.delegations[id] do
-      %{status: :active} ->
+      %{role: :accountable, runtime_lease: nil, status: :active} ->
         {:ok, graph}
 
       %{role: :accountable, runtime_lease: nil, status: :blocked, blocked_on: :restart_reconciliation} ->

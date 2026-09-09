@@ -56,6 +56,11 @@ host-controlled service configuration. Workers must not edit the manifest or gra
 Loading this input grants no worker lease: fresh native eligibility, exact responsibility,
 execution fencing and the provider's durable claim remain required before a turn starts.
 
+Optional pre-spawn recovery receipts use host-only `DAHLIA_WORK_PACKAGE_RECOVERY_DIRECTORY`
+and `DAHLIA_WORK_PACKAGE_RECOVERY_PUBLIC_KEY` settings documented in `README.md`. Workers must
+not change those settings, receipt files or private authority journals. The signing key remains
+outside the runtime. Receipt adoption preserves history and retains normal native admission checks.
+
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}

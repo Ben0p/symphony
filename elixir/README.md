@@ -210,6 +210,25 @@ DAHLIA_MANAGED_PROJECT_PROFILE_ID=<managed profile identity>
 SYMPHONY_ACCEPTED_SOURCE_HEAD=<launcher-attested 40-character Git object ID>
 ```
 
+For an explicitly confirmed pre-spawn recovery, configure both
+`DAHLIA_WORK_PACKAGE_RECOVERY_DIRECTORY` (an existing absolute directory) and
+`DAHLIA_WORK_PACKAGE_RECOVERY_PUBLIC_KEY` (the unpadded base64url 32-byte Ed25519 public key).
+The host writes one immutable `<issue UUID>.json` envelope containing base64url `payload` and
+`signature`; the signed payload uses `work-package-pre-spawn-recovery.v1`, the exact provider
+claim and confirmation receipt, local generation maximum, original journal SHA-256 and
+`neverSpawned: true`. The independent root signer must verify the provider response and retained
+history while the runtime is durably stopped across restart. Keep the private key outside the
+runtime and workers; publish receipts atomically into a root-owned directory.
+
+Receipt adoption is read-only. The current generation must equal the retained local maximum,
+all issue generations must have released, unobserved leases, all issue workspaces must be absent,
+and the original journal bytes and provider tuple must match. A spawn marker or worker observation
+blocks adoption. Existing manifest, owner and budget checks still apply; accountable restart
+reconciliation uses the responsibility graph. Normal admission archives the previous generation
+and increments it once. An envelope already passed by a newer generation does not override that
+generation's claim/recovery checks. Failure after admission but before a new journal is written
+remains held for explicit reconciliation; the receipt cannot roll local authority back.
+
 `DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
 private reservation journal and archive root. The archive root must be outside active workspaces.
 Archives now use version 2: regular file bytes and empty directories are copied, while junctions

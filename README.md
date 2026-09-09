@@ -26,6 +26,9 @@ Managed claims retain their generation and repository capacity when an acknowled
 The runner journals submission and the first spawn attempt separately, replays only the exact
 current authority, and stops after bounded recovery attempts. A legacy or mismatched claim requires
 explicit reconciliation; it cannot silently become a new worker generation.
+For retained pre-spawn incidents, the host may supply a signed provider recovery receipt. The
+runtime verifies the old journal, complete unstarted history and released scope before normal
+admission advances the generation; it preserves the original evidence and never invents cleanup.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 

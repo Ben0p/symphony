@@ -62,6 +62,27 @@ defmodule SymphonyElixir.WorkPackageRuntimeTest do
              )
   end
 
+  test "recovery configuration requires both an existing absolute directory and an Ed25519 public key" do
+    {public_key, _private_key} = :crypto.generate_key(:eddsa, :ed25519)
+
+    configured =
+      Map.merge(@required, %{
+        "DAHLIA_WORK_PACKAGE_RECOVERY_DIRECTORY" => System.tmp_dir!(),
+        "DAHLIA_WORK_PACKAGE_RECOVERY_PUBLIC_KEY" => Base.url_encode64(public_key, padding: false)
+      })
+
+    assert {:ok, %{claim_recovery: %{public_key: ^public_key}}} = WorkPackageRuntime.configuration(env: configured)
+
+    assert {:error, :incomplete_claim_recovery_configuration} =
+             WorkPackageRuntime.configuration(env: Map.delete(configured, "DAHLIA_WORK_PACKAGE_RECOVERY_PUBLIC_KEY"))
+
+    assert {:error, :invalid_claim_recovery_configuration} =
+             WorkPackageRuntime.configuration(env: Map.put(configured, "DAHLIA_WORK_PACKAGE_RECOVERY_DIRECTORY", "relative"))
+
+    assert {:error, :invalid_claim_recovery_configuration} =
+             WorkPackageRuntime.configuration(env: Map.put(configured, "DAHLIA_WORK_PACKAGE_RECOVERY_PUBLIC_KEY", "invalid"))
+  end
+
   test "application supervisor supplies managed options to the real orchestrator child" do
     previous =
       Enum.map(@required, fn {name, value} ->

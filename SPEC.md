@@ -1651,6 +1651,13 @@ eligibility/authority checks and bounded retries. Pending claims consume capacit
 running workers. A missing journal, old generation, deterministic rejection or uncertain spawn
 requires explicit reconciliation rather than a new admission or fabricated terminal cleanup.
 
+A host-signed confirmation from a supported provider pre-spawn recovery can authorize normal
+forward admission only when the exact original journal, provider claim, current generation and
+complete unstarted local history agree. Provider scope must already be released; absent workspaces
+and released leases are required. Preserve journal and fence history, reconcile only the existing
+restart-blocked accountable delegation, and reapply current responsibility, owner and budget
+checks. The next generation is created by normal admission, never by rewriting old authority.
+
 ### 14.1 Failure Classes
 
 1. `Workflow/Config Failures`

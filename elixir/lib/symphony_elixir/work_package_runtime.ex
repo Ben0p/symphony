@@ -17,6 +17,8 @@ defmodule SymphonyElixir.WorkPackageRuntime do
   @profile_id "DAHLIA_MANAGED_PROJECT_PROFILE_ID"
   @journal_path "DAHLIA_WORK_PACKAGE_JOURNAL_PATH"
   @archive_root "DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT"
+  @recovery_directory "DAHLIA_WORK_PACKAGE_RECOVERY_DIRECTORY"
+  @recovery_public_key "DAHLIA_WORK_PACKAGE_RECOVERY_PUBLIC_KEY"
 
   @required_env [@provider_url, @runner_token, @attestation_key, @runner_id, @profile_id]
 
@@ -54,7 +56,8 @@ defmodule SymphonyElixir.WorkPackageRuntime do
     with {:ok, base_url} <- valid_base_url(values[@provider_url]),
          {:ok, journal_path} <- configured_path(env, @journal_path, default_journal_path()),
          {:ok, archive_root} <- configured_path(env, @archive_root, default_archive_root(journal_path)),
-         {:ok, managed_delegations} <- Manifest.load(env, System.system_time(:millisecond)) do
+         {:ok, managed_delegations} <- Manifest.load(env, System.system_time(:millisecond)),
+         {:ok, claim_recovery} <- recovery_configuration(env) do
       {:ok,
        %{
          base_url: base_url,
@@ -65,6 +68,7 @@ defmodule SymphonyElixir.WorkPackageRuntime do
          journal_path: journal_path,
          archive_root: archive_root,
          managed_delegations: managed_delegations,
+         claim_recovery: claim_recovery,
          cleanup_prepare_fun: fn state, token, head, entry ->
            WorkPackageCleanup.prepare(state, token, head, entry, archive_root: archive_root)
          end,
@@ -78,6 +82,25 @@ defmodule SymphonyElixir.WorkPackageRuntime do
            "DAHLIA_CLEANUP_ATTESTATION_KEY"
          ]
        }}
+    end
+  end
+
+  defp recovery_configuration(env) do
+    case {Map.get(env, @recovery_directory), Map.get(env, @recovery_public_key)} do
+      {nil, nil} ->
+        {:ok, nil}
+
+      {directory, encoded_key} when is_binary(directory) and is_binary(encoded_key) ->
+        with :absolute <- Path.type(directory),
+             {:ok, %{type: :directory}} <- File.lstat(directory),
+             {:ok, key} when byte_size(key) == 32 <- Base.url_decode64(encoded_key, padding: false) do
+          {:ok, %{directory: directory, public_key: key}}
+        else
+          _ -> {:error, :invalid_claim_recovery_configuration}
+        end
+
+      _ ->
+        {:error, :incomplete_claim_recovery_configuration}
     end
   end
 
