@@ -414,29 +414,30 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
       {"supervisor", value}, acc ->
         Map.put(acc, :supervisor, decode_optional_atom(value))
 
-      {key, value}, acc
-      when key in [
-             "session_id",
-             "process_id",
-             "unit",
-             "pre_active_state",
-             "pre_control_group",
-             "pre_processes",
-             "main_pid",
-             "active_state",
-             "control_group",
-             "remaining_processes",
-             "observed_at_ms",
-             "evidence_ref"
-           ] ->
-        Map.put(acc, String.to_existing_atom(key), value)
-
-      _entry, acc ->
-        acc
+      {key, value}, acc ->
+        case termination_field(key) do
+          nil -> acc
+          field -> Map.put(acc, field, value)
+        end
     end)
   end
 
   defp decode_termination_evidence(_payload), do: :invalid
+
+  # Literal atoms make cold decoding independent of supervisor module load order.
+  defp termination_field("session_id"), do: :session_id
+  defp termination_field("process_id"), do: :process_id
+  defp termination_field("unit"), do: :unit
+  defp termination_field("pre_active_state"), do: :pre_active_state
+  defp termination_field("pre_control_group"), do: :pre_control_group
+  defp termination_field("pre_processes"), do: :pre_processes
+  defp termination_field("main_pid"), do: :main_pid
+  defp termination_field("active_state"), do: :active_state
+  defp termination_field("control_group"), do: :control_group
+  defp termination_field("remaining_processes"), do: :remaining_processes
+  defp termination_field("observed_at_ms"), do: :observed_at_ms
+  defp termination_field("evidence_ref"), do: :evidence_ref
+  defp termination_field(_key), do: nil
 
   defp encode_optional_atom(nil), do: nil
   defp encode_optional_atom(value) when is_atom(value), do: Atom.to_string(value)
@@ -512,8 +513,14 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
         nil ->
           {:ok, receipt}
 
-        outcome when outcome in ["completed", "failed", "blocked"] ->
-          {:ok, Map.put(receipt, :terminal_outcome, String.to_existing_atom(outcome))}
+        "completed" ->
+          {:ok, Map.put(receipt, :terminal_outcome, :completed)}
+
+        "failed" ->
+          {:ok, Map.put(receipt, :terminal_outcome, :failed)}
+
+        "blocked" ->
+          {:ok, Map.put(receipt, :terminal_outcome, :blocked)}
 
         _ ->
           {:error, :invalid_cleanup_terminal_outcome}
