@@ -85,6 +85,42 @@ defmodule SymphonyElixir.Codex.SupervisedStartupTest do
     Port.close(port)
   end
 
+  test "caller timeout cannot widen the five-second deadline" do
+    port = open_port("read line")
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, {:supervisor_startup_failed, :supervisor_startup_timeout, _}, nil} =
+             SupervisedStartup.capture(port, identity(), fn -> :ok end,
+               timeout_ms: 60_000,
+               capture: fn _, _ -> {:error, {:systemd_unit_not_loaded, "not-found"}} end
+             )
+
+    assert System.monotonic_time(:millisecond) - started < 7_000
+    Port.close(port)
+  end
+
+  test "noninteger startup timeout fails before capture" do
+    port = open_port("read line")
+
+    assert {:error, {:supervisor_startup_failed, :invalid_supervisor_startup_timeout, _}, nil} =
+             SupervisedStartup.capture(port, identity(), fn -> :ok end, timeout_ms: "unbounded")
+
+    Port.close(port)
+  end
+
+  test "oversized mailbox fails without copying its messages into diagnostics" do
+    port = open_port("read line")
+    for _ <- 1..129, do: send(self(), {:unrelated, "private"})
+
+    assert {:error, {:supervisor_startup_failed, :supervisor_startup_mailbox_overflow, summary}, nil} =
+             SupervisedStartup.capture(port, identity(), fn -> :ok end)
+
+    assert summary.bytes == nil
+    assert summary.chunk_sha256 == []
+    assert summary.mailbox_messages >= 129
+    Port.close(port)
+  end
+
   test "guard exceptions remain fail closed" do
     port = open_port("read line")
 

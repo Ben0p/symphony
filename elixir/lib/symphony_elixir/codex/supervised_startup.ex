@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.SupervisedStartup do
   @poll_ms 50
   @max_output_bytes 1_048_576
   @max_output_events 64
+  @max_mailbox_messages 128
 
   @spec capture(port(), ExecutionSupervisor.identity() | nil, (-> term()), keyword()) ::
           {:ok, ExecutionSupervisor.identity() | nil} | {:error, term(), ExecutionSupervisor.identity() | nil}
@@ -21,9 +22,15 @@ defmodule SymphonyElixir.Codex.SupervisedStartup do
         {:ok, nil}
 
       _ ->
-        deadline = now_ms() + Keyword.get(opts, :timeout_ms, @deadline_ms)
-        capture = Keyword.get(opts, :capture, &ExecutionSupervisor.capture/2)
-        await_capture(port, identity, guard, capture, deadline)
+        case Keyword.get(opts, :timeout_ms, @deadline_ms) do
+          requested when is_integer(requested) ->
+            deadline = now_ms() + min(@deadline_ms, max(requested, 0))
+            capture = Keyword.get(opts, :capture, &ExecutionSupervisor.capture/2)
+            await_capture(port, identity, guard, capture, deadline)
+
+          _ ->
+            failure(port, :invalid_supervisor_startup_timeout)
+        end
     end
   end
 
@@ -82,6 +89,7 @@ defmodule SymphonyElixir.Codex.SupervisedStartup do
         summary = output_summary(port)
 
         cond do
+          summary.mailbox_overflow -> {:error, :supervisor_startup_mailbox_overflow}
           summary.bytes > @max_output_bytes or summary.events > @max_output_events -> {:error, :supervisor_startup_output_overflow}
           is_nil(Port.info(port)) -> closed_port_status(port, max(0, min(@poll_ms, deadline - now_ms())))
           true -> :ok
@@ -100,16 +108,26 @@ defmodule SymphonyElixir.Codex.SupervisedStartup do
   defp failure(port, reason, captured \\ nil), do: {:error, {:supervisor_startup_failed, reason, output_summary(port)}, captured}
 
   defp output_summary(port) do
+    {:message_queue_len, count} = Process.info(self(), :message_queue_len)
+
+    if count > @max_mailbox_messages do
+      %{bytes: nil, events: nil, chunk_sha256: [], mailbox_overflow: true, mailbox_messages: count}
+    else
+      port_output_summary(port)
+    end
+  end
+
+  defp port_output_summary(port) do
     {:messages, messages} = Process.info(self(), :messages)
 
-    Enum.reduce(messages, %{bytes: 0, events: 0, chunk_sha256: []}, fn
+    Enum.reduce(messages, %{bytes: 0, events: 0, chunk_sha256: [], mailbox_overflow: false}, fn
       {^port, {:data, {kind, data}}}, summary when kind in [:eol, :noeol] and is_binary(data) ->
         hashes =
           if summary.events < @max_output_events,
             do: summary.chunk_sha256 ++ [Base.encode16(:crypto.hash(:sha256, data), case: :lower)],
             else: summary.chunk_sha256
 
-        %{bytes: summary.bytes + byte_size(data), events: summary.events + 1, chunk_sha256: hashes}
+        %{summary | bytes: summary.bytes + byte_size(data), events: summary.events + 1, chunk_sha256: hashes}
 
       _, summary ->
         summary
