@@ -789,39 +789,50 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
     parent = self()
-    original_workflow_path = Workflow.workflow_file_path()
-    workflow_store_pid = Process.whereis(WorkflowStore)
+    mfa = {Config, :settings!, 0}
+    assert :erlang.trace_pattern(mfa, true, [:local]) == 1
 
-    missing_workflow_path =
-      Path.join(System.tmp_dir!(), "missing-bound-workflow-#{System.unique_integer([:positive])}.md")
+    runner =
+      Task.async(fn ->
+        receive do
+          :run -> :ok
+        end
 
-    on_exit(fn ->
-      Workflow.set_workflow_file_path(original_workflow_path)
+        result =
+          Client.graphql(
+            "query Viewer { viewer { id } }",
+            %{},
+            tracker_settings: %{
+              api_key: "bound-token",
+              endpoint: "https://bound.example.test/graphql"
+            },
+            request_fun: fn payload, headers ->
+              send(parent, {:bound_graphql_request, payload, headers})
+              {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
+            end
+          )
 
-      if is_pid(workflow_store_pid) and is_nil(Process.whereis(WorkflowStore)) do
-        Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
-      end
-    end)
-
-    if is_pid(Process.whereis(WorkflowStore)) do
-      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
-    end
-
-    Workflow.set_workflow_file_path(missing_workflow_path)
+        # Positive control: exactly this call must appear in the trace.
+        Config.settings!()
+        pid = self()
+        ref = :erlang.trace_delivered(pid)
+        assert_receive {:trace_delivered, ^pid, ^ref}, 1_000
+        result
+      end)
 
     result =
-      Client.graphql(
-        "query Viewer { viewer { id } }",
-        %{},
-        tracker_settings: %{
-          api_key: "bound-token",
-          endpoint: "https://bound.example.test/graphql"
-        },
-        request_fun: fn payload, headers ->
-          send(parent, {:bound_graphql_request, payload, headers})
-          {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
-        end
-      )
+      try do
+        assert :erlang.trace(runner.pid, true, [:call, {:tracer, parent}]) == 1
+        send(runner.pid, :run)
+        result = Task.await(runner)
+        pid = runner.pid
+        assert_receive {:trace, ^pid, :call, {Config, :settings!, []}}
+        refute_receive {:trace, ^pid, :call, {Config, :settings!, []}}, 0
+        result
+      after
+        Task.shutdown(runner, :brutal_kill)
+        :erlang.trace_pattern(mfa, false, [:local])
+      end
 
     if linear_lock_supported?() do
       assert {:ok, %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}} = result

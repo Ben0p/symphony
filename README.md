@@ -26,6 +26,10 @@ A generation released before claim submission does not reserve the repository in
 Another eligible issue may proceed only after the journal, exact delegation and absent local
 workspace prove that the released generation has no remaining mutable authority.
 
+Managed issue token totals survive scheduler restarts and claim release. Explicit historical
+baselines and per-thread cumulative observations live beside the private claim journal. Missing or
+uncertain accounting prevents further admission; recovery does not silently reset an allowance.
+
 Managed claims retain their generation and repository capacity when an acknowledgement is lost.
 The runner journals submission and the first spawn attempt separately, replays only the exact
 current authority, and stops after bounded recovery attempts. A legacy or mismatched claim requires

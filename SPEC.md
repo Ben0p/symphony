@@ -1446,6 +1446,19 @@ Token accounting rules:
   way.
 - Accumulate aggregate totals in orchestrator state.
 
+Managed-runtime extension:
+
+- Persist accepted absolute thread totals before enforcing the cumulative issue ceiling. Key
+  highwaters by stable issue UUID, execution generation and actual thread ID, across turns/restarts.
+- Bootstrap known historical consumption explicitly with evidence, authority and a continuation
+  generation floor. Preserve observed overshoots; claim release does not erase issue usage.
+- Require a readable, identity-matching ledger before startup and admission. Unknown issue
+  baselines, incomplete records, unexpected file changes and uncertain writes fail closed.
+- After stopping a managed worker, account for already queued updates bearing its exact execution
+  token and worker session before releasing ownership. Accounting uncertainty retains the fence.
+- Historical baseline initialization is not allowance renewal. No automatic reset or renewal is
+  implied. This accounts for observed usage; it cannot reconstruct spend the agent never reported.
+
 Runtime accounting:
 
 - Runtime SHOULD be reported as a live aggregate at snapshot/render time.

@@ -64,6 +64,12 @@ The host may admit another eligible issue after verifying that a never-submitted
 already released its exact authority and has no local workspace. Workers must not fabricate
 cleanup, change retained grants or remove journals to trigger that exception.
 
+Managed pools require an explicitly initialized token-usage ledger beside their claim journal.
+The host retains known historical consumption and per-thread totals across retries and restarts.
+Workers must not edit this ledger, its `.pending`/`.blocked` markers, or budget baselines. A total
+budget stop requires evidence-based operator reconciliation; recovery never resets consumption
+or authorizes a larger allowance. See `README.md` for the initialization and failure contract.
+
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}
