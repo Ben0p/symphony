@@ -67,6 +67,29 @@ defmodule SymphonyElixir.ExecutionFence do
     end
   end
 
+  @doc "Reconciles only a journal-proven, never-started claim at the unchanged current generation."
+  @spec reconcile_unstarted_claim(state(), map()) :: {:ok, state()} | {:error, term()}
+  def reconcile_unstarted_claim(state, reservation) do
+    with :ok <- validate_state(state),
+         %{dispatch: %{phase: phase}} <- reservation,
+         true <- phase in ["submitted", "confirmed", "blocked"],
+         %{status: :active, cleanup: :pending} = execution <- state.executions[reservation.issue_id],
+         true <- execution.generation == reservation.generation and execution.repository == reservation.repository_ref,
+         true <- execution.ownership in [:reconciled, :unknown] and not Map.get(execution, :termination_unconfirmed, false),
+         [session_id] <- active_lease_ids(execution),
+         true <- session_id == reservation.session_id,
+         %{role: :worker, status: :active, head: "unobserved", last_heartbeat_at: 0} = lease <- execution.leases[session_id],
+         true <- lease.process_id == reservation.process_id and is_nil(lease[:supervisor_identity]),
+         true <- not Map.get(lease, :termination_required, false),
+         true <-
+           reservation.execution_fence_token == "#{reservation.issue_id}:#{reservation.generation}" and
+             reservation.runtime_lease_id == session_id do
+      {:ok, put_in(state, [:executions, reservation.issue_id, :ownership], :reconciled)}
+    else
+      _ -> {:error, :unstarted_claim_not_reconcilable}
+    end
+  end
+
   @doc "Returns a sanitized, deterministic projection for operator/API observability."
   @spec snapshot(state()) :: map() | {:error, :invalid_state}
   def snapshot(state) do
@@ -606,12 +629,51 @@ defmodule SymphonyElixir.ExecutionFence do
   def reconcile_sessions(state, observations, now_ms, ttl_ms)
       when is_list(observations) and is_integer(now_ms) and now_ms >= 0 and
              is_integer(ttl_ms) and ttl_ms > 0 do
+    reconcile_session_set(state, observations, now_ms, ttl_ms, MapSet.new())
+  end
+
+  def reconcile_sessions(_state, _observations, _now_ms, _ttl_ms),
+    do: {:error, :invalid_reconciliation_input}
+
+  @doc "Preserves journal-proven pre-spawn leases from missing-heartbeat expiry; actual observations still dominate."
+  @spec reconcile_claim_sessions(state(), [map()], [map()], non_neg_integer(), pos_integer()) ::
+          {:ok, state(), map()} | {:error, term()}
+  def reconcile_claim_sessions(state, observations, claims, now_ms, ttl_ms)
+      when is_list(observations) and is_list(claims) and is_integer(now_ms) and now_ms >= 0 and
+             is_integer(ttl_ms) and ttl_ms > 0 do
+    with :ok <- validate_state(state),
+         {:ok, observations} <- canonical_observations(observations) do
+      protected = protected_claim_keys(state, observations, claims)
+      reconcile_session_set(state, observations, now_ms, ttl_ms, protected)
+    end
+  end
+
+  def reconcile_claim_sessions(_state, _observations, _claims, _now_ms, _ttl_ms),
+    do: {:error, :invalid_reconciliation_input}
+
+  defp protected_claim_keys(state, observations, claims) do
+    Enum.reduce(claims, MapSet.new(), fn
+      %{issue_id: issue_id, generation: generation, session_id: session_id} = claim, protected ->
+        observed = Enum.any?(observations, &(&1.issue_id == issue_id))
+
+        if not observed and match?({:ok, _}, reconcile_unstarted_claim(state, claim)) do
+          MapSet.put(protected, {issue_id, generation, session_id})
+        else
+          protected
+        end
+
+      _claim, protected ->
+        protected
+    end)
+  end
+
+  defp reconcile_session_set(state, observations, now_ms, ttl_ms, protected) do
     with :ok <- validate_state(state),
          {:ok, observations} <- canonical_observations(observations) do
       initial = %{state | executions: reset_ownership(state.executions)}
 
       {reconciled_state, summary, seen} =
-        Enum.reduce(observations, {initial, empty_summary(), MapSet.new()}, fn observation, {state_acc, summary_acc, seen_acc} ->
+        Enum.reduce(observations, {initial, empty_summary(), protected}, fn observation, {state_acc, summary_acc, seen_acc} ->
           reconcile_observation(state_acc, summary_acc, seen_acc, observation, now_ms, ttl_ms)
         end)
 
@@ -621,9 +683,6 @@ defmodule SymphonyElixir.ExecutionFence do
       {:ok, final_state, final_summary |> add_unconfirmed_reasons(final_state) |> finalize_summary()}
     end
   end
-
-  def reconcile_sessions(_state, _observations, _now_ms, _ttl_ms),
-    do: {:error, :invalid_reconciliation_input}
 
   defp validate_state(%{
          schema_version: @schema_version,

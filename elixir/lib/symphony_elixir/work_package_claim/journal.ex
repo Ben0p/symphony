@@ -9,7 +9,11 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
 
   @schema_version 1
 
+  alias SymphonyElixir.WorkPackageClaim.Dispatch
+
   @type reservation :: %{
+          optional(:dispatch) => map(),
+          optional(:cleanup_receipts) => %{optional(String.t()) => map()},
           issue_id: String.t(),
           managed_project_profile_id: String.t(),
           repository_ref: String.t(),
@@ -23,8 +27,7 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
           process_id: String.t(),
           responsible_delegation_id: String.t(),
           execution_fence_token: String.t(),
-          runtime_lease_id: String.t(),
-          cleanup_receipts: %{optional(String.t()) => map()}
+          runtime_lease_id: String.t()
         }
 
   @type state :: %{schema_version: 1, reservations: %{optional(String.t()) => reservation()}}
@@ -233,8 +236,9 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
            ),
          true <- is_integer(values.generation) and values.generation > 0,
          true <- is_list(values.scope_keys) and values.scope_keys != [] and Enum.all?(values.scope_keys, &present_string?/1),
-         {:ok, cleanup_receipts} <- decode_cleanup_receipts(Map.get(payload, "cleanup_receipts")) do
-      {:ok, maybe_put_decoded(values, :cleanup_receipts, cleanup_receipts)}
+         {:ok, cleanup_receipts} <- decode_cleanup_receipts(Map.get(payload, "cleanup_receipts")),
+         {:ok, dispatch} <- Dispatch.decode(Map.get(payload, "dispatch")) do
+      {:ok, values |> maybe_put_decoded(:cleanup_receipts, cleanup_receipts) |> maybe_put_decoded(:dispatch, dispatch)}
     else
       false -> {:error, :invalid_reservation}
       error -> error
@@ -366,7 +370,8 @@ defmodule SymphonyElixir.WorkPackageClaim.Journal do
       is_integer(reservation[:generation]) and reservation[:generation] > 0 and
       is_list(reservation[:scope_keys]) and reservation[:scope_keys] != [] and
       Enum.all?(reservation[:scope_keys], &present_string?/1) and
-      valid_cleanup_receipts?(Map.get(reservation, :cleanup_receipts, %{}))
+      valid_cleanup_receipts?(Map.get(reservation, :cleanup_receipts, %{})) and
+      Dispatch.valid?(Map.get(reservation, :dispatch))
   end
 
   defp valid_reservation?(_reservation), do: false

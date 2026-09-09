@@ -22,6 +22,11 @@ It creates responsibility only for the exact freshly eligible issue, through the
 owner, and keeps successor admission behind predecessor cleanup and provider claims. A ready label
 does not grant execution authority. See [responsibility delegation](docs/responsibility-delegation.md).
 
+Managed claims retain their generation and repository capacity when an acknowledgement is lost.
+The runner journals submission and the first spawn attempt separately, replays only the exact
+current authority, and stops after bounded recovery attempts. A legacy or mismatched claim requires
+explicit reconciliation; it cannot silently become a new worker generation.
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
 _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._

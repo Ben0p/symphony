@@ -180,6 +180,20 @@ it claims this reservation before launching the mutable worker and posts termina
 cleanup receipts from the same fence. Runner tokens and attestation keys are supplied by the host
 and are never logged or placed in workflow files.
 
+The journal records `submitted`, `confirmed`, and `spawn_started` separately. The last marker is
+synced before attempting a worker task, so a restart can replay a submitted claim only when its
+current generation and unstarted lease still match. Uncertain claims keep their repository and
+pool capacity without appearing as running workers. Recovery makes at most six claim requests,
+with delays of 5, 10, 20, 40, and at most 60 seconds; requests have a five-second connection deadline
+and a 30-second response deadline to accommodate the provider's current native prerequisite check.
+Each retry signs a fresh timestamp with the same nonce and authority tuple.
+
+A deterministic provider rejection, exhausted budget, missing/corrupt journal, changed authority,
+or recorded spawn attempt requires reconciliation and preserves the fence. Legacy journal entries
+without a spawn marker cannot prove that no worker started. Old provider claims whose local
+generation has advanced require a supported forward-only recovery; never restore an old fence,
+reset provider state, or fabricate a terminal head/cleanup receipt.
+
 To enable this managed runtime on a Linux runner, the host must provide the complete tuple below;
 the service rejects a partial tuple during supervisor startup and leaves the adapter disabled when
 all five values are absent. A host that declares `SYMPHONY_POOL_KEY` or

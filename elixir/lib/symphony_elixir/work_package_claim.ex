@@ -9,9 +9,11 @@ defmodule SymphonyElixir.WorkPackageClaim do
 
   alias SymphonyElixir.ExecutionFence
   alias SymphonyElixir.ResponsibilityGraph
+  alias SymphonyElixir.WorkPackageClaim.Dispatch
   alias SymphonyElixir.WorkPackageClaim.Journal
 
-  @request_timeout_ms 5_000
+  @connect_timeout_ms 5_000
+  @request_timeout_ms 30_000
   @contract_version "work-package-runtime-attestation.v1"
 
   @type input :: %{
@@ -39,12 +41,46 @@ defmodule SymphonyElixir.WorkPackageClaim do
          {:ok, authority} <- authority(input, DateTime.to_unix(now, :millisecond)),
          {:ok, journal} <- load_journal(input.journal_path),
          {:ok, reservation, journal} <- ensure_reservation(authority, journal, request_fun),
-         :ok <- Journal.save(input.journal_path, journal),
          {:ok, attestation} <- attestation(authority, reservation, now),
-         {:ok, response} <- request_claim(authority, reservation, attestation, request_fun),
+         {:ok, journal} <- Dispatch.submit(journal, journal_key(authority), input, now),
+         :ok <- Journal.save(input.journal_path, journal) do
+      submit_claim(input, authority, reservation, attestation, journal, request_fun)
+    end
+  end
+
+  defp submit_claim(input, authority, reservation, attestation, journal, request_fun) do
+    with {:ok, response} <- request_claim(authority, reservation, attestation, request_fun),
          {:ok, body} <- response_data(response),
-         {:ok, result} <- validate_claim_result(body, authority, reservation) do
+         {:ok, result} <- validate_claim_result(body, authority, reservation),
+         {:ok, journal} <- Dispatch.confirm(journal, journal_key(authority)),
+         :ok <- Journal.save(input.journal_path, journal) do
       {:ok, %{reservation: reservation, attestation: attestation, response: result}}
+    else
+      {:error, {:provider_status, status} = reason} when status in 400..499 and status not in [408, 425, 429] ->
+        with {:ok, journal} <- Dispatch.block(journal, journal_key(authority)),
+             :ok <- Journal.save(input.journal_path, journal) do
+          {:error, {:claim_blocked, reason}}
+        else
+          {:error, failure} -> {:error, {:claim_indeterminate, failure}}
+        end
+
+      {:error, reason} ->
+        {:error, {:claim_indeterminate, reason}}
+    end
+  end
+
+  @doc "Durably closes the replay window before attempting to start a worker."
+  @spec begin_spawn(input()) :: :ok | {:error, term()}
+  def begin_spawn(input) do
+    with {:ok, authority} <- authority(input, System.system_time(:millisecond)),
+         {:ok, journal} <- Journal.load(input.journal_path),
+         {:ok, journal} <- Dispatch.begin_spawn(journal, journal_key(authority), input),
+         :ok <- Journal.save(input.journal_path, journal),
+         {:ok, _authority} <- authority(input, System.system_time(:millisecond)) do
+      :ok
+    else
+      :missing -> {:error, :claim_journal_missing}
+      error -> error
     end
   end
 
@@ -242,7 +278,8 @@ defmodule SymphonyElixir.WorkPackageClaim do
         end
 
       reservation ->
-        with :ok <- reservation_matches_authority(reservation, authority) do
+        with :ok <- reservation_matches_authority(reservation, authority),
+             :ok <- replay_marker_present(reservation) do
           {:ok, reservation, journal}
         end
     end
@@ -250,11 +287,14 @@ defmodule SymphonyElixir.WorkPackageClaim do
 
   defp request_reservation_or_replay(authority, %{generation: generation} = reservation, _request_fun)
        when generation == authority.generation do
-    {:ok, reservation}
+    with :ok <- replay_marker_present(reservation), do: {:ok, reservation}
   end
 
   defp request_reservation_or_replay(authority, _legacy_reservation, request_fun),
     do: request_reservation(authority, request_fun)
+
+  defp replay_marker_present(%{dispatch: dispatch}) when is_map(dispatch), do: :ok
+  defp replay_marker_present(_reservation), do: {:error, :legacy_claim_requires_reconciliation}
 
   defp request_reservation(authority, request_fun) do
     url = authority.base_url <> "/runner/v1/work-packages/reservations/by-issue"
@@ -381,7 +421,7 @@ defmodule SymphonyElixir.WorkPackageClaim do
     options = [
       headers: [{"authorization", "Bearer #{token}"}, {"content-type", "application/json"}],
       json: payload,
-      connect_options: [timeout: @request_timeout_ms],
+      connect_options: [timeout: @connect_timeout_ms],
       receive_timeout: @request_timeout_ms,
       retry: false
     ]

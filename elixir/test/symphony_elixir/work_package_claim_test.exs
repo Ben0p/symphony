@@ -26,7 +26,7 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
       end
     end
 
-    assert {:error, {:provider_request, :lost_response}} = WorkPackageClaim.claim(input, request_fun: first_request, now_fun: fn -> ~U[2026-09-06 10:00:00.000Z] end)
+    assert {:error, {:claim_indeterminate, {:provider_request, :lost_response}}} = WorkPackageClaim.claim(input, request_fun: first_request, now_fun: fn -> ~U[2026-09-06 10:00:00.000Z] end)
     assert_receive {:request, reservation_url, reservation_options}
     assert String.ends_with?(reservation_url, "/reservations/by-issue")
     assert Keyword.get(reservation_options, :json) == %{issueId: @issue_id, managedProjectProfileId: @profile, repositoryRef: @repository}
@@ -153,13 +153,13 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
       end
     end
 
-    assert {:error, :invalid_claim_result} =
+    assert {:error, {:claim_indeterminate, :invalid_claim_result}} =
              WorkPackageClaim.claim(input, request_fun: malformed_claim)
 
     provider_error = fn _url, _options -> {:ok, response(%{"error" => "unavailable"}, 503)} end
 
-    assert {:error, {:provider_status, 503}} =
-             WorkPackageClaim.claim(input, request_fun: provider_error)
+    assert {:error, {:claim_indeterminate, {:provider_status, 503}}} =
+             WorkPackageClaim.claim(input, request_fun: provider_error, now_fun: fn -> DateTime.add(DateTime.utc_now(), 60, :second) end)
 
     assert {:ok, journal} = Journal.load(path)
     assert map_size(journal.reservations) == 1
@@ -169,6 +169,45 @@ defmodule SymphonyElixir.WorkPackageClaimTest do
 
     assert {:error, :reservation_authority_mismatch} =
              WorkPackageClaim.claim(input, request_fun: provider_error)
+  end
+
+  test "transient HTTP failures preserve the claim while authority conflicts block replay" do
+    for status <- [408, 425, 429, 409] do
+      path = temp_path()
+      on_exit(fn -> File.rm_rf(path) end)
+      %{input: input} = authority_fixture(path)
+      now = ~U[2026-09-06 10:00:00Z]
+
+      request = fn url, _options ->
+        if String.ends_with?(url, "/reservations/by-issue"),
+          do: {:ok, response(%{"data" => reservation_payload()})},
+          else: {:ok, response(%{"error" => "retained fixture response"}, status)}
+      end
+
+      result = WorkPackageClaim.claim(input, request_fun: request, now_fun: fn -> now end)
+      kind = if status == 409, do: :claim_blocked, else: :claim_indeterminate
+      assert result == {:error, {kind, {:provider_status, status}}}
+      assert {:ok, journal} = Journal.load(path)
+      [reservation] = Map.values(journal.reservations)
+      assert reservation.dispatch.phase == if(status == 409, do: "blocked", else: "submitted")
+
+      if status != 409 do
+        assert {:error, :claim_recovery_backoff} =
+                 WorkPackageClaim.claim(input, request_fun: fn _, _ -> flunk("early retry sent HTTP") end, now_fun: fn -> now end)
+
+        assert {:ok, replay} =
+                 WorkPackageClaim.claim(input,
+                   request_fun: fn url, options ->
+                     refute String.ends_with?(url, "/reservations/by-issue")
+                     assert Keyword.fetch!(options, :json).attestation["reservationNonce"] == reservation.reservation_nonce
+                     {:ok, response(%{"data" => claim_result_payload()})}
+                   end,
+                   now_fun: fn -> DateTime.add(now, 5, :second) end
+                 )
+
+        assert replay.reservation.generation == reservation.generation
+      end
+    end
   end
 
   defp authority_fixture(path) do
