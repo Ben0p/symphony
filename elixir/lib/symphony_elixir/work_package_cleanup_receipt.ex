@@ -363,6 +363,7 @@ defmodule SymphonyElixir.WorkPackageCleanupReceipt do
          projection_id: reservation.projection_id,
          reservation_id: reservation.reservation_id,
          reservation_nonce: reservation.reservation_nonce,
+         generation: reservation.generation,
          responsible_delegation_id: reservation.responsible_delegation_id,
          execution_fence_token: reservation.execution_fence_token,
          runtime_lease_id: reservation.runtime_lease_id,
