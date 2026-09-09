@@ -27,6 +27,8 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Codex.Progress
   alias SymphonyElixir.ExecutionFence.Persistence
   alias SymphonyElixir.ManagedResponsibility.Admission, as: ManagedAdmission
+  alias SymphonyElixir.ManagedTokenBudget.Runtime, as: ManagedBudget
+  alias SymphonyElixir.ManagedTokenBudget.Stop, as: ManagedBudgetStop
   alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkPackageClaim.{Journal, Unsubmitted}
@@ -82,6 +84,8 @@ defmodule SymphonyElixir.Orchestrator do
       stall_restarts: %{},
       codex_totals: nil,
       codex_issue_totals: %{},
+      managed_token_budget: nil,
+      managed_token_budget_error: nil,
       codex_rate_limits: nil,
       startup_maintenance: nil
     ]
@@ -123,9 +127,7 @@ defmodule SymphonyElixir.Orchestrator do
                   codex_rate_limits: nil
                 }
 
-                state = start_startup_maintenance(state, opts)
-
-                {:ok, state}
+                start_with_managed_budget(state, opts)
 
               {:error, reason} ->
                 {:stop, {:responsibility_graph_unavailable, reason}}
@@ -259,10 +261,7 @@ defmodule SymphonyElixir.Orchestrator do
         running_entry = Map.put(running_entry, :terminal_outcome, terminal_outcome_for(running_entry, reason))
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
-        state = release_execution_lease(state, running_entry, reason)
-        state = maybe_confirm_execution_supervisor(state, running_entry, session_id)
-
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        state = finish_agent_down(state, issue_id, running_entry, session_id, reason)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -332,6 +331,24 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp start_with_managed_budget(state, opts) do
+    case ManagedBudget.load(state) do
+      {:ok, state} -> {:ok, start_startup_maintenance(state, opts)}
+      {:error, reason} -> {:stop, {:managed_token_budget_unavailable, reason}}
+    end
+  end
+
+  defp finish_agent_down(%{managed_token_budget_error: error} = state, issue_id, entry, _session_id, _reason)
+       when not is_nil(error) do
+    block_issue_from_entry(state, issue_id, entry, "managed token accounting requires reconciliation")
+  end
+
+  defp finish_agent_down(state, issue_id, entry, session_id, reason) do
+    state = release_execution_lease(state, entry, reason)
+    state = maybe_confirm_execution_supervisor(state, entry, session_id)
+    handle_agent_down(reason, state, issue_id, entry, session_id)
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
@@ -715,27 +732,38 @@ defmodule SymphonyElixir.Orchestrator do
         state = maybe_fence_terminal_execution(state, running_entry, cleanup_workspace)
 
         stop_running_task(pid, ref, state.task_supervisor)
-        state = release_execution_lease(state, running_entry, :orchestrator_stop)
-        state = maybe_confirm_execution_supervisor(state, running_entry, identifier)
+        {state, running_entry} = drain_stopped_managed_usage(state, issue_id, running_entry)
 
-        state =
-          if cleanup_workspace do
-            cleanup_fenced_workspace_or_legacy(state, Map.get(running_entry, :issue, identifier), running_entry)
-          else
-            state
-          end
-
-        %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
-        }
+        finish_stopped_issue(state, issue_id, running_entry, identifier, cleanup_workspace)
 
       _ ->
         release_issue_claim(state, issue_id)
     end
+  end
+
+  defp finish_stopped_issue(%{managed_token_budget_error: error} = state, issue_id, entry, _identifier, _cleanup)
+       when not is_nil(error) do
+    block_issue_from_entry(state, issue_id, entry, "managed token accounting requires reconciliation")
+  end
+
+  defp finish_stopped_issue(state, issue_id, running_entry, identifier, cleanup_workspace) do
+    state = release_execution_lease(state, running_entry, :orchestrator_stop)
+    state = maybe_confirm_execution_supervisor(state, running_entry, identifier)
+
+    state =
+      if cleanup_workspace do
+        cleanup_fenced_workspace_or_legacy(state, Map.get(running_entry, :issue, identifier), running_entry)
+      else
+        state
+      end
+
+    %{
+      state
+      | running: Map.delete(state.running, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id),
+        blocked: Map.delete(state.blocked, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
@@ -1058,7 +1086,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp stop_running_task(pid, ref, task_supervisor) do
     if is_pid(pid) do
+      stop_ref = Process.monitor(pid)
       terminate_task(pid, task_supervisor)
+
+      receive do
+        {:DOWN, ^stop_ref, :process, ^pid, _reason} -> :ok
+      after
+        5_000 -> Process.demonitor(stop_ref, [:flush])
+      end
     end
 
     if is_reference(ref) do
@@ -1075,7 +1110,16 @@ defmodule SymphonyElixir.Orchestrator do
       state.task_supervisor
     )
 
+    {state, running_entry} = drain_stopped_managed_usage(state, issue_id, running_entry)
     block_issue_from_entry(state, issue_id, running_entry, error)
+  end
+
+  defp drain_stopped_managed_usage(state, issue_id, entry) do
+    ManagedBudgetStop.drain(state, issue_id, entry, fn current, current_entry, update ->
+      {next_entry, delta} = integrate_codex_update(current_entry, update)
+      current = current |> apply_codex_token_delta(delta) |> ManagedBudget.observe(issue_id, next_entry, update)
+      {%{current | running: Map.put(current.running, issue_id, next_entry)}, next_entry}
+    end)
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
@@ -1149,6 +1193,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
+      ManagedBudget.admission(state, issue.id) == :ok and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
@@ -1482,6 +1527,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host, attempt)
        when is_binary(issue_id) do
+    with :ok <- ManagedBudget.admission(state, issue_id) do
+      recover_or_admit_execution(state, issue, worker_host, attempt)
+    end
+  end
+
+  defp admit_execution(_state, _issue, _worker_host, _attempt), do: {:error, :invalid_issue}
+
+  defp recover_or_admit_execution(state, issue, worker_host, attempt) do
     case prepare_claim_recovery(state, issue, attempt) do
       {:new, fence, graph} ->
         with {:ok, state} <- persist_responsibility_graph(state, graph),
@@ -1496,7 +1549,8 @@ defmodule SymphonyElixir.Orchestrator do
         admit_new_execution(state, issue, worker_host, attempt)
 
       {:ok, fence, graph, recovered} ->
-        with {:ok, state} <- persist_responsibility_graph(state, graph),
+        with :ok <- ManagedBudget.generation(state, recovered.token),
+             {:ok, state} <- persist_responsibility_graph(state, graph),
              {:ok, state} <- persist_execution_fence(state, fence) do
           {:ok, state, recovered.token, recovered.session_id, recovered.delegation_id, recovered.runtime_lease}
         end
@@ -1505,8 +1559,6 @@ defmodule SymphonyElixir.Orchestrator do
         error
     end
   end
-
-  defp admit_execution(_state, _issue, _worker_host, _attempt), do: {:error, :invalid_issue}
 
   defp admit_new_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host, attempt) do
     now_ms = execution_fence_now_ms()
@@ -1527,6 +1579,7 @@ defmodule SymphonyElixir.Orchestrator do
            ),
          state = %{state | responsibility_graph: graph},
          {:ok, fence_state, token} <- ExecutionFence.admit(state.execution_fence, attrs, now_ms),
+         :ok <- ManagedBudget.generation(state, token),
          session_id = session_id_for_generation.(token.generation),
          runtime_lease = execution_runtime_lease(issue_id, token, session_id),
          {:ok, fence_state, _result} <-
@@ -2797,7 +2850,7 @@ defmodule SymphonyElixir.Orchestrator do
         blocked: Map.delete(state.blocked, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
         stall_restarts: Map.delete(state.stall_restarts, issue_id),
-        codex_issue_totals: Map.delete(state.codex_issue_totals || %{}, issue_id)
+        codex_issue_totals: ManagedBudget.release_totals(state, issue_id)
     }
   end
 
@@ -3827,6 +3880,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> apply_codex_token_delta(token_delta)
       |> apply_codex_issue_token_delta(issue_id, token_delta)
+      |> ManagedBudget.observe(issue_id, updated_running_entry, update)
       |> apply_codex_rate_limits(update)
 
     updated_running_entry =
@@ -3836,6 +3890,16 @@ defmodule SymphonyElixir.Orchestrator do
         issue_token_total(state, issue_id)
       )
 
+    if state.managed_token_budget_error do
+      error = "managed token accounting requires reconciliation"
+      Logger.error("Managed usage persistence failed: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{running_entry_session_id(updated_running_entry)}")
+      {:noreply, stop_and_block_issue(state, issue_id, updated_running_entry, error)}
+    else
+      enforce_total_token_budget(state, issue_id, updated_running_entry)
+    end
+  end
+
+  defp enforce_total_token_budget(state, issue_id, updated_running_entry) do
     if total_token_budget_exhausted?(state, issue_id) do
       threshold = Config.settings!().codex.max_total_tokens
       total_tokens = issue_token_total(state, issue_id)
@@ -3843,7 +3907,7 @@ defmodule SymphonyElixir.Orchestrator do
       error = total_token_budget_error(total_tokens, threshold)
 
       Logger.warning(
-        "Issue stopped after cumulative Codex token budget: issue_id=#{issue_id} issue_identifier=#{Map.get(running_entry, :identifier, issue_id)} total_tokens=#{total_tokens} threshold=#{threshold}"
+        "Issue stopped after cumulative Codex token budget: issue_id=#{issue_id} issue_identifier=#{Map.get(updated_running_entry, :identifier, issue_id)} total_tokens=#{total_tokens} threshold=#{threshold}"
       )
 
       state =
@@ -4132,6 +4196,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_token_delta(state, _token_delta), do: state
 
+  defp apply_codex_issue_token_delta(%State{work_package_runtime: runtime} = state, _issue_id, _delta)
+       when not is_nil(runtime), do: state
+
   defp apply_codex_issue_token_delta(
          %State{} = state,
          issue_id,
@@ -4147,7 +4214,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp put_issue_token_total(%State{} = state, issue_id, total_tokens)
        when is_binary(issue_id) and is_integer(total_tokens) do
-    %{state | codex_issue_totals: Map.put(state.codex_issue_totals || %{}, issue_id, max(total_tokens, 0))}
+    %{state | codex_issue_totals: Map.put(state.codex_issue_totals || %{}, issue_id, max(total_tokens, issue_token_total(state, issue_id)))}
   end
 
   defp put_issue_token_total(state, _issue_id, _total_tokens), do: state

@@ -33,6 +33,7 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
       max_concurrent_agents: 1
     }
 
+    state = Fixture.initialize_budget(state)
     issue = Fixture.issue(1)
     {:ok, state, token, session, delegation, lease} = Orchestrator.admit_execution_for_test(state, issue, nil)
     input = claim_input(state, issue)
@@ -109,7 +110,7 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
       end)
 
     runtime = %{context.runtime | base_url: "http://127.0.0.1:#{port}", journal_path: context.runtime.journal_path <> ".http"}
-    state = %{context.state | work_package_runtime: runtime}
+    state = Fixture.initialize_budget(%{context.state | work_package_runtime: runtime})
     input = claim_input(state, context.issue)
 
     assert {:error, {:claim_indeterminate, {:provider_request, _}}} =

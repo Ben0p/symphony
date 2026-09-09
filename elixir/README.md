@@ -275,6 +275,32 @@ Retained old generations and grants remain history; they are not marked complete
 
 `DAHLIA_WORK_PACKAGE_JOURNAL_PATH` and `DAHLIA_WORK_PACKAGE_ARCHIVE_ROOT` optionally select the
 private reservation journal and archive root. The archive root must be outside active workspaces.
+
+Managed token accounting uses `<effective-journal-path>.token-usage.jsonl`. Before starting a
+managed pool, the host operator must explicitly call `SymphonyElixir.ManagedTokenBudget.initialize/3`
+with that absolute plain path, the manifest's `pool_key`, `repository_ref` and
+`managed_project_profile_id`, and at most 20 reviewed issue baselines. Each baseline contains
+`issue_id` (stable UUID), `known_minimum_tokens`, positive `continuation_floor`, `evidence_ref` and
+`authority_ref`. The known minimum covers only generations below that floor. A previously active
+issue requires retained usage evidence; absence of a ledger is never evidence of zero consumption.
+An empty baseline list initializes an idle pool without authorizing any issue. Initialization is
+exclusive; there is no automatic bootstrap, rollover, reset, or allowance-renewal operation.
+
+The scheduler loads known issue totals before startup maintenance and checks the configured positive
+`codex.max_total_tokens` against the current responsibility grant before fresh or recovered admission.
+Each execution starts a new actual Codex thread. Duplicate or lower cumulative observations add
+zero, later turns keep the same thread highwater, and later generations accumulate additional usage.
+Overshoots are retained. Managed claim release never deletes totals. If a stopped worker has queued
+usage, the scheduler drains only its exact execution token/session before releasing ownership.
+
+The single host writer verifies the full file before observations, writes a flushed `.pending`
+intent, appends and flushes usage, verifies resulting bytes, then retires the intent. Any uncertainty
+latches admission and attempts to retain a `.blocked` marker; both markers prevent cold startup.
+Preserve and explicitly reconcile these artifacts together with claim/fence and original protocol
+evidence. A storage outage may itself prevent writing the hold marker, so retained execution claims
+still require recovery rather than automatic respawn. File flushes and process-restart replay are
+covered; filesystem power-loss durability and unreported external spend are not claimed.
+
 Archives now use version 2: regular file bytes and empty directories are copied, while junctions
 and symbolic links remain evidence-bound path/target metadata. Verification never recreates or
 follows those links. Version 1 archives retain their original verification and evidence references.

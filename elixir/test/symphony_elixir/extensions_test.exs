@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.ManagedTokenBudget.Runtime, as: BudgetRuntime
   alias SymphonyElixir.Tracker.Memory
   alias SymphonyElixir.WorkPackageRuntime
 
@@ -545,6 +546,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     assert {:ok, runtime} = WorkPackageRuntime.configuration(env: environment)
+
+    {:ok, budget_path, budget_identity} = BudgetRuntime.location(runtime)
+    {:ok, _ledger} = SymphonyElixir.ManagedTokenBudget.initialize(budget_path, budget_identity, [])
 
     start_supervised!(
       {SymphonyElixir.Orchestrator,

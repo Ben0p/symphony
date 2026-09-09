@@ -1,5 +1,29 @@
 defmodule SymphonyElixir.ManagedResponsibilityFixture do
   @moduledoc false
+  alias SymphonyElixir.ManagedTokenBudget.Runtime, as: BudgetRuntime
+
+  @spec initialize_budget(map()) :: map()
+  def initialize_budget(state) do
+    manifest = state.work_package_runtime.managed_delegations
+    root = Path.dirname(SymphonyElixir.Workflow.workflow_file_path())
+
+    runtime =
+      state.work_package_runtime
+      |> Map.put_new(:journal_path, Path.join(root, "claims.json"))
+      |> Map.put_new(:managed_project_profile_id, manifest.managed_project_profile_id)
+
+    state = %{state | work_package_runtime: runtime}
+    {:ok, path, identity} = BudgetRuntime.location(runtime)
+
+    baselines =
+      Enum.map(manifest.entries, fn entry ->
+        %{issue_id: entry.issue_id, known_minimum_tokens: 0, continuation_floor: 1, evidence_ref: "test:new-fixture-no-prior-worker", authority_ref: "test:explicit-bootstrap"}
+      end)
+
+    {:ok, _ledger} = SymphonyElixir.ManagedTokenBudget.initialize(path, identity, baselines)
+    {:ok, state} = BudgetRuntime.load(state)
+    state
+  end
 
   @spec context(String.t()) :: map()
   def context(repository \\ "openai/symphony") do

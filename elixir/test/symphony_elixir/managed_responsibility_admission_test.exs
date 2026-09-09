@@ -25,7 +25,7 @@ defmodule SymphonyElixir.ManagedResponsibilityAdmissionTest do
       work_package_runtime: %{managed_delegations: manifest}
     }
 
-    %{root: root, now: now, graph: graph, manifest: manifest, state: state}
+    %{root: root, now: now, graph: graph, manifest: manifest, state: Fixture.initialize_budget(state)}
   end
 
   test "normal admission persists matching graph and generation, and restart blocks the bound grant", %{state: state, manifest: manifest, now: now} do

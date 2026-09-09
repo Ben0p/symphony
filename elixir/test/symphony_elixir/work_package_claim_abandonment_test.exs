@@ -119,7 +119,7 @@ defmodule SymphonyElixir.WorkPackageClaimAbandonmentTest do
     }
 
     context = %{
-      state: %{state | work_package_runtime: runtime},
+      state: Fixture.initialize_budget(%{state | work_package_runtime: runtime}),
       runtime: runtime,
       issue: issue,
       envelope: envelope,

@@ -21,6 +21,7 @@ defmodule SymphonyElixir.UnsubmittedSuccessorTest do
     runtime = %{managed_delegations: manifest, managed_project_profile_id: "profile-test", journal_path: Path.join(root, "claims.json")}
     :ok = Journal.save(runtime.journal_path, %{schema_version: 1, reservations: %{}})
     state = %Orchestrator.State{execution_fence: ExecutionFence.new(), responsibility_graph: graph, work_package_runtime: runtime}
+    state = Fixture.initialize_budget(state)
     {:ok, admitted, _, _, _, _} = Orchestrator.admit_execution_for_test(state, Fixture.issue(1), nil)
     execution = admitted.execution_fence.executions[Fixture.issue(1).id]
     now = System.system_time(:millisecond)
