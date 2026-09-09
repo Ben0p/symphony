@@ -90,6 +90,24 @@ defmodule SymphonyElixir.ExecutionFence do
     end
   end
 
+  @doc "Releases untouched local authority after the claim journal proves this generation was never submitted."
+  @spec release_unsubmitted_claim(state(), token(), String.t()) :: {:ok, state()} | {:error, term()}
+  def release_unsubmitted_claim(state, token, session_id) do
+    with :ok <- validate_state(state),
+         {:ok, execution} <- current_execution(state, token),
+         true <- execution.status == :active and execution.cleanup == :pending,
+         true <- execution.ownership in [:reconciled, :unknown] and not termination_unconfirmed?(execution),
+         [{^session_id, lease}] <- Map.to_list(execution.leases),
+         true <- lease.role == :worker and lease.head == "unobserved" and lease.last_heartbeat_at == 0,
+         true <- is_nil(lease[:supervisor_identity]) and not Map.get(lease, :termination_required, false),
+         true <- lease.status == :active or (lease.status == :released and lease[:release_reason] in [:claim_not_submitted, "claim_not_submitted"]),
+         {:ok, released, _} <- release(state, token, session_id, :claim_not_submitted) do
+      {:ok, put_in(released, [:executions, token.issue_id, :ownership], :reconciled)}
+    else
+      _ -> {:error, :unsubmitted_claim_not_reconcilable}
+    end
+  end
+
   @doc "Returns a sanitized, deterministic projection for operator/API observability."
   @spec snapshot(state()) :: map() | {:error, :invalid_state}
   def snapshot(state) do

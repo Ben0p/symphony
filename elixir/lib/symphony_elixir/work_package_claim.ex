@@ -305,9 +305,10 @@ defmodule SymphonyElixir.WorkPackageClaim do
       repositoryRef: authority.repository_ref
     }
 
-    with {:ok, response} <- request(request_fun, url, authority.runner_token, payload),
-         {:ok, data} <- response_data(response),
-         do: parse_reservation(data, authority)
+    with {:ok, response} <- request(request_fun, url, authority.runner_token, payload, :reservation_lookup),
+         {:ok, data} <- response_data(response) do
+      parse_reservation(data, authority)
+    end
   end
 
   defp parse_reservation(data, authority) when is_map(data) do
@@ -417,7 +418,7 @@ defmodule SymphonyElixir.WorkPackageClaim do
   defp camel_case(:attested_at), do: "attestedAt"
   defp camel_case(:signature), do: "signature"
 
-  defp request(request_fun, url, token, payload) do
+  defp request(request_fun, url, token, payload, stage \\ :claim) do
     options = [
       headers: [{"authorization", "Bearer #{token}"}, {"content-type", "application/json"}],
       json: payload,
@@ -427,10 +428,21 @@ defmodule SymphonyElixir.WorkPackageClaim do
     ]
 
     case request_fun.(url, options) do
-      {:ok, %Req.Response{status: status} = response} when status in 200..299 -> {:ok, response}
-      {:ok, %Req.Response{status: status}} -> {:error, {:provider_status, status}}
-      {:error, reason} -> {:error, {:provider_request, reason}}
-      _ -> {:error, :invalid_provider_response}
+      {:ok, %Req.Response{status: status} = response} when status in 200..299 ->
+        {:ok, response}
+
+      {:ok, %Req.Response{status: 409, body: %{"error" => %{"code" => "work_package_reservation_not_reissuable"}}}}
+      when stage == :reservation_lookup ->
+        {:error, :reservation_not_ready}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, {:provider_status, status}}
+
+      {:error, reason} ->
+        {:error, {:provider_request, reason}}
+
+      _ ->
+        {:error, :invalid_provider_response}
     end
   rescue
     _error -> {:error, :provider_request_failed}

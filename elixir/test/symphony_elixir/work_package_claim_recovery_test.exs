@@ -4,7 +4,7 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
   use SymphonyElixir.TestSupport
   alias SymphonyElixir.{ExecutionFence, ManagedResponsibility, ResponsibilityGraph, WorkPackageClaim}
   alias SymphonyElixir.ManagedResponsibilityFixture, as: Fixture
-  alias SymphonyElixir.WorkPackageClaim.{Dispatch, Journal, Recovery}
+  alias SymphonyElixir.WorkPackageClaim.{Dispatch, Journal, Recovery, Unsubmitted}
 
   setup do
     root = Path.dirname(Workflow.workflow_file_path())
@@ -304,6 +304,192 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     assert :ok = Journal.save(context.runtime.journal_path, missing)
     assert {:error, :claim_terminal_acknowledgement_required} = Orchestrator.admit_execution_for_test(state, context.issue, nil)
     assert graph.delegations[parent].blocked_on == :restart_reconciliation
+  end
+
+  test "queued historical issue releases only its new unsubmitted lease and leaves another task eligible", context do
+    cleaned = cleaned_failed_attempt(context)
+    journal_before = File.read!(context.runtime.journal_path)
+    parent = self()
+
+    request = fn url, options ->
+      assert String.ends_with?(url, "/reservations/by-issue")
+      send(parent, {:reservation_lookup, Keyword.fetch!(options, :json).issueId})
+      {:ok, %Req.Response{status: 409, body: %{"error" => %{"code" => "work_package_reservation_not_reissuable"}}}}
+    end
+
+    {:ok, admitted, token, session, delegation, lease} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    assert {:error, :reservation_not_ready} = WorkPackageClaim.claim(claim_input(admitted, context.issue), request_fun: request)
+
+    entry = %{
+      execution_token: token,
+      execution_session_id: session,
+      responsibility_delegation_id: delegation,
+      responsibility_runtime_lease: lease
+    }
+
+    next = Orchestrator.handle_claim_failure_for_test(admitted, context.issue, :reservation_not_ready, entry)
+    assert_receive {:reservation_lookup, first}
+    assert first == context.issue.id
+    assert next.running == %{}
+    refute Recovery.held?(next.execution_fence, first)
+    assert Orchestrator.should_dispatch_issue_for_test(Fixture.issue(2), next)
+    assert File.read!(context.runtime.journal_path) == journal_before
+    assert next.responsibility_graph.delegations[context.delegation].runtime_lease == nil
+    assert Enum.all?(Map.values(next.execution_fence.executions[first].leases), &(&1.release_reason == :claim_not_submitted))
+  end
+
+  test "real restart recovers an untouched unsubmitted generation without erasing historical claims", context do
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, admitted, token, _, _, _} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    assert token.generation == 2
+    before = File.read!(context.runtime.journal_path)
+    name = Module.concat(__MODULE__, "UnsubmittedRestart#{System.unique_integer([:positive])}")
+    pid = start_supervised!({Orchestrator, name: name, work_package_runtime: context.runtime})
+    restarted = :sys.get_state(pid)
+    assert restarted.execution_fence.executions[context.issue.id].ownership == :unknown
+    assert {:ok, recovered, next_token, _, _, _} = Orchestrator.admit_execution_for_test(restarted, context.issue, nil)
+    assert next_token.generation == token.generation + 1
+    assert File.read!(context.runtime.journal_path) == before
+    assert Enum.any?(recovered.execution_fence.history, &(&1.generation == admitted.execution_fence.executions[context.issue.id].generation))
+    assert Enum.any?(recovered.execution_fence.history, &(&1.generation == 1 and &1.terminal.state == "Failed attempt"))
+  end
+
+  test "unsubmitted recovery completes graph-first and fence-first interrupted persistence", context do
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, admitted, _, _, _, _} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    execution = admitted.execution_fence.executions[context.issue.id]
+
+    {:new, fence, graph} =
+      Unsubmitted.prepare(
+        context.runtime,
+        admitted.execution_fence,
+        admitted.responsibility_graph,
+        execution,
+        System.system_time(:millisecond)
+      )
+
+    for partial <- [%{admitted | responsibility_graph: graph}, %{admitted | execution_fence: fence}] do
+      assert {:ok, recovered, token, _, _, _} = Orchestrator.admit_execution_for_test(partial, context.issue, nil)
+      assert token.generation == 3
+      assert recovered.responsibility_graph.delegations[context.delegation].runtime_lease.generation == 3
+    end
+  end
+
+  test "unsubmitted proof rejects observed supervised released-stop and foreign responsibility state", context do
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, admitted, _token, session, _, _} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    path = [:executions, context.issue.id, :leases, session]
+
+    for change <- [
+          %{head: "observed"},
+          %{last_heartbeat_at: 1},
+          %{supervisor_identity: %{unexpected: true}},
+          %{status: :released, release_reason: :orchestrator_stop},
+          %{termination_required: true}
+        ] do
+      fence = update_in(admitted.execution_fence, path, &Map.merge(&1, change))
+      assert {:error, _} = Orchestrator.admit_execution_for_test(%{admitted | execution_fence: fence}, context.issue, nil)
+    end
+
+    graph = put_in(admitted.responsibility_graph, [:delegations, context.delegation, :runtime_lease], context.lease)
+    assert {:error, _} = Orchestrator.admit_execution_for_test(%{admitted | responsibility_graph: graph}, context.issue, nil)
+    File.rename!(context.runtime.journal_path, context.runtime.journal_path <> ".unsubmitted-retained")
+    assert {:error, :claim_recovery_journal_missing} = Orchestrator.admit_execution_for_test(admitted, context.issue, nil)
+  end
+
+  test "current and future claims remain held and a missing fence cannot reuse old history", context do
+    assert Unsubmitted.claim_may_exist?(context.runtime, context.state.execution_fence, context.issue.id)
+
+    assert :submitted =
+             Unsubmitted.prepare(
+               context.runtime,
+               context.state.execution_fence,
+               context.state.responsibility_graph,
+               context.state.execution_fence.executions[context.issue.id],
+               System.system_time(:millisecond)
+             )
+
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, admitted, _, _, _, _} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    refute Unsubmitted.claim_may_exist?(context.runtime, admitted.execution_fence, context.issue.id)
+    assert {:error, :claim_exists_without_matching_fence} = Orchestrator.admit_execution_for_test(%{admitted | execution_fence: ExecutionFence.new()}, context.issue, nil)
+    {:ok, journal} = Journal.load(context.runtime.journal_path)
+    [old] = Map.values(journal.reservations)
+    future = %{old | generation: 3}
+    key = Journal.reservation_key(old.issue_id, old.managed_project_profile_id, old.repository_ref, 3)
+    {:ok, journal} = Journal.put(journal, key, future)
+    assert :ok = Journal.save(context.runtime.journal_path, journal)
+    assert Unsubmitted.claim_may_exist?(context.runtime, admitted.execution_fence, context.issue.id)
+    assert {:error, _} = Orchestrator.admit_execution_for_test(admitted, context.issue, nil)
+  end
+
+  test "unrelated reservation conflicts retain the local claim slot", context do
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, admitted, token, session, delegation, lease} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    before = File.read!(context.runtime.journal_path)
+
+    request = fn _url, _options ->
+      {:ok, %Req.Response{status: 409, body: %{"error" => %{"code" => "different_conflict"}}}}
+    end
+
+    assert {:error, reason} = WorkPackageClaim.claim(claim_input(admitted, context.issue), request_fun: request)
+    refute reason == :reservation_not_ready
+
+    entry = %{
+      execution_token: token,
+      execution_session_id: session,
+      responsibility_delegation_id: delegation,
+      responsibility_runtime_lease: lease
+    }
+
+    retained = Orchestrator.handle_claim_failure_for_test(admitted, context.issue, reason, entry)
+    assert Recovery.held?(retained.execution_fence, context.issue.id)
+    assert retained.execution_fence == admitted.execution_fence
+    assert File.read!(context.runtime.journal_path) == before
+  end
+
+  test "malformed and unreadable journals never prove an unsubmitted claim", context do
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, admitted, _, _, _, _} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    File.rename!(context.runtime.journal_path, context.runtime.journal_path <> ".preserved")
+    bad = context.runtime.journal_path <> ".malformed"
+    File.write!(bad, "{truncated")
+
+    for path <- [bad, Path.dirname(bad)] do
+      runtime = %{context.runtime | journal_path: path}
+      assert Unsubmitted.claim_may_exist?(runtime, admitted.execution_fence, context.issue.id)
+
+      assert {:error, _} =
+               Orchestrator.admit_execution_for_test(%{admitted | work_package_runtime: runtime}, context.issue, nil)
+    end
+
+    assert File.read!(bad) == "{truncated"
+  end
+
+  test "same generation with a foreign profile cannot release current authority", context do
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, admitted, token, _, _, _} = Orchestrator.admit_execution_for_test(cleaned, context.issue, nil)
+    {:ok, journal} = Journal.load(context.runtime.journal_path)
+    [old] = Map.values(journal.reservations)
+    foreign = %{old | generation: token.generation, managed_project_profile_id: "foreign-profile"}
+
+    key =
+      Journal.reservation_key(
+        old.issue_id,
+        foreign.managed_project_profile_id,
+        old.repository_ref,
+        token.generation
+      )
+
+    {:ok, journal} = Journal.put(journal, key, foreign)
+    assert :ok = Journal.save(context.runtime.journal_path, journal)
+    before = File.read!(context.runtime.journal_path)
+    assert Unsubmitted.claim_may_exist?(context.runtime, admitted.execution_fence, context.issue.id)
+
+    assert {:error, :claim_recovery_identity_conflict} =
+             Orchestrator.admit_execution_for_test(admitted, context.issue, nil)
+
+    assert File.read!(context.runtime.journal_path) == before
   end
 
   defp cleaned_failed_attempt(context) do
