@@ -1658,6 +1658,13 @@ and released leases are required. Preserve journal and fence history, reconcile 
 restart-blocked accountable delegation, and reapply current responsibility, owner and budget
 checks. The next generation is created by normal admission, never by rewriting old authority.
 
+An attempted managed execution may record a local failed-attempt terminal outcome without
+changing the tracker issue to a terminal state. This requires already-confirmed termination
+for every required lease, reconciled ownership, an exact accepted head and a content-addressed
+failure evidence reference. Preserve these fields and lease evidence through portable cleanup
+and restart. Both provider cleanup acknowledgements must be retained before requesting supported
+forward recovery for the same useful issue; pre-spawn recovery does not authorize a spawned attempt.
+
 ### 14.1 Failure Classes
 
 1. `Workflow/Config Failures`

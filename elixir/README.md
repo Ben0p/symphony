@@ -194,6 +194,19 @@ without a spawn marker cannot prove that no worker started. Old provider claims 
 generation has advanced require a supported forward-only recovery; never restore an old fence,
 reset provider state, or fabricate a terminal head/cleanup receipt.
 
+A spawned attempt that failed before useful work uses
+`ExecutionFence.FailedAttempt.record/4` after every required process termination
+has already been confirmed. This records a local `Failed attempt` outcome with
+an exact accepted head and a content-addressed failure evidence reference; it
+does not change the Linear issue state. The operation preserves lease evidence
+and is replayable after persistence. Unknown ownership, active leases, stale
+generations, missing worker termination or conflicting outcomes reject the
+transition. Complete the existing portable cleanup and retain both provider
+receipt acknowledgements before using a supported failed-attempt recovery to
+request fresh authority for the same useful issue. A cleaned failed attempt can
+reconcile its restart-blocked accountable delegation only after its responsible
+runtime lease is released; current authorization and normal admission still apply.
+
 To enable this managed runtime on a Linux runner, the host must provide the complete tuple below;
 the service rejects a partial tuple during supervisor startup and leaves the adapter disabled when
 all five values are absent. A host that declares `SYMPHONY_POOL_KEY` or
