@@ -532,12 +532,31 @@ defmodule SymphonyElixir.ExecutionSupervisor do
 
   defp run(runner, executable, args, opts) when is_function(runner, 3) do
     runner_opts = Keyword.get(opts, :system_cmd_opts, stderr_to_stdout: true)
-    {:ok, runner.(executable, args, runner_opts)}
+
+    with {:ok, command, command_args} <- command_arguments(executable, args, Keyword.get(opts, :timeout_ms)) do
+      command_result(runner.(command, command_args, runner_opts), Keyword.get(opts, :timeout_ms))
+    end
   rescue
     error -> {:error, {:systemd_runner_failed, error}}
   end
 
   defp run(_runner, _executable, _args, _opts), do: {:error, :invalid_command_runner}
+
+  defp command_arguments(executable, args, nil), do: {:ok, executable, args}
+
+  defp command_arguments(executable, args, timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0 do
+    case System.find_executable("timeout") do
+      nil -> {:error, :systemd_timeout_executable_missing}
+      timeout -> {:ok, timeout, ["--signal=KILL", "#{timeout_ms / 1_000}s", executable | args]}
+    end
+  end
+
+  defp command_arguments(_executable, _args, _timeout), do: {:error, :invalid_systemd_command_timeout}
+
+  defp command_result({_output, status}, timeout_ms) when is_integer(timeout_ms) and status in [124, 137],
+    do: {:error, :systemd_command_timeout}
+
+  defp command_result(result, _timeout_ms), do: {:ok, result}
 
   defp validate_identity(%{
          supervisor: :systemd_user,

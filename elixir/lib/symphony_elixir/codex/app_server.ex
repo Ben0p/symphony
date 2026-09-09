@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.{Codex.DynamicTool, Config, ExecutionSupervisor, PathSafety, Shell, SSH}
+  alias SymphonyElixir.Codex.SupervisedStartup
 
   @initialize_id 1
   @thread_start_id 2
@@ -66,6 +67,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     execution_supervisor = Keyword.get(opts, :execution_supervisor)
     execution_supervisor_recorder = Keyword.get(opts, :execution_supervisor_recorder)
     secret_environment_names = secret_environment_names(Keyword.get(opts, :secret_environment_names, []))
+    startup_guard = fn -> execution_fence_preflight(execution_fence_guard) end
 
     with :ok <- execution_fence_preflight(execution_fence_guard),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
@@ -78,30 +80,55 @@ defmodule SymphonyElixir.Codex.AppServer do
              execution_supervisor,
              secret_environment_names
            ) do
-      case record_execution_supervisor(execution_supervisor, execution_supervisor_recorder) do
-        :ok ->
-          start_session_on_port(
+      case SupervisedStartup.capture(port, execution_supervisor, startup_guard) do
+        {:ok, captured_supervisor} ->
+          record_and_start_session(
             port,
             expanded_workspace,
             worker_host,
             dynamic_tool_binding,
             execution_fence_guard,
             model_route,
-            execution_supervisor
+            captured_supervisor,
+            execution_supervisor_recorder
           )
 
-        {:error, reason} = error ->
-          # A supervisor identity is part of the admission fence. If it cannot
-          # be journaled immediately after launch, terminate the child before
-          # returning so an unrecorded execution cannot mutate the workspace.
-          stop_port_with_supervisor(port, execution_supervisor)
-          Logger.warning("Execution supervisor identity was not persisted: #{inspect(reason)}")
-          error
+        {:error, reason, captured_supervisor} ->
+          stop_port_with_supervisor(port, captured_supervisor || execution_supervisor)
+          {:error, reason}
       end
     else
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp record_and_start_session(port, workspace, worker_host, binding, guard, route, supervisor, recorder) do
+    case record_execution_supervisor(supervisor, recorder) do
+      :ok ->
+        start_session_on_port(
+          port,
+          workspace,
+          worker_host,
+          binding,
+          guard,
+          route,
+          supervisor
+        )
+
+      {:error, reason} = error ->
+        stop_port_with_supervisor(port, supervisor)
+        Logger.warning("Execution supervisor identity was not persisted: #{inspect(reason)}")
+        error
+    end
+  rescue
+    _error ->
+      stop_port_with_supervisor(port, supervisor)
+      {:error, :execution_supervisor_setup_failed}
+  catch
+    kind, _reason ->
+      stop_port_with_supervisor(port, supervisor)
+      {:error, {:execution_supervisor_setup_failed, kind}}
   end
 
   defp start_session_on_port(
@@ -115,7 +142,8 @@ defmodule SymphonyElixir.Codex.AppServer do
        ) do
     metadata = port_metadata(port, worker_host)
 
-    with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+    with :ok <- supervised_startup_guard(execution_supervisor, execution_fence_guard),
+         {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
          {:ok, thread_id} <-
            do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
       {:ok,
@@ -419,6 +447,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp secret_environment_names(_extra_names), do: @runner_secret_environment_names
+
+  defp supervised_startup_guard(nil, _guard), do: :ok
+  defp supervised_startup_guard(_identity, guard), do: execution_fence_preflight(guard)
 
   defp execution_fence_preflight(nil), do: :ok
 

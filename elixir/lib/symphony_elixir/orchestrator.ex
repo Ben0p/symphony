@@ -3320,7 +3320,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:execution_fence_supervisor, token, session_id, identity}, _from, %State{} = state) do
-    with {:ok, captured_identity} <- ExecutionSupervisor.capture(identity),
+    with {:ok, captured_identity} <- ExecutionSupervisor.capture(identity, timeout_ms: 1_000),
          {:ok, fence_state} <- ExecutionFence.record_supervisor(state.execution_fence, token, session_id, captured_identity) do
       case persist_execution_fence(state, fence_state) do
         {:ok, next_state} -> {:reply, {:ok, :recorded}, next_state}

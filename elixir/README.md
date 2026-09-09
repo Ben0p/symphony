@@ -244,6 +244,15 @@ marks the identity stale.
 The same response reports `execution_authority.fence` (`hgs294`) and `execution_authority.delegation`
 (`hgs300`) together with their posture derived from the durable fence and responsibility graph.
 No provider or attestation credential is included in this projection.
+Before Codex protocol initialization, the port-owning worker waits up to five seconds for its
+exact systemd scope to become active with a nonempty cgroup. Each systemctl probe has an enforced
+deadline using GNU `timeout`; a missing timeout executable fails closed. Early process exit,
+pause, missing containment, or excess startup output also fail closed. Output remains ordered
+in the port mailbox; failure diagnostics contain bounded counts and hashes, never raw output.
+The orchestrator independently rechecks the live identity and durably records it before the
+worker sends protocol requests. A failed startup with unknown termination retains its fence
+and requires supported reconciliation; it does not authorize another dispatch attempt.
+
 The local Linux path uses the systemd user supervisor and records the claim, process-tree proof,
 and archive evidence before releasing provider capacity. Remote SSH workers remain held when this
 proof or the independent archive verifier is unavailable. These provider credentials are scrubbed

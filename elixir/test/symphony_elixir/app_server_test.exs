@@ -27,6 +27,38 @@ defmodule SymphonyElixir.AppServerTest do
     assert_received :execution_fence_checked
   end
 
+  test "supervisor recorder exceptions stop the captured scope before protocol startup" do
+    alias SymphonyElixir.ExecutionSupervisor
+
+    if match?({:unix, :linux}, :os.type()) and ExecutionSupervisor.available?() == :ok do
+      test_root = Path.join(System.tmp_dir!(), "symphony-recorder-failure-#{System.unique_integer([:positive])}")
+      workspace = Path.join(test_root, "issue")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: test_root, codex_command: "sleep 30")
+      identity = ExecutionSupervisor.identity("recorder-failure", 1, "session-recorder-failure", "process-recorder-failure", 0)
+      parent = self()
+
+      try do
+        assert {:error, :execution_supervisor_setup_failed} =
+                 AppServer.start_session(workspace,
+                   execution_supervisor: identity,
+                   execution_supervisor_recorder: fn observed ->
+                     send(parent, {:captured_before_recorder_failure, observed})
+                     raise "private recorder failure"
+                   end
+                 )
+
+        assert_receive {:captured_before_recorder_failure, captured}
+        assert {:ok, evidence} = ExecutionSupervisor.terminate(captured)
+        assert evidence.remaining_processes == 0
+        assert :ok = ExecutionSupervisor.validate_evidence(captured, evidence)
+      after
+        _ = ExecutionSupervisor.terminate(identity)
+        File.rm_rf(test_root)
+      end
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
