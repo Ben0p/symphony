@@ -151,6 +151,101 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
     assert reloaded.executions[@issue].leases["worker-1"].termination_confirmed_at_ms == 120
   end
 
+  test "cold persistence loads full termination evidence without preloaded fence atoms", %{path: path} do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, state, :registered} = ExecutionFence.register(state, token, :worker, session("worker-1"), 100)
+    assert :ok = Persistence.save(path, state)
+
+    unknown = "unknown_termination_#{System.unique_integer([:positive])}"
+
+    evidence = %{
+      "process_tree" => "terminated",
+      "supervisor" => "systemd_user",
+      "session_id" => "worker-1",
+      "process_id" => "process-worker-1",
+      "unit" => "symphony-exec-cold.scope",
+      "pre_active_state" => nil,
+      "pre_control_group" => "/qualification/symphony-exec-cold.scope",
+      "pre_processes" => [123, 124],
+      "main_pid" => nil,
+      "active_state" => "inactive",
+      "control_group" => nil,
+      "remaining_processes" => 0,
+      "observed_at_ms" => 120,
+      "evidence_ref" => "cold-load-proof",
+      unknown => "ignored"
+    }
+
+    payload = path |> File.read!() |> Jason.decode!()
+    lease = Map.put(payload["sessions"]["worker-1"], "termination_evidence", evidence)
+
+    payload =
+      payload
+      |> put_in(["sessions", "worker-1"], lease)
+      |> put_in(["executions", @issue, "leases", "worker-1"], lease)
+
+    snapshot = Jason.encode!(payload)
+    File.write!(path, snapshot)
+
+    # This script contains no termination-field atom literals. Its VM has not
+    # loaded the modules that previously happened to intern the decoder's keys.
+    script = ~S"""
+    [path, unknown] = System.argv()
+    false = :code.is_loaded(SymphonyElixir.ExecutionFence)
+    false = :code.is_loaded(SymphonyElixir.ExecutionSupervisor)
+    {:ok, restored} = SymphonyElixir.ExecutionFence.Persistence.load(path)
+    actual = Map.new(restored.sessions["worker-1"].termination_evidence, fn {key, value} ->
+      value = if is_atom(value) and not is_nil(value), do: Atom.to_string(value), else: value
+      {Atom.to_string(key), value}
+    end)
+    expected = path |> File.read!() |> Jason.decode!() |> get_in(["sessions", "worker-1", "termination_evidence"]) |> Map.delete(unknown)
+    true = actual == expected
+    try do
+      String.to_existing_atom(unknown)
+      raise "unknown termination field was interned"
+    rescue
+      ArgumentError -> :ok
+    end
+    IO.puts("cold termination evidence loaded")
+    """
+
+    {output, status} = cold_process(script, [path, unknown])
+
+    assert status == 0, output
+    assert output =~ "cold termination evidence loaded"
+    assert File.read!(path) == snapshot
+  end
+
+  test "cold cleanup outcome decoding retains its closed value set", %{path: path} do
+    {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
+    {:ok, state, :fenced} = ExecutionFence.fence(state, token, terminal(), 110)
+    {:ok, state, :prepared} = ExecutionFence.prepare_cleanup(state, token, "abc123", 120)
+    assert :ok = Persistence.save(path, state)
+    payload = path |> File.read!() |> Jason.decode!()
+
+    script = ~S"""
+    [path, issue, expected] = System.argv()
+    false = :code.is_loaded(SymphonyElixir.ExecutionFence)
+    result = SymphonyElixir.ExecutionFence.Persistence.load(path)
+    if expected == "invalid" do
+      {:error, {:invalid_snapshot, :invalid_cleanup_terminal_outcome}} = result
+    else
+      {:ok, restored} = result
+      true = Atom.to_string(restored.executions[issue].cleanup_receipt.terminal_outcome) == expected
+    end
+    IO.puts("cold cleanup outcome checked")
+    """
+
+    for outcome <- ["completed", "failed", "blocked", "invalid"] do
+      snapshot = payload |> put_in(["executions", @issue, "cleanup_receipt", "terminal_outcome"], outcome) |> Jason.encode!()
+      File.write!(path, snapshot)
+      {output, status} = cold_process(script, [path, @issue, outcome])
+      assert status == 0, output
+      assert output =~ "cold cleanup outcome checked"
+      assert File.read!(path) == snapshot
+    end
+  end
+
   test "legacy snapshots with expired leases migrate to unconfirmed termination", %{path: path} do
     {:ok, state, token} = ExecutionFence.admit(ExecutionFence.new(), admission(), 100)
 
@@ -173,6 +268,13 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
     assert {:ok, restored} = Persistence.load(path)
     assert restored.executions[@issue].termination_unconfirmed
     refute Map.has_key?(restored.executions[@issue].leases["worker-1"], :termination_confirmed_at_ms)
+  end
+
+  defp cold_process(script, args) do
+    code_paths = Enum.flat_map(:code.get_path(), &["-pa", List.to_string(&1)])
+    executable = System.find_executable("elixir") || raise "elixir executable unavailable"
+
+    System.cmd(executable, ["--erl", "+S 2:2"] ++ code_paths ++ ["-e", script | args], stderr_to_stdout: true)
   end
 
   defp admission(issue_id \\ @issue) do
