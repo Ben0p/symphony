@@ -1643,6 +1643,14 @@ API design notes:
 
 ## 14. Failure Model and Recovery Strategy
 
+Managed provider-claim extension: a lost claim acknowledgement must retain the exact current
+generation, session, responsibility lease and reservation nonce. Submission must be journaled
+before the remote effect, and the first worker-spawn attempt must be journaled before starting
+the task. Only a matching, never-started current claim may be replayed after restart, with fresh
+eligibility/authority checks and bounded retries. Pending claims consume capacity but are not
+running workers. A missing journal, old generation, deterministic rejection or uncertain spawn
+requires explicit reconciliation rather than a new admission or fabricated terminal cleanup.
+
 ### 14.1 Failure Classes
 
 1. `Workflow/Config Failures`

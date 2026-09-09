@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.ExecutionFence.Persistence
   alias SymphonyElixir.ManagedResponsibility.Admission, as: ManagedAdmission
   alias SymphonyElixir.WorkPackageClaim.Journal
+  alias SymphonyElixir.WorkPackageClaim.Recovery, as: ClaimRecovery
   alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
   alias SymphonyElixir.Tracker.Issue
 
@@ -433,9 +434,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
     else
       with :ok <- Config.validate!(),
-           {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-           true <- available_slots(state) > 0 do
-        choose_issues(issues, state)
+           {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+        choose_issues(refresh_pending_claim_issues(state, issues), state)
       else
         {:error, :missing_linear_api_token} ->
           Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -473,9 +473,6 @@ defmodule SymphonyElixir.Orchestrator do
 
         {:error, reason} ->
           Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-          state
-
-        false ->
           state
       end
     end
@@ -1182,7 +1179,7 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
-      available_slots(state) > 0 and
+      (available_slots(state) > 0 or retained_claim_slot?(state, issue.id)) and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
   end
@@ -1338,21 +1335,16 @@ defmodule SymphonyElixir.Orchestrator do
             {:error, reason} ->
               Logger.warning("Skipping mutable dispatch without a durable work-package claim for #{issue_context(issue)}: #{inspect(reason)}")
 
-              release_execution_lease(
-                state,
-                %{
-                  execution_token: token,
-                  execution_session_id: session_id,
-                  responsibility_delegation_id: responsibility_delegation_id,
-                  responsibility_runtime_lease: runtime_lease
-                },
-                :spawn_failed
-              )
+              handle_claim_failure(state, issue, reason, %{
+                execution_token: token,
+                execution_session_id: session_id,
+                responsibility_delegation_id: responsibility_delegation_id,
+                responsibility_runtime_lease: runtime_lease
+              })
           end
 
         {:error, reason} ->
-          Logger.warning("Skipping fenced dispatch for #{issue_context(issue)}: #{inspect(reason)}")
-          state
+          handle_claim_admission_failure(state, issue, reason)
       end
     end
   end
@@ -1374,18 +1366,22 @@ defmodule SymphonyElixir.Orchestrator do
     if GlobalPause.paused?() do
       Logger.debug("Global mutable admission paused immediately before worker spawn for #{issue_context(issue)}")
 
-      release_execution_lease(
-        state,
-        %{
-          execution_token: token,
-          execution_session_id: session_id,
-          responsibility_delegation_id: responsibility_delegation_id,
-          responsibility_runtime_lease: runtime_lease
-        },
-        :global_pause
-      )
+      if is_map(state.work_package_runtime) do
+        state
+      else
+        release_execution_lease(
+          state,
+          %{
+            execution_token: token,
+            execution_session_id: session_id,
+            responsibility_delegation_id: responsibility_delegation_id,
+            responsibility_runtime_lease: runtime_lease
+          },
+          :global_pause
+        )
+      end
     else
-      case Task.Supervisor.start_child(state.task_supervisor, fn ->
+      case start_claimed_worker(state, issue, fn ->
              AgentRunner.run(issue, recipient,
                attempt: attempt,
                worker_host: worker_host,
@@ -1458,27 +1454,13 @@ defmodule SymphonyElixir.Orchestrator do
 
         {:error, reason} ->
           Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
-          next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
-          state =
-            release_execution_lease(
-              state,
-              %{
-                execution_token: token,
-                execution_session_id: session_id,
-                responsibility_delegation_id: responsibility_delegation_id,
-                responsibility_runtime_lease: runtime_lease
-              },
-              :spawn_failed
-            )
-
-          schedule_issue_retry(state, issue.id, next_attempt, %{
-            identifier: issue.identifier,
-            issue_url: issue.url,
-            error: "failed to spawn agent: #{inspect(reason)}",
+          handle_claim_spawn_failure(state, issue, attempt, reason, %{
             worker_host: worker_host,
             execution_token: token,
-            execution_session_id: session_id
+            execution_session_id: session_id,
+            responsibility_delegation_id: responsibility_delegation_id,
+            responsibility_runtime_lease: runtime_lease
           })
       end
     end
@@ -1498,17 +1480,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp claim_work_package(%State{work_package_runtime: runtime, execution_supervisor: :systemd_user} = state, issue, _token, nil)
        when is_map(runtime) do
-    repository_ref = get_in(state.execution_fence, [:executions, issue.id, :repository])
-
-    input =
-      runtime
-      |> Map.merge(%{
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        repository_ref: repository_ref,
-        fence_state: state.execution_fence,
-        responsibility_graph: state.responsibility_graph
-      })
+    input = claim_input(state, issue)
 
     claim_opts =
       []
@@ -1537,6 +1509,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host, attempt)
        when is_binary(issue_id) do
+    case prepare_claim_recovery(state, issue, attempt) do
+      :new ->
+        admit_new_execution(state, issue, worker_host, attempt)
+
+      {:ok, fence, graph, recovered} ->
+        with {:ok, state} <- persist_responsibility_graph(state, graph),
+             {:ok, state} <- persist_execution_fence(state, fence) do
+          {:ok, state, recovered.token, recovered.session_id, recovered.delegation_id, recovered.runtime_lease}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp admit_execution(_state, _issue, _worker_host, _attempt), do: {:error, :invalid_issue}
+
+  defp admit_new_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host, attempt) do
     now_ms = execution_fence_now_ms()
     attrs = execution_attributes(issue, worker_host)
     session_id_for_generation = fn generation -> execution_session_id(issue_id, generation) end
@@ -1571,7 +1561,114 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp admit_execution(_state, _issue, _worker_host, _attempt), do: {:error, :invalid_issue}
+  defp prepare_claim_recovery(%State{work_package_runtime: nil}, _issue, _attempt), do: :new
+
+  defp prepare_claim_recovery(state, issue, attempt) do
+    ClaimRecovery.prepare(
+      state.work_package_runtime,
+      state.execution_fence,
+      state.responsibility_graph,
+      issue,
+      attempt,
+      execution_fence_now_ms()
+    )
+  end
+
+  defp claim_input(state, issue) do
+    Map.merge(state.work_package_runtime, %{
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      repository_ref: get_in(state.execution_fence, [:executions, issue.id, :repository]),
+      fence_state: state.execution_fence,
+      responsibility_graph: state.responsibility_graph
+    })
+  end
+
+  defp start_claimed_worker(%State{work_package_runtime: nil} = state, _issue, worker),
+    do: Task.Supervisor.start_child(state.task_supervisor, worker)
+
+  defp start_claimed_worker(state, issue, worker) do
+    with :ok <- WorkPackageClaim.begin_spawn(claim_input(state, issue)) do
+      if GlobalPause.paused?(),
+        do: {:error, :global_pause},
+        else: Task.Supervisor.start_child(state.task_supervisor, worker)
+    end
+  end
+
+  defp handle_claim_failure(state, _issue, {:claim_indeterminate, _reason}, _entry), do: state
+
+  defp handle_claim_failure(state, issue, reason, entry) do
+    if retain_claim_error?(state, issue, reason),
+      do: block_claim_recovery(state, issue, reason),
+      else: release_execution_lease(state, entry, :claim_not_submitted)
+  end
+
+  defp handle_claim_admission_failure(state, _issue, :claim_recovery_backoff), do: state
+
+  defp handle_claim_admission_failure(state, issue, reason) do
+    Logger.warning("Skipping fenced dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+    if is_map(state.work_package_runtime) and Map.has_key?(state.execution_fence.executions, issue.id), do: block_claim_recovery(state, issue, reason), else: state
+  end
+
+  defp handle_claim_spawn_failure(%State{work_package_runtime: nil} = state, issue, attempt, reason, entry) do
+    state = release_execution_lease(state, entry, :spawn_failed)
+    next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+    schedule_issue_retry(
+      state,
+      issue.id,
+      next_attempt,
+      Map.merge(entry, %{
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "failed to spawn agent: #{inspect(reason)}"
+      })
+    )
+  end
+
+  defp handle_claim_spawn_failure(state, issue, _attempt, reason, _entry),
+    do: block_claim_recovery(state, issue, reason)
+
+  defp retain_claim_error?(_state, _issue, {:claim_indeterminate, _reason}), do: true
+  defp retain_claim_error?(%State{work_package_runtime: nil}, _issue, _reason), do: false
+
+  defp retain_claim_error?(state, issue, _reason) do
+    case Journal.load(Map.get(state.work_package_runtime, :journal_path, "")) do
+      :missing -> false
+      {:ok, journal} -> Enum.any?(journal.reservations, fn {_key, reservation} -> reservation.issue_id == issue.id end)
+      {:error, _reason} -> true
+    end
+  end
+
+  defp retained_claim_slot?(%State{work_package_runtime: nil}, _issue_id), do: false
+  defp retained_claim_slot?(state, issue_id), do: ClaimRecovery.held?(state.execution_fence, issue_id)
+
+  defp block_claim_recovery(state, issue, reason) do
+    block_issue_from_entry(state, issue.id, %{issue: issue, identifier: issue.identifier}, "Claim recovery requires reconciliation: #{inspect(reason)}")
+  end
+
+  defp refresh_pending_claim_issues(%State{work_package_runtime: nil}, issues), do: issues
+
+  defp refresh_pending_claim_issues(state, issues) do
+    visible = MapSet.new(issues, & &1.id)
+
+    missing =
+      for {id, _execution} <- state.execution_fence.executions,
+          retained_claim_slot?(state, id) and not MapSet.member?(visible, id) and
+            not Map.has_key?(state.running, id),
+          do: id
+
+    case missing do
+      [] ->
+        issues
+
+      ids ->
+        case Tracker.fetch_issues_by_ids(ids) do
+          {:ok, refreshed} -> issues ++ refreshed
+          {:error, _reason} -> issues
+        end
+    end
+  end
 
   @doc false
   @spec repository_identity() :: String.t()
@@ -2862,9 +2959,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp available_slots(%State{} = state) do
+    pending =
+      if is_map(state.work_package_runtime) do
+        Enum.count(state.execution_fence.executions, fn {id, _execution} ->
+          not Map.has_key?(state.running, id) and ClaimRecovery.held?(state.execution_fence, id)
+        end)
+      else
+        0
+      end
+
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
-        map_size(state.running),
+        map_size(state.running) - pending,
       0
     )
   end
@@ -3315,7 +3421,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:execution_fence_reconcile, observations, now_ms, ttl_ms}, _from, %State{} = state) do
-    case ExecutionFence.reconcile_sessions(state.execution_fence, observations, now_ms, ttl_ms) do
+    result =
+      with {:ok, claims} <- ClaimRecovery.unstarted_claims(state.work_package_runtime, state.execution_fence) do
+        ExecutionFence.reconcile_claim_sessions(state.execution_fence, observations, claims, now_ms, ttl_ms)
+      end
+
+    case result do
       {:ok, fence_state, summary} ->
         case persist_execution_fence(state, fence_state) do
           {:ok, next_state} ->
