@@ -286,6 +286,18 @@ issue requires retained usage evidence; absence of a ledger is never evidence of
 An empty baseline list initializes an idle pool without authorizing any issue. Initialization is
 exclusive; there is no automatic bootstrap, rollover, reset, or allowance-renewal operation.
 
+Generation floors are per issue, not per pool: an issue with no prior execution starts at 1.
+To correct a mistaken floor for an unstarted issue, stop its managed service and retain the ledger,
+fence, journal and independent no-worker/no-claim evidence. The sole host writer may explicitly call
+`ManagedTokenBudget.correct_unstarted_floor/2` on a freshly loaded ledger. Supply `issue_id`, a unique
+`correction_id`, the matching `previous_floor` greater than 1, `new_floor: 1`, the exact lowercase
+`ledger_before_sha256`, `evidence_ref` and `authority_ref`. The issue must have zero historical minimum,
+zero cumulative usage and no observed thread or highwater, including zero-token observations.
+The operation appends one correction, preserves original bootstrap bytes and the original baseline,
+and changes only the replayed effective floor. Exact retries are idempotent; conflicting or repeated
+corrections fail. The scheduler never invokes it. This uses the existing single-host-writer append
+contract; it is not concurrent-writer locking, credential authorization or an allowance increase.
+
 The scheduler loads known issue totals before startup maintenance and checks the configured positive
 `codex.max_total_tokens` against the current responsibility grant before fresh or recovered admission.
 Each execution starts a new actual Codex thread. Duplicate or lower cumulative observations add

@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.ManagedTokenBudget.Codec do
   @moduledoc "Strict replay of managed usage observations and explicit historical baselines."
 
+  alias SymphonyElixir.ManagedTokenBudget.Correction
+
   @identity_keys ~w(pool_key repository_ref managed_project_profile_id)a
   @baseline_keys ~w(issue_id known_minimum_tokens continuation_floor evidence_ref authority_ref)a
   @usage_keys ~w(issue_id generation thread_id cumulative_total_tokens)a
@@ -34,7 +36,7 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
          [header | lines] <- bytes |> String.split("\n") |> Enum.drop(-1),
          {:ok, expected} <- decode_record(header),
          true <- expected == record("header", identity),
-         {:ok, state} <- replay(lines),
+         {:ok, state} <- replay(lines, bytes, byte_size(header) + 1),
          true <- map_size(state.baselines) in 0..20 do
       {:ok, state}
     else
@@ -77,18 +79,27 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
   @spec encode(map()) :: binary()
   def encode(row), do: Jason.encode!(row) <> "\n"
 
-  defp replay(lines) do
-    state = %{baselines: %{}, issue_totals: %{}, highwaters: %{}, threads: %{}, phase: :bootstrap}
+  defp replay(lines, bytes, offset) do
+    state = %{baselines: %{}, issue_totals: %{}, highwaters: %{}, threads: %{}, corrections: %{}, phase: :bootstrap}
 
-    Enum.reduce_while(lines, {:ok, state}, fn line, {:ok, current} ->
+    Enum.reduce_while(lines, {:ok, state, offset}, fn line, {:ok, current, position} ->
       with {:ok, row} <- decode_record(line),
-           {:ok, next} <- apply_record(current, row) do
-        {:cont, {:ok, next}}
+           {:ok, next} <- replay_record(current, row, bytes, position) do
+        {:cont, {:ok, next, position + byte_size(line) + 1}}
       else
         _ -> {:halt, {:error, :invalid_budget_record}}
       end
     end)
+    |> case do
+      {:ok, state, _position} -> {:ok, state}
+      error -> error
+    end
   end
+
+  defp replay_record(state, %{"kind" => "unstarted_floor_correction"} = row, bytes, position),
+    do: Correction.replay(state, row, binary_part(bytes, 0, position))
+
+  defp replay_record(state, row, _bytes, _position), do: apply_record(state, row)
 
   defp decode_record(line) do
     with {:ok, row} when is_map(row) <- Jason.decode(line),
