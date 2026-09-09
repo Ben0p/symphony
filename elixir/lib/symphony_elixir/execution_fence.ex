@@ -525,6 +525,11 @@ defmodule SymphonyElixir.ExecutionFence do
         observed_at_ms: now_ms
       }
 
+      terminal =
+        if Map.has_key?(attrs, :failure_evidence_ref),
+          do: Map.put(terminal, :failure_evidence_ref, attrs.failure_evidence_ref),
+          else: terminal
+
       fence_execution(state, execution, terminal)
     end
   end
@@ -1021,10 +1026,24 @@ defmodule SymphonyElixir.ExecutionFence do
     present_string?(Map.get(terminal, :state)) and
       present_string?(Map.get(terminal, :accepted_head)) and
       optional_string?(Map.get(terminal, :merge_identity)) and
+      valid_failure_evidence?(terminal, :state) and
       is_integer(Map.get(terminal, :observed_at_ms)) and Map.get(terminal, :observed_at_ms) >= 0
   end
 
   defp valid_terminal?(_terminal), do: false
+
+  defp valid_failure_evidence?(value, state_key) do
+    case Map.fetch(value, :failure_evidence_ref) do
+      :error ->
+        true
+
+      {:ok, ref} when is_binary(ref) ->
+        Map.get(value, state_key) == "Failed attempt" and Regex.match?(~r/\Asha256:[0-9a-f]{64}\z/, ref)
+
+      _ ->
+        false
+    end
+  end
 
   defp execution_sort_key(execution), do: {execution.issue_id, execution.generation}
 
@@ -1301,7 +1320,7 @@ defmodule SymphonyElixir.ExecutionFence do
        when is_map(attrs) and is_integer(now_ms) and now_ms >= 0 do
     if present_string?(Map.get(attrs, :terminal_state)) and
          present_string?(Map.get(attrs, :accepted_head)) and
-         optional_string?(Map.get(attrs, :merge_identity)) do
+         optional_string?(Map.get(attrs, :merge_identity)) and valid_failure_evidence?(attrs, :terminal_state) do
       :ok
     else
       {:error, :invalid_terminal_observation}
@@ -1311,8 +1330,8 @@ defmodule SymphonyElixir.ExecutionFence do
   defp validate_terminal(_attrs, _now_ms), do: {:error, :invalid_terminal_observation}
 
   defp same_terminal?(left, right) do
-    Map.take(left, [:state, :accepted_head, :merge_identity]) ==
-      Map.take(right, [:state, :accepted_head, :merge_identity])
+    Map.take(left, [:state, :accepted_head, :merge_identity, :failure_evidence_ref]) ==
+      Map.take(right, [:state, :accepted_head, :merge_identity, :failure_evidence_ref])
   end
 
   defp same_triage_incident?(record, execution, expected_head) do

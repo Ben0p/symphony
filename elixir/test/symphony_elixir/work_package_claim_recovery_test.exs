@@ -259,6 +259,75 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     assert {:error, :claim_spawn_already_attempted} = Orchestrator.admit_execution_for_test(context.state, context.issue, nil)
   end
 
+  test "cleaned failed attempt admits fresh authority after actual orchestrator restart", context do
+    cleaned = cleaned_failed_attempt(context)
+    assert :ok = ExecutionFence.Persistence.save(cleaned.execution_fence_path, cleaned.execution_fence)
+    assert :ok = ResponsibilityGraph.Persistence.save(cleaned.responsibility_graph_path, cleaned.responsibility_graph)
+    journal_before = File.read!(context.runtime.journal_path)
+    name = Module.concat(__MODULE__, "FailedRestart#{System.unique_integer([:positive])}")
+    pid = start_supervised!({Orchestrator, name: name, work_package_runtime: context.runtime})
+    restarted = :sys.get_state(pid)
+    parent = restarted.responsibility_graph.delegations[context.delegation].parent_delegation_id
+    assert restarted.responsibility_graph.delegations[parent].blocked_on == :restart_reconciliation
+
+    assert {:ok, recovered, token, session, delegation, lease} =
+             Orchestrator.admit_execution_for_test(restarted, context.issue, nil)
+
+    assert token.generation == context.token.generation + 1
+    refute session == context.session
+    assert delegation == context.delegation
+    assert lease.generation == token.generation
+    assert recovered.responsibility_graph.delegations[parent].status == :active
+    assert File.read!(context.runtime.journal_path) == journal_before
+    assert Enum.any?(recovered.execution_fence.history, &(&1.generation == context.token.generation and &1.terminal.state == "Failed attempt"))
+  end
+
+  test "failed retry refuses changed responsibility and missing cleanup acknowledgement", context do
+    cleaned = cleaned_failed_attempt(context)
+    {:ok, graph} = ResponsibilityGraph.mark_unreconciled_after_restart(cleaned.responsibility_graph)
+    state = %{cleaned | responsibility_graph: graph}
+    parent = graph.delegations[context.delegation].parent_delegation_id
+
+    for changed <- [
+          put_in(graph, [:delegations, context.delegation, :runtime_lease], context.lease),
+          put_in(graph, [:delegations, parent, :blocked_on], :external_decision),
+          put_in(graph, [:delegations, parent, :runtime_lease], context.lease),
+          put_in(graph, [:delegations, context.delegation, :expires_at_ms], 1)
+        ] do
+      assert {:error, _} = Orchestrator.admit_execution_for_test(%{state | responsibility_graph: changed}, context.issue, nil)
+    end
+
+    assert {:error, _} = Orchestrator.admit_execution_for_test(state, %{context.issue | assignee_id: "different-owner"}, nil)
+    {:ok, journal} = Journal.load(context.runtime.journal_path)
+    [key] = Map.keys(journal.reservations)
+    {:ok, missing} = Journal.put(journal, key, Map.delete(journal.reservations[key], :cleanup_receipts))
+    assert :ok = Journal.save(context.runtime.journal_path, missing)
+    assert {:error, :claim_terminal_acknowledgement_required} = Orchestrator.admit_execution_for_test(state, context.issue, nil)
+    assert graph.delegations[parent].blocked_on == :restart_reconciliation
+  end
+
+  defp cleaned_failed_attempt(context) do
+    now = System.system_time(:millisecond)
+    head = String.duplicate("a", 40)
+    evidence_ref = "sha256:" <> String.duplicate("b", 64)
+    token = context.token
+    {:ok, fence, :released} = ExecutionFence.release(context.state.execution_fence, token, context.session, :orchestrator_stop)
+    evidence = %{session_id: context.session, process_id: context.lease.process_id, process_tree: :terminated, evidence_ref: evidence_ref, observed_at_ms: now}
+    {:ok, fence, :confirmed} = ExecutionFence.confirm_termination(fence, token, context.session, evidence, now)
+    {:ok, fence, :fenced} = ExecutionFence.FailedAttempt.record(fence, token, %{accepted_head: head, failure_evidence_ref: evidence_ref}, now)
+    {:ok, fence, :prepared} = ExecutionFence.prepare_cleanup(fence, token, head, now, :failed)
+    {:ok, fence} = ExecutionFence.record_cleanup_evidence(fence, token, head, evidence_ref, now)
+    {:ok, fence, :cleaned} = ExecutionFence.cleanup(fence, token, head, now)
+    {:ok, graph, _} = ResponsibilityGraph.release_runtime_lease(context.state.responsibility_graph, context.delegation, context.lease, now)
+    {:ok, journal} = Journal.load(context.runtime.journal_path)
+    [key] = Map.keys(journal.reservations)
+    ack = %{reservation_state: "released", execution_capacity_state: "released", scope_state: "released", accepted_head: head}
+    {:ok, journal} = Journal.put_cleanup_receipt(journal, key, "termination_confirmed", %{acknowledgement: ack})
+    {:ok, journal} = Journal.put_cleanup_receipt(journal, key, "repository_cleanup_verified", %{acknowledgement: ack})
+    assert :ok = Journal.save(context.runtime.journal_path, journal)
+    %{context.state | execution_fence: fence, responsibility_graph: graph}
+  end
+
   defp claim_input(state, issue) do
     Map.merge(state.work_package_runtime, %{
       issue_id: issue.id,

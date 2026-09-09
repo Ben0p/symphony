@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.WorkPackageClaim.Recovery do
-  @moduledoc "Recovers current pre-spawn authority without new admission or fabricated worker observations."
+  @moduledoc "Recovers pre-spawn authority and reconciles released failed attempts before fresh admission."
 
   alias SymphonyElixir.{ExecutionFence, ResponsibilityGraph}
   alias SymphonyElixir.ManagedResponsibility.Admission
@@ -12,13 +12,18 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
       nil ->
         new_without_claim(runtime, issue.id)
 
+      %{status: :terminal, cleanup: :cleaned, terminal: %{state: "Failed attempt"}} = execution ->
+        with :new <- completed_claim(runtime, issue.id, execution) do
+          prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms)
+        end
+
       %{status: :terminal, cleanup: :cleaned} = execution ->
         completed_claim(runtime, issue.id, execution)
 
       execution ->
         case Abandonment.check(runtime, fence, issue.id) do
           :authorized ->
-            prepare_abandoned_claim(runtime, fence, graph, issue, attempt, now_ms)
+            prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms)
 
           :missing ->
             prepare_existing_claim(runtime, fence, graph, issue, attempt, now_ms, execution)
@@ -35,7 +40,7 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
       else: recover(runtime, fence, graph, issue, attempt, now_ms, execution)
   end
 
-  defp prepare_abandoned_claim(runtime, fence, graph, issue, attempt, now_ms) do
+  defp prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms) do
     with %{entries: entries} <- runtime[:managed_delegations],
          entry when is_map(entry) <- Enum.find(entries, &(&1.issue_id == issue.id)),
          %{role: :responsible, status: :active, runtime_lease: nil, parent_delegation_id: parent} <- graph.delegations[entry.responsible.id],

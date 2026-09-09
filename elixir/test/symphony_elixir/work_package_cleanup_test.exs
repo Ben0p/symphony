@@ -252,7 +252,66 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
              )
   end
 
-  defp admitted_fence(workspace) do
+  test "failed attempt cleanup preserves nonterminal tracker state and termination evidence across restart", context do
+    head = git!(context.workspace, ["rev-parse", "HEAD"]) |> String.trim()
+    {fence, token} = admitted_fence(context.workspace, "Todo")
+    session_id = "worker:HGS-350:1"
+    {:ok, fence, :released} = ExecutionFence.release(fence, token, session_id, :orchestrator_stop)
+
+    termination = %{
+      session_id: session_id,
+      process_id: session_id,
+      process_tree: :terminated,
+      observed_at_ms: 10,
+      evidence_ref: "sha256:" <> String.duplicate("a", 64)
+    }
+
+    {:ok, fence, :confirmed} = ExecutionFence.confirm_termination(fence, token, session_id, termination, 10)
+    failure = %{accepted_head: head, failure_evidence_ref: "sha256:" <> String.duplicate("b", 64)}
+    {:ok, fence, :fenced} = ExecutionFence.FailedAttempt.record(fence, token, failure, 15)
+    path = Path.join(context.root, "failed-fence.json")
+    assert :ok = ExecutionFence.Persistence.save(path, fence)
+    assert {:ok, fence} = ExecutionFence.Persistence.load(path)
+
+    runner = fn
+      "gh", _args, _opts -> {"[]", 0}
+      executable, args, opts -> System.cmd(executable, args, opts)
+    end
+
+    assert {:ok, evidence_ref} =
+             WorkPackageCleanup.prepare(
+               %{execution_fence: fence},
+               token,
+               head,
+               %{workspace_path: context.workspace, worker_host: nil},
+               archive_root: context.archive_root,
+               command_runner: runner
+             )
+
+    {:ok, fence, :prepared} = ExecutionFence.prepare_cleanup(fence, token, head, 20, :failed)
+    {:ok, fence} = ExecutionFence.record_cleanup_evidence(fence, token, head, evidence_ref, 21)
+    File.rm_rf!(context.workspace)
+
+    assert {:ok, ^evidence_ref} =
+             WorkPackageCleanup.verify(
+               %{execution_fence: fence},
+               token,
+               head,
+               archive_root: context.archive_root
+             )
+
+    assert {:ok, fence, :cleaned} = ExecutionFence.cleanup(fence, token, head, 22)
+    assert :ok = ExecutionFence.Persistence.save(path, fence)
+    assert {:ok, loaded} = ExecutionFence.Persistence.load(path)
+    assert {:ok, restarted} = ExecutionFence.mark_unreconciled_after_restart(loaded)
+    assert restarted.executions[@issue_id].leases[session_id].linear_state == "Todo"
+    assert restarted.executions[@issue_id].leases[session_id].termination_required
+    assert restarted.executions[@issue_id].leases[session_id].termination_evidence == termination
+    assert {:ok, ^restarted, :already_fenced} = ExecutionFence.FailedAttempt.record(restarted, token, failure, 23)
+    assert :ok = ExecutionFence.validate_cleanup(restarted, token, head)
+  end
+
+  defp admitted_fence(workspace, linear_state \\ "In Progress") do
     admission = %{
       issue_id: @issue_id,
       repository: @repository,
@@ -269,7 +328,7 @@ defmodule SymphonyElixir.WorkPackageCleanupTest do
         role: :worker,
         session_id: "worker:HGS-350:1",
         process_id: "worker:HGS-350:1",
-        linear_state: "In Progress",
+        linear_state: linear_state,
         pr_state: "OPEN",
         head: "unobserved",
         last_heartbeat_at: 0

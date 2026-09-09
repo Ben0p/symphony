@@ -181,12 +181,16 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
   defp encode_terminal(nil), do: nil
 
   defp encode_terminal(terminal) do
-    %{
+    encoded = %{
       "state" => terminal.state,
       "accepted_head" => terminal.accepted_head,
       "merge_identity" => terminal.merge_identity,
       "observed_at_ms" => terminal.observed_at_ms
     }
+
+    if Map.has_key?(terminal, :failure_evidence_ref),
+      do: Map.put(encoded, "failure_evidence_ref", terminal.failure_evidence_ref),
+      else: encoded
   end
 
   defp decode_state(
@@ -449,13 +453,19 @@ defmodule SymphonyElixir.ExecutionFence.Persistence do
     with {:ok, state} <- required(payload, "state"),
          {:ok, accepted_head} <- required(payload, "accepted_head"),
          {:ok, observed_at_ms} <- required(payload, "observed_at_ms") do
-      {:ok,
-       %{
-         state: state,
-         accepted_head: accepted_head,
-         merge_identity: Map.get(payload, "merge_identity"),
-         observed_at_ms: observed_at_ms
-       }}
+      terminal = %{
+        state: state,
+        accepted_head: accepted_head,
+        merge_identity: Map.get(payload, "merge_identity"),
+        observed_at_ms: observed_at_ms
+      }
+
+      terminal =
+        if Map.has_key?(payload, "failure_evidence_ref"),
+          do: Map.put(terminal, :failure_evidence_ref, payload["failure_evidence_ref"]),
+          else: terminal
+
+      {:ok, terminal}
     end
   end
 
