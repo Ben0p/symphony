@@ -77,9 +77,14 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp codex_message_handler(recipient, issue, opts) do
+    identity = %{
+      execution_token: Keyword.get(opts, :execution_token),
+      execution_session_id: Keyword.get(opts, :execution_session_id)
+    }
+
     fn message ->
-      send_codex_update(recipient, issue, message)
+      send_codex_update(recipient, issue, Map.merge(message, identity))
     end
   end
 
@@ -153,7 +158,7 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue),
+             on_message: codex_message_handler(codex_update_recipient, issue, opts),
              execution_fence_guard: Keyword.get(opts, :execution_fence_guard)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
