@@ -1510,6 +1510,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp admit_execution(%State{} = state, %Issue{id: issue_id} = issue, worker_host, attempt)
        when is_binary(issue_id) do
     case prepare_claim_recovery(state, issue, attempt) do
+      {:new, graph} ->
+        admit_new_execution(%{state | responsibility_graph: graph}, issue, worker_host, attempt)
+
       :new ->
         admit_new_execution(state, issue, worker_host, attempt)
 
