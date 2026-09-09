@@ -89,6 +89,22 @@ recorded execution generation in the current pool, or a generation already
 marked cleaned, can use the existing path-safe cleanup path. Any recorded
 non-cleaned generation remains deferred for explicit fence reconciliation.
 
+### File-change progress and token limits
+
+The no-progress guard recognizes app-server `item/completed` notifications whose nested
+`fileChange` item completed successfully in the current thread and turn. Every change must
+contain a nonempty diff, a supported add/update/delete kind, and an absolute path lexically
+inside the running workspace. Approval requests, failed or declined changes, and unrelated
+items do not count as durable progress.
+
+A completed item advances both progress baselines once. Repeated or conflicting uses of
+the same thread/turn/item identity do not advance them again. Each running attempt retains
+at most 1,024 identities without eviction; further file changes fail closed at that limit.
+This observation state does not grant execution authority or replace workspace containment.
+Existing session/turn outcomes, cumulative token limits, no-progress limits, time limits,
+and claim fencing remain in force. Restarted attempts must use the existing fenced recovery
+path; an old session's notifications cannot qualify a new session's progress.
+
 ## Burrito releases
 
 Symphony ships self-contained executables built with

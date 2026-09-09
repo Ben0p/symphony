@@ -24,6 +24,7 @@ defmodule SymphonyElixir.Orchestrator do
     Workspace
   }
 
+  alias SymphonyElixir.Codex.Progress
   alias SymphonyElixir.ExecutionFence.Persistence
   alias SymphonyElixir.ManagedResponsibility.Admission, as: ManagedAdmission
   alias SymphonyElixir.WorkPackageClaim.Journal
@@ -304,45 +305,11 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
-
-        state =
-          state
-          |> apply_codex_token_delta(token_delta)
-          |> apply_codex_issue_token_delta(issue_id, token_delta)
-          |> apply_codex_rate_limits(update)
-
-        updated_running_entry =
-          Map.put(
-            updated_running_entry,
-            :codex_issue_total_tokens,
-            issue_token_total(state, issue_id)
-          )
-
-        if total_token_budget_exhausted?(state, issue_id) do
-          threshold = Config.settings!().codex.max_total_tokens
-          total_tokens = issue_token_total(state, issue_id)
-          diagnostic = total_token_budget_diagnostic(updated_running_entry, total_tokens, threshold)
-          error = total_token_budget_error(total_tokens, threshold)
-
-          Logger.warning(
-            "Issue stopped after cumulative Codex token budget: issue_id=#{issue_id} issue_identifier=#{Map.get(running_entry, :identifier, issue_id)} total_tokens=#{total_tokens} threshold=#{threshold}"
-          )
-
-          state =
-            state
-            |> record_session_completion_totals(updated_running_entry)
-            |> stop_and_block_issue(
-              issue_id,
-              Map.put(updated_running_entry, :stall_diagnostic, diagnostic),
-              error
-            )
-
-          notify_dashboard()
-          {:noreply, state}
+        if runtime_info_belongs_to_entry?(update, running_entry) do
+          handle_current_codex_update(state, issue_id, running_entry, update)
         else
-          notify_dashboard()
-          {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          Logger.warning("Ignoring stale Codex worker update for issue_id=#{issue_id}")
+          {:noreply, state}
         end
     end
   end
@@ -3843,7 +3810,60 @@ defmodule SymphonyElixir.Orchestrator do
   defp server_available?(server) when is_atom(server), do: is_pid(Process.whereis(server))
   defp server_available?(_server), do: false
 
+  defp handle_current_codex_update(state, issue_id, running_entry, update) do
+    {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+
+    state =
+      state
+      |> apply_codex_token_delta(token_delta)
+      |> apply_codex_issue_token_delta(issue_id, token_delta)
+      |> apply_codex_rate_limits(update)
+
+    updated_running_entry =
+      Map.put(
+        updated_running_entry,
+        :codex_issue_total_tokens,
+        issue_token_total(state, issue_id)
+      )
+
+    if total_token_budget_exhausted?(state, issue_id) do
+      threshold = Config.settings!().codex.max_total_tokens
+      total_tokens = issue_token_total(state, issue_id)
+      diagnostic = total_token_budget_diagnostic(updated_running_entry, total_tokens, threshold)
+      error = total_token_budget_error(total_tokens, threshold)
+
+      Logger.warning(
+        "Issue stopped after cumulative Codex token budget: issue_id=#{issue_id} issue_identifier=#{Map.get(running_entry, :identifier, issue_id)} total_tokens=#{total_tokens} threshold=#{threshold}"
+      )
+
+      state =
+        state
+        |> record_session_completion_totals(updated_running_entry)
+        |> stop_and_block_issue(
+          issue_id,
+          Map.put(updated_running_entry, :stall_diagnostic, diagnostic),
+          error
+        )
+
+      notify_dashboard()
+      {:noreply, state}
+    else
+      notify_dashboard()
+      {:noreply, %{state | running: Map.put(state.running, issue_id, updated_running_entry)}}
+    end
+  end
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
+    {file_change_result, seen_file_change_ids} =
+      Progress.accept_file_change(
+        update,
+        running_entry
+        |> Map.get(:codex_session_identity, %{})
+        |> Map.put(:id, running_entry.session_id),
+        Map.get(running_entry, :workspace_path),
+        Map.get(running_entry, :seen_file_change_ids, MapSet.new())
+      )
+
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
@@ -3856,6 +3876,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     updated_running_entry =
       Map.merge(running_entry, %{
+        seen_file_change_ids: seen_file_change_ids,
+        codex_session_identity: codex_session_identity_for_update(running_entry, update),
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
@@ -3871,7 +3893,7 @@ defmodule SymphonyElixir.Orchestrator do
       })
 
     updated_running_entry =
-      if meaningful_progress_update?(update) do
+      if file_change_result == :accepted or meaningful_progress_update?(update) do
         updated_running_entry
         |> Map.put(:codex_progress_token_baseline, updated_running_entry.codex_total_tokens)
         |> Map.put(:codex_last_progress_timestamp, timestamp)
@@ -3890,7 +3912,7 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
     updated_running_entry =
-      if durable_progress_update?(update) do
+      if file_change_result == :accepted or durable_progress_update?(update) do
         updated_running_entry
         |> Map.put(:codex_durable_progress_token_baseline, updated_running_entry.codex_total_tokens)
         |> Map.put(:codex_last_durable_progress_timestamp, timestamp)
@@ -3901,6 +3923,16 @@ defmodule SymphonyElixir.Orchestrator do
 
     {updated_running_entry, token_delta}
   end
+
+  defp codex_session_identity_for_update(_entry, %{
+         event: :session_started,
+         thread_id: thread_id,
+         turn_id: turn_id
+       }),
+       do: %{thread_id: thread_id, turn_id: turn_id}
+
+  defp codex_session_identity_for_update(entry, _update),
+    do: Map.get(entry, :codex_session_identity, %{})
 
   defp meaningful_progress_update?(%{event: event})
        when event in [
@@ -3954,12 +3986,7 @@ defmodule SymphonyElixir.Orchestrator do
        when event in [:session_started, :turn_completed, :turn_failed, :turn_cancelled],
        do: true
 
-  defp durable_progress_update?(update) do
-    case codex_update_method(update) do
-      method when is_binary(method) -> String.contains?(method, "fileChange")
-      _ -> false
-    end
-  end
+  defp durable_progress_update?(_update), do: false
 
   defp codex_update_method(%{payload: %{"method" => method}}) when is_binary(method), do: method
   defp codex_update_method(%{payload: %{method: method}}) when is_binary(method), do: method
@@ -4180,7 +4207,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
-    running_entry = running_entry || %{}
     usage = extract_token_usage(update)
 
     {
