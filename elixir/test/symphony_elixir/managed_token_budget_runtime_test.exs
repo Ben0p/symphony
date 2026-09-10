@@ -2,21 +2,41 @@ Code.require_file("../support/managed_responsibility_fixture.exs", __DIR__)
 
 defmodule SymphonyElixir.ManagedTokenBudgetRuntimeTest do
   use SymphonyElixir.TestSupport
-  alias SymphonyElixir.{ManagedResponsibility, ResponsibilityGraph}
+  alias SymphonyElixir.{ManagedResponsibility, ManagedTokenBudget, ResponsibilityGraph}
   alias SymphonyElixir.ManagedResponsibilityFixture, as: Fixture
   alias SymphonyElixir.ManagedTokenBudget.Runtime
 
-  setup do
-    options = [tracker_kind: "memory", max_concurrent_agents: 1, codex_stall_timeout_ms: 0, codex_max_total_tokens: 500_000]
+  setup context do
+    options = [
+      tracker_kind: "memory",
+      max_concurrent_agents: 1,
+      codex_stall_timeout_ms: 0,
+      codex_max_no_progress_tokens: 0,
+      codex_max_total_tokens: context[:configured_limit] || 500_000
+    ]
+
     root = Path.dirname(Workflow.workflow_file_path())
     options = Keyword.put(options, :workspace_root, Path.join(root, "workspaces"))
     write_workflow_file!(Workflow.workflow_file_path(), options)
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
     now = System.system_time(:millisecond)
-    {:ok, manifest} = ManagedResponsibility.decode(Fixture.payload(now), Fixture.context(), now)
+
+    payload =
+      update_in(Fixture.payload(now), ["entries"], fn [first, second] ->
+        second = put_in(second, ["accountable", "budget", "max_tokens"], 750_000)
+        [first, put_in(second, ["responsible", "budget", "max_tokens"], 750_000)]
+      end)
+
+    {:ok, manifest} = ManagedResponsibility.decode(payload, Fixture.context(), now)
     {:ok, graph, _} = ResponsibilityGraph.activate(ResponsibilityGraph.new(), now)
     runtime = %{managed_delegations: manifest}
     state = Fixture.initialize_budget(%Orchestrator.State{responsibility_graph: graph, work_package_runtime: runtime})
+
+    if historical = context[:historical_tokens] do
+      {:ok, _} = ManagedTokenBudget.observe(state.managed_token_budget, Fixture.issue(2).id, 1, "retained-history", historical)
+    end
+
+    {:ok, state} = Runtime.load(state)
     issue = Fixture.issue(1)
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
     {:ok, state, token, session, _, _} = Orchestrator.admit_execution_for_test(state, issue, nil)
@@ -54,7 +74,7 @@ defmodule SymphonyElixir.ManagedTokenBudgetRuntimeTest do
       %{current | running: %{issue.id => entry}, claimed: MapSet.new([issue.id]), execution_fence: state.execution_fence, responsibility_graph: state.responsibility_graph, tick_token: nil}
     end)
 
-    %{pid: pid, worker: worker, entry: entry, issue: issue, child: child, name: name, state: state}
+    %{pid: pid, worker: worker, entry: entry, issue: issue, child: child, name: name, state: state, options: options}
   end
 
   test "real OTP usage rejects stale identity, records queued overshoot, and survives restart", c do
@@ -102,6 +122,107 @@ defmodule SymphonyElixir.ManagedTokenBudgetRuntimeTest do
     assert {:error, _} = Orchestrator.admit_execution_for_test(state, unknown, nil)
     assert {:error, _} = Runtime.generation(state, %{issue_id: c.issue.id, generation: 0})
     assert state.execution_fence == c.state.execution_fence
+  end
+
+  @tag configured_limit: 750_000, historical_tokens: 600_000
+  test "smaller grant stops at equality while larger grant retains its own allowance after restart", c do
+    state = :sys.get_state(c.pid)
+    larger_id = Fixture.issue(2).id
+    assert Runtime.effective_limit(state, c.issue.id) == {:ok, 500_000}
+    assert Runtime.effective_limit(state, larger_id) == {:ok, 750_000}
+    assert Runtime.admission(state, larger_id) == :ok
+    send_usage(c.pid, c.entry, 500_000)
+    stopped = :sys.get_state(c.pid)
+    refute Process.alive?(c.worker)
+    assert stopped.blocked[c.issue.id].stall_diagnostic.total_token_threshold == 500_000
+    assert stopped.codex_issue_totals[c.issue.id] == 500_000
+    assert stopped.codex_issue_totals[larger_id] == 600_000
+    assert {:error, _} = Runtime.admission(stopped, c.issue.id)
+    stop_supervised!(c.name)
+    restarted = start_supervised!(c.child)
+    restored = :sys.get_state(restarted)
+    assert restored.codex_issue_totals == stopped.codex_issue_totals
+    assert Runtime.admission(restored, larger_id) == :ok
+    assert {:error, _} = Runtime.admission(restored, c.issue.id)
+  end
+
+  @tag configured_limit: 750_000, historical_tokens: 750_001
+  test "larger grant exhaustion remains rejected after a cold restart", c do
+    larger_id = Fixture.issue(2).id
+    assert {:error, _} = Runtime.admission(:sys.get_state(c.pid), larger_id)
+    stop_supervised!(c.name)
+    restarted = start_supervised!(c.child)
+    restored = :sys.get_state(restarted)
+    assert restored.codex_issue_totals[larger_id] == 750_001
+    assert {:error, _} = Runtime.admission(restored, larger_id)
+  end
+
+  test "a lower configured ceiling stops on polling with the effective diagnostic", c do
+    send_usage(c.pid, c.entry, 200_000)
+    assert :sys.get_state(c.pid).codex_issue_totals[c.issue.id] == 200_000
+    write_workflow_file!(Workflow.workflow_file_path(), Keyword.put(c.options, :codex_max_total_tokens, 200_000))
+    send(c.pid, :run_poll_cycle)
+    state = :sys.get_state(c.pid)
+    refute Process.alive?(c.worker)
+    assert state.blocked[c.issue.id].stall_diagnostic.total_token_threshold == 200_000
+    assert state.codex_issue_totals[c.issue.id] == 200_000
+  end
+
+  test "managed zero cannot skip authority enforcement when other stall guards are disabled", c do
+    write_workflow_file!(Workflow.workflow_file_path(), Keyword.put(c.options, :codex_max_total_tokens, 0))
+    send(c.pid, :run_poll_cycle)
+    state = :sys.get_state(c.pid)
+    refute Process.alive?(c.worker)
+    assert state.managed_token_budget_error
+    assert File.regular?(state.managed_token_budget.path <> ".blocked")
+  end
+
+  test "a changed live grant latches and stops while retaining the last usage", c do
+    :sys.replace_state(c.pid, fn state ->
+      put_in(state.responsibility_graph.delegations["responsible-1"].budget.max_tokens, 499_999)
+    end)
+
+    send_usage(c.pid, c.entry, 1)
+    state = :sys.get_state(c.pid)
+    refute Process.alive?(c.worker)
+    assert state.managed_token_budget_error
+    assert state.codex_issue_totals[c.issue.id] == 1
+    assert File.regular?(state.managed_token_budget.path <> ".blocked")
+    stop_supervised!(c.name)
+    assert {:error, _} = start_supervised(c.child)
+  end
+
+  test "authority failure retains exactly bound queued usage before latching", c do
+    :sys.suspend(c.pid)
+
+    :sys.replace_state(c.pid, fn state ->
+      put_in(state.responsibility_graph.delegations["responsible-1"].budget.max_tokens, 499_999)
+    end)
+
+    send_usage(c.pid, c.entry, 1)
+    send_usage(c.pid, c.entry, 25)
+    :sys.resume(c.pid)
+    state = :sys.get_state(c.pid)
+    refute Process.alive?(c.worker)
+    assert state.codex_issue_totals[c.issue.id] == 25
+    assert state.managed_token_budget_error
+    assert File.regular?(state.managed_token_budget.path <> ".blocked")
+  end
+
+  test "missing graph and malformed bound lease fail closed without raising", c do
+    state = :sys.get_state(c.pid)
+    assert {:error, _} = Runtime.effective_limit(%{state | responsibility_graph: nil}, c.issue.id)
+    changed = put_in(state.responsibility_graph.delegations["responsible-1"].runtime_lease.generation, 2)
+    assert {:error, _} = Runtime.effective_limit(changed, c.issue.id)
+    malformed = put_in(state.work_package_runtime.managed_delegations.entries, [%{issue_id: c.issue.id}])
+    assert {:error, _} = Runtime.effective_limit(malformed, c.issue.id)
+
+    stripped =
+      update_in(state.work_package_runtime.managed_delegations.entries, fn [first | rest] ->
+        [%{first | responsible: Map.delete(first.responsible, :authority)} | rest]
+      end)
+
+    assert {:error, _} = Runtime.effective_limit(stripped, c.issue.id)
   end
 
   defp send_usage(pid, entry, total) do

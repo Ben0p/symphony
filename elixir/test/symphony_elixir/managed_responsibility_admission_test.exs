@@ -91,4 +91,11 @@ defmodule SymphonyElixir.ManagedResponsibilityAdmissionTest do
     assert {:error, _} = Admission.prepare(restarted, ExecutionFence.new(), manifest, Fixture.issue(1), nil, now + 1)
     assert {:error, _} = Admission.prepare(restarted, ExecutionFence.new(), manifest, Fixture.issue(2), nil, now + 1)
   end
+
+  test "a larger configured ceiling admits a smaller grant without changing its terms", %{graph: graph, manifest: manifest, now: now} do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", codex_max_total_tokens: 750_000)
+    assert {:ok, admitted} = Admission.prepare(graph, ExecutionFence.new(), manifest, Fixture.issue(1), nil, now)
+    assert admitted.delegations["responsible-1"].budget == hd(manifest.entries).responsible.budget
+    assert admitted.delegations["responsible-1"].budget.max_tokens == 500_000
+  end
 end

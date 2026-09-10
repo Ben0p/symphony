@@ -7,6 +7,7 @@ defmodule SymphonyElixir.ManagedResponsibility.Admission do
   alias SymphonyElixir.{Config, ExecutionFence, ManagedResponsibility, ResponsibilityGraph}
 
   alias SymphonyElixir.Codex.ModelRouter
+  alias SymphonyElixir.ManagedTokenBudget.Limit
   alias SymphonyElixir.WorkPackageClaim.Unsubmitted
 
   @efforts ~w(none minimal low medium high xhigh max ultra)
@@ -59,8 +60,7 @@ defmodule SymphonyElixir.ManagedResponsibility.Admission do
     maximum_rank = Enum.find_index(@efforts, &(&1 == Atom.to_string(budget.effort)))
 
     if route.model == budget.model and is_integer(selected_rank) and is_integer(maximum_rank) and
-         selected_rank <= maximum_rank and is_integer(configured_limit) and configured_limit > 0 and
-         configured_limit <= budget.max_tokens do
+         selected_rank <= maximum_rank and match?({:ok, _}, Limit.bounded(configured_limit, %{budget: budget})) do
       :ok
     else
       {:error, :managed_responsibility_budget_exceeded}
