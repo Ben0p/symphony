@@ -770,9 +770,10 @@ defmodule SymphonyElixir.Orchestrator do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
     max_no_progress_tokens = Config.settings!().codex.max_no_progress_tokens
     max_total_tokens = Config.settings!().codex.max_total_tokens
+    unmanaged? = is_nil(state.work_package_runtime)
 
     cond do
-      timeout_ms <= 0 and max_no_progress_tokens <= 0 and max_total_tokens <= 0 ->
+      unmanaged? and timeout_ms <= 0 and max_no_progress_tokens <= 0 and max_total_tokens <= 0 ->
         state
 
       map_size(state.running) == 0 ->
@@ -797,9 +798,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms) do
+    case ManagedBudget.effective_limit(state, issue_id) do
+      {:ok, limit} ->
+        restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms, limit)
+
+      {:error, reason} ->
+        stop_for_invalid_token_budget(state, issue_id, running_entry, reason)
+    end
+  end
+
+  defp restart_stalled_issue(state, issue_id, running_entry, now, now_ms, timeout_ms, max_total_tokens) do
     elapsed_ms = stall_elapsed_ms(running_entry, now_ms)
     max_no_progress_tokens = Config.settings!().codex.max_no_progress_tokens
-    max_total_tokens = Config.settings!().codex.max_total_tokens
     no_progress_tokens = no_progress_token_count(running_entry)
     no_durable_progress_tokens = no_durable_progress_token_count(running_entry)
     issue_total_tokens = issue_token_total(state, issue_id)
@@ -3900,8 +3910,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp enforce_total_token_budget(state, issue_id, updated_running_entry) do
-    if total_token_budget_exhausted?(state, issue_id) do
-      threshold = Config.settings!().codex.max_total_tokens
+    case ManagedBudget.effective_limit(state, issue_id) do
+      {:ok, threshold} ->
+        enforce_total_token_budget(state, issue_id, updated_running_entry, threshold)
+
+      {:error, reason} ->
+        state = stop_for_invalid_token_budget(state, issue_id, updated_running_entry, reason)
+        notify_dashboard()
+        {:noreply, state}
+    end
+  end
+
+  defp enforce_total_token_budget(state, issue_id, updated_running_entry, threshold) do
+    if threshold > 0 and issue_token_total(state, issue_id) >= threshold do
       total_tokens = issue_token_total(state, issue_id)
       diagnostic = total_token_budget_diagnostic(updated_running_entry, total_tokens, threshold)
       error = total_token_budget_error(total_tokens, threshold)
@@ -4225,9 +4246,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp issue_token_total(_state, _issue_id), do: 0
 
-  defp total_token_budget_exhausted?(%State{} = state, issue_id) do
-    threshold = Config.settings!().codex.max_total_tokens
-    threshold > 0 and issue_token_total(state, issue_id) >= threshold
+  defp stop_for_invalid_token_budget(state, issue_id, running_entry, reason) do
+    state
+    |> stop_and_block_issue(issue_id, running_entry, "managed token budget authority requires reconciliation")
+    |> ManagedBudget.latch(reason)
   end
 
   defp total_token_budget_error(total_tokens, threshold) do

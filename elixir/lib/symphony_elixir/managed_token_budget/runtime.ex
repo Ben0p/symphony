@@ -2,6 +2,9 @@ defmodule SymphonyElixir.ManagedTokenBudget.Runtime do
   @moduledoc "Managed scheduler accounting, with an explicit historical bootstrap and a latched failure boundary."
 
   alias SymphonyElixir.{Config, ManagedTokenBudget}
+  alias SymphonyElixir.ManagedTokenBudget.Limit
+
+  @grant_fields ~w(id parent_delegation_id role actor_id scope authority budget expires_at_ms expected_deliverable expected_evidence return_to_parent)a
 
   @spec load(map()) :: {:ok, map()} | {:error, term()}
   def load(%{work_package_runtime: nil} = state), do: {:ok, state}
@@ -30,16 +33,12 @@ defmodule SymphonyElixir.ManagedTokenBudget.Runtime do
 
   def admission(%{managed_token_budget_error: nil, managed_token_budget: ledger} = state, issue_id)
       when is_map(ledger) do
-    threshold = Config.settings!().codex.max_total_tokens
-    entries = get_in(state.work_package_runtime, [:managed_delegations, :entries]) || []
-    entry = Enum.find(entries, &(&1.issue_id == issue_id))
-    grant_limit = get_in(entry || %{}, [:responsible, :budget, :max_tokens])
-
     with {:ok, path, identity} <- location(state.work_package_runtime),
          true <- path == ledger.path and identity == ledger.identity,
          :ok <- ManagedTokenBudget.verify(ledger),
          {:ok, total} <- Map.fetch(ledger.issue_totals, issue_id),
-         true <- is_integer(threshold) and threshold > 0 and is_integer(grant_limit) and threshold <= grant_limit,
+         {:ok, threshold} <- effective_limit(state, issue_id),
+         true <- is_integer(total) and total >= 0,
          true <- total < threshold do
       :ok
     else
@@ -48,6 +47,56 @@ defmodule SymphonyElixir.ManagedTokenBudget.Runtime do
   end
 
   def admission(_state, _issue_id), do: {:error, :managed_token_budget_unavailable_or_exhausted}
+
+  @spec effective_limit(map(), String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def effective_limit(%{work_package_runtime: nil}, issue_id) do
+    with {:ok, limit, nil} <- Limit.resolve(Config.settings!().codex.max_total_tokens, nil, issue_id),
+         do: {:ok, limit}
+  end
+
+  def effective_limit(%{work_package_runtime: runtime, managed_token_budget_error: nil} = state, issue_id)
+      when is_map(runtime) do
+    with {:ok, limit, grant} <- Limit.resolve(Config.settings!().codex.max_total_tokens, runtime, issue_id),
+         :ok <- bound_grant_matches(state, issue_id, grant) do
+      {:ok, limit}
+    end
+  end
+
+  def effective_limit(_state, _issue_id), do: {:error, :managed_token_budget_unavailable_or_exhausted}
+
+  defp bound_grant_matches(state, issue_id, grant) do
+    case Map.get(state, :running, %{}) do
+      running when is_map(running) ->
+        case Map.fetch(running, issue_id) do
+          :error -> :ok
+          {:ok, entry} -> bound_running_grant(state, issue_id, entry, grant)
+        end
+
+      _ ->
+        {:error, :managed_token_budget_unavailable_or_exhausted}
+    end
+  end
+
+  defp bound_running_grant(state, issue_id, entry, grant) do
+    with true <- MapSet.equal?(MapSet.new(Map.keys(grant)), MapSet.new(@grant_fields)),
+         %{id: grant_id, scope: %{issue_id: ^issue_id, repository: repository}} when is_binary(repository) <- grant,
+         %{execution_token: %{issue_id: ^issue_id, generation: generation}, execution_session_id: session}
+         when is_integer(generation) and generation > 0 and is_binary(session) and byte_size(session) > 0 <- entry,
+         %{delegations: delegations} when is_map(delegations) <- Map.get(state, :responsibility_graph),
+         %{status: :active, runtime_lease: lease} = current when is_map(lease) <- Map.get(delegations, grant_id),
+         true <- Map.take(current, Map.keys(grant)) == grant,
+         true <- lease == expected_lease(issue_id, generation, session, repository),
+         true <- Map.get(entry, :responsibility_delegation_id, grant_id) == grant_id,
+         true <- Map.get(entry, :responsibility_runtime_lease, lease) == lease do
+      :ok
+    else
+      _ -> {:error, :managed_token_budget_unavailable_or_exhausted}
+    end
+  end
+
+  defp expected_lease(issue_id, generation, session, repository) do
+    %{issue_id: issue_id, generation: generation, session_id: session, process_id: session, repository: repository}
+  end
 
   @spec generation(map(), map()) :: :ok | {:error, term()}
   def generation(%{work_package_runtime: nil}, _token), do: :ok

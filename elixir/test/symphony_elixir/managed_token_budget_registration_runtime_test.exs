@@ -24,10 +24,13 @@ defmodule SymphonyElixir.ManagedTokenBudgetRegistrationRuntimeTest do
 
     assert {:ok, _} = Budget.register_new_issue(ledger, attrs)
     assert {:ok, registered} = Budget.load(path, identity)
-    grant = %{issue_id: issue, responsible: %{budget: %{max_tokens: 500_000}}}
+    grant = %{issue_id: issue, responsible: %{id: "registered-grant", budget: %{max_tokens: 500_000}}}
     runtime = %{journal_path: journal, managed_project_profile_id: "profile", managed_delegations: Map.put(identity, :entries, [grant])}
     state = %{work_package_runtime: runtime, managed_token_budget: registered, managed_token_budget_error: nil}
     assert :ok = Runtime.admission(state, issue)
+    anonymous_grant = %{grant | responsible: Map.delete(grant.responsible, :id)}
+    anonymous_runtime = put_in(runtime, [:managed_delegations, :entries], [anonymous_grant])
+    assert {:error, _} = Runtime.admission(%{state | work_package_runtime: anonymous_runtime}, issue)
     without_grant = put_in(runtime, [:managed_delegations, :entries], [])
     assert {:error, _} = Runtime.admission(%{state | work_package_runtime: without_grant}, issue)
     nil_grant = %{grant | responsible: %{budget: nil}}

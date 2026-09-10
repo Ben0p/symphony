@@ -70,6 +70,12 @@ Workers must not edit this ledger, its `.pending`/`.blocked` markers, or budget 
 budget stop requires evidence-based operator reconciliation; recovery never resets consumption
 or authorizes a larger allowance. See `README.md` for the initialization and failure contract.
 
+Managed `codex.max_total_tokens` must be positive. Each issue is limited to the smaller of this
+configured per-issue ceiling and its responsible grant's `budget.max_tokens`, including across
+retries and restarts. A larger configured ceiling does not enlarge a smaller grant. Missing or
+mismatched bound authority stops running work; changing the manifest cannot widen an active lease.
+Unmanaged workflows may use zero to disable the optional cumulative cap.
+
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}
