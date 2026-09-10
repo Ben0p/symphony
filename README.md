@@ -29,6 +29,9 @@ workspace prove that the released generation has no remaining mutable authority.
 Managed issue token totals survive scheduler restarts and claim release. Explicit historical
 baselines and per-thread cumulative observations live beside the private claim journal. Missing or
 uncertain accounting prevents further admission; recovery does not silently reset an allowance.
+The sole host operator can explicitly register a genuinely new canonical issue in the existing
+ledger after verifying no prior execution. Registration preserves old usage and requires separate
+current responsibility and provider authority before execution; the scheduler never creates it.
 
 Managed claims retain their generation and repository capacity when an acknowledgement is lost.
 The runner journals submission and the first spawn attempt separately, replays only the exact

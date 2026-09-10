@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ManagedTokenBudget.Codec do
   @moduledoc "Strict replay of managed usage observations and explicit historical baselines."
 
-  alias SymphonyElixir.ManagedTokenBudget.Correction
+  alias SymphonyElixir.ManagedTokenBudget.{Correction, Registration}
 
   @identity_keys ~w(pool_key repository_ref managed_project_profile_id)a
   @baseline_keys ~w(issue_id known_minimum_tokens continuation_floor evidence_ref authority_ref)a
@@ -80,7 +80,15 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
   def encode(row), do: Jason.encode!(row) <> "\n"
 
   defp replay(lines, bytes, offset) do
-    state = %{baselines: %{}, issue_totals: %{}, highwaters: %{}, threads: %{}, corrections: %{}, phase: :bootstrap}
+    state = %{
+      baselines: %{},
+      issue_totals: %{},
+      highwaters: %{},
+      threads: %{},
+      corrections: %{},
+      registrations: %{},
+      phase: :bootstrap
+    }
 
     Enum.reduce_while(lines, {:ok, state, offset}, fn line, {:ok, current, position} ->
       with {:ok, row} <- decode_record(line),
@@ -98,6 +106,9 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
 
   defp replay_record(state, %{"kind" => "unstarted_floor_correction"} = row, bytes, position),
     do: Correction.replay(state, row, binary_part(bytes, 0, position))
+
+  defp replay_record(state, %{"kind" => "new_issue_registration"} = row, bytes, position),
+    do: Registration.replay(state, row, binary_part(bytes, 0, position))
 
   defp replay_record(state, row, _bytes, _position), do: apply_record(state, row)
 

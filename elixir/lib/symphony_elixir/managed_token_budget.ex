@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ManagedTokenBudget do
   @moduledoc "Durable managed usage; one host writer, explicit initialization, and no implicit repair or renewal."
 
-  alias SymphonyElixir.ManagedTokenBudget.{Codec, Correction}
+  alias SymphonyElixir.ManagedTokenBudget.{Codec, Correction, Registration}
 
   @spec load(Path.t(), map()) :: {:ok, map()} | {:error, term()}
   def load(path, identity) do
@@ -56,6 +56,15 @@ defmodule SymphonyElixir.ManagedTokenBudget do
   def correct_unstarted_floor(ledger, attrs) do
     with {:ok, bytes} <- verified_bytes(ledger),
          {:ok, next, row} <- Correction.prepare(ledger, attrs, bytes) do
+      append_observation(next, row, bytes)
+    end
+  end
+
+  @doc "Records an operator-verified new issue without renewing usage or granting execution authority."
+  @spec register_new_issue(map(), map()) :: {:ok, map()} | {:error, term()}
+  def register_new_issue(ledger, attrs) do
+    with {:ok, bytes} <- verified_bytes(ledger),
+         {:ok, next, row} <- Registration.prepare(ledger, attrs, bytes) do
       append_observation(next, row, bytes)
     end
   end
