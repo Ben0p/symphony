@@ -1458,6 +1458,11 @@ Managed-runtime extension:
   token and worker session before releasing ownership. Accounting uncertainty retains the fence.
 - Historical baseline initialization is not allowance renewal. No automatic reset or renewal is
   implied. This accounts for observed usage; it cannot reconstruct spend the agent never reported.
+- A sole host operator may register a verified new canonical issue with zero historical use and
+  generation floor 1 by appending a record bound to the exact existing ledger prefix. Preserve all
+  old bytes and usage, reject existing UUIDs and aliases, and require independent no-history evidence.
+  Registration does not grant execution authority. Exact logical retries are idempotent after
+  reload; conflicting retries, duplicate physical records and uncertain writes fail closed.
 
 Runtime accounting:
 

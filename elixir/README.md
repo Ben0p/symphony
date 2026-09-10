@@ -286,6 +286,20 @@ issue requires retained usage evidence; absence of a ledger is never evidence of
 An empty baseline list initializes an idle pool without authorizing any issue. Initialization is
 exclusive; there is no automatic bootstrap, rollover, reset, or allowance-renewal operation.
 
+For a genuinely new canonical issue after initialization, stop the pool and independently verify
+its native UUID and absence of prior execution, claims, responsibility, fences and workspaces.
+Missing accounting alone is not evidence of zero use. The sole host writer may explicitly call
+`ManagedTokenBudget.register_new_issue/2` with the freshly loaded ledger and exactly: lowercase
+`issue_id`, `known_minimum_tokens: 0`, `continuation_floor: 1`, `evidence_ref`, `authority_ref`,
+`ledger_prefix_sha256` (lowercase SHA256 of the current bytes) and `ledger_prefix_size_bytes`.
+The append binds the complete prefix, retains every prior byte and usage total, seals bootstrap,
+and preserves the 20-issue limit. Existing UUIDs, including case aliases, cannot be registered again.
+Exact logical retries after reload or later usage append nothing; conflicting retries and duplicate
+physical rows fail. Pending or blocked writes prevent registration. Deploy this decoder before
+appending registration records; older runtimes reject them. Registration is bookkeeping, not an
+execution grant, allowance renewal or automatic scheduler action. Current manifest, responsibility,
+provider claim, generation, capacity and token limits still control admission.
+
 Generation floors are per issue, not per pool: an issue with no prior execution starts at 1.
 To correct a mistaken floor for an unstarted issue, stop its managed service and retain the ledger,
 fence, journal and independent no-worker/no-claim evidence. The sole host writer may explicitly call
