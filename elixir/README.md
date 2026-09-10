@@ -200,6 +200,16 @@ Cleanup receipt authority retains the validated reservation generation through j
 and acknowledgement replay. Later generations use their own journal entry even when a legacy
 entry is present; termination and repository-cleanup receipts never fall back to an older claim.
 
+Managed review handoff remains discoverable from the persisted execution fence after the worker
+stops or the orchestrator restarts. The ordinary poll confirms the exact execution session and
+retains the repository claim while review is pending. Process termination alone emits no terminal
+receipt. A fresh terminal tracker state and a merged GitHub PR matching the clean workspace's
+current commit are required before successful fencing and cleanup. The qualified local Linux path
+checks the actual branch, repository origin, merge commit and absence of an open PR on that branch;
+the tracker-derived branch and the worker's initial checkout head are not acceptance evidence.
+Missing or conflicting evidence keeps the workspace and capacity held. Portable archive/restore
+verification and signed provider acknowledgements remain separate required cleanup steps.
+
 The journal records `submitted`, `confirmed`, and `spawn_started` separately. The last marker is
 synced before attempting a worker task, so a restart can replay a submitted claim only when its
 current generation and unstarted lease still match. Uncertain claims keep their repository and

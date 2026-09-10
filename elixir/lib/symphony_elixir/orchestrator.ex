@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
     ExecutionSupervisor,
     GlobalPause,
     ResponsibilityGraph,
+    ReviewHandoff,
+    ReviewHandoffEvidence,
     RuntimeIdentity,
     StartupMaintenance,
     StatusDashboard,
@@ -30,6 +32,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.ManagedTokenBudget.Runtime, as: ManagedBudget
   alias SymphonyElixir.ManagedTokenBudget.Stop, as: ManagedBudgetStop
   alias SymphonyElixir.ResponsibilityGraph.Persistence, as: ResponsibilityPersistence
+  alias SymphonyElixir.ResponsibilityGraph.ReviewCompletion
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkPackageClaim.{Journal, Unsubmitted}
   alias SymphonyElixir.WorkPackageClaim.Recovery, as: ClaimRecovery
@@ -81,6 +84,10 @@ defmodule SymphonyElixir.Orchestrator do
       responsibility_graph_path: nil,
       execution_supervisor: nil,
       work_package_runtime: nil,
+      review_handoff_evidence: nil,
+      review_issue_fetcher: nil,
+      review_handoff_cursor: 0,
+      execution_termination_fun: nil,
       stall_restarts: %{},
       codex_totals: nil,
       codex_issue_totals: %{},
@@ -122,6 +129,9 @@ defmodule SymphonyElixir.Orchestrator do
                   responsibility_graph_path: graph_path,
                   execution_supervisor: Keyword.get(opts, :execution_supervisor),
                   work_package_runtime: Keyword.get(opts, :work_package_runtime),
+                  review_handoff_evidence: Keyword.get(opts, :review_handoff_evidence),
+                  review_issue_fetcher: Keyword.get(opts, :review_issue_fetcher),
+                  execution_termination_fun: Keyword.get(opts, :execution_termination_fun),
                   codex_totals: @empty_codex_totals,
                   codex_issue_totals: %{},
                   codex_rate_limits: nil
@@ -180,6 +190,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    state = reconcile_review_handoffs(state)
     state = replay_persisted_cleanup_receipts(state)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
@@ -347,7 +358,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp finish_agent_down(state, issue_id, entry, session_id, reason) do
     state = release_execution_lease(state, entry, reason)
-    state = maybe_confirm_execution_supervisor(state, entry, session_id)
+    state = maybe_confirm_execution_supervisor(state, entry)
     handle_agent_down(reason, state, issue_id, entry, session_id)
   end
 
@@ -412,6 +423,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
+      |> hold_review_handoff_claims()
 
     if GlobalPause.paused?() do
       Logger.debug("Global mutable admission is paused; skipping new worker dispatch")
@@ -459,6 +471,170 @@ defmodule SymphonyElixir.Orchestrator do
           Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
           state
       end
+    end
+  end
+
+  defp reconcile_review_handoffs(%State{work_package_runtime: nil} = state), do: state
+
+  defp reconcile_review_handoffs(state) do
+    pending = ReviewHandoff.pending_executions(state.execution_fence, Map.keys(state.running))
+    offset = if pending == [], do: 0, else: rem(state.review_handoff_cursor, length(pending))
+    batch = Enum.drop(pending, offset) ++ Enum.take(pending, offset)
+    ids = batch |> Enum.take(@cleanup_receipt_replay_limit) |> Enum.map(&elem(&1, 0))
+    state = %{state | review_handoff_cursor: offset + length(ids)}
+
+    case ids do
+      [] ->
+        state
+
+      _ ->
+        case fetch_review_issues(state, ids) do
+          {:ok, issues} ->
+            reconcile_review_handoff_issues(state, issues)
+
+          {:error, reason} ->
+            Logger.warning("Review handoff tracker reconciliation unavailable: #{inspect(reason)}")
+            state
+        end
+    end
+  end
+
+  defp hold_review_handoff_claims(%State{work_package_runtime: nil} = state), do: state
+
+  defp hold_review_handoff_claims(state) do
+    ids = ReviewHandoff.pending_executions(state.execution_fence, Map.keys(state.running)) |> Enum.map(&elem(&1, 0))
+    %{state | claimed: MapSet.union(state.claimed, MapSet.new(ids))}
+  end
+
+  @doc false
+  @spec reconcile_review_handoff_issues_for_test(map(), [Issue.t()]) :: map()
+  def reconcile_review_handoff_issues_for_test(state, issues) do
+    fetcher = state.review_issue_fetcher || fn _ids -> {:ok, issues} end
+    result = reconcile_review_handoff_issues(%{state | review_issue_fetcher: fetcher}, issues)
+    %{result | review_issue_fetcher: state.review_issue_fetcher}
+  end
+
+  defp fetch_review_issues(state, ids) do
+    fetcher = state.review_issue_fetcher || (&Tracker.fetch_issues_by_ids/1)
+    fetcher.(ids)
+  end
+
+  defp reconcile_review_handoff_issues(state, issues) do
+    pending = Map.new(ReviewHandoff.pending_executions(state.execution_fence, Map.keys(state.running)))
+
+    Enum.reduce(issues, state, fn issue, current ->
+      case Map.get(pending, issue.id) do
+        nil -> current
+        execution -> reconcile_review_handoff(current, execution, issue)
+      end
+    end)
+  end
+
+  defp reconcile_review_handoff(state, execution, issue) do
+    with {:ok, entry} <- ReviewHandoff.entry(execution, issue),
+         {:ok, entry} <- bind_review_handoff_responsibility(state, execution, entry) do
+      state = maybe_confirm_execution_supervisor(state, entry)
+
+      if terminal_issue_state?(issue.state, terminal_state_set()) and
+           get_in(state.execution_fence, [:executions, issue.id, :ownership]) == :reconciled do
+        finish_review_handoff(state, execution, entry)
+      else
+        state
+      end
+    else
+      {:error, reason} ->
+        Logger.warning("Review handoff remains held for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp bind_review_handoff_responsibility(state, execution, entry) do
+    runtime = state.work_package_runtime
+    profile = runtime.managed_project_profile_id
+    key = Journal.reservation_key(execution.issue_id, profile, execution.repository, execution.generation)
+    delegations = state.responsibility_graph.delegations
+    expected = review_reservation_identity(runtime, execution, entry)
+
+    with {:ok, journal} <- Journal.load(runtime.journal_path),
+         reservation when is_map(reservation) <- Map.get(journal.reservations, key),
+         true <- Map.take(reservation, Map.keys(expected)) == expected,
+         delegation when is_map(delegation) <- Map.get(delegations, reservation.responsible_delegation_id),
+         true <-
+           delegation.role == :responsible and delegation.scope.repository == execution.repository and
+             delegation.scope.issue_id in [execution.issue_id, entry.issue.identifier] do
+      {:ok, entry |> Map.put(:responsibility_delegation_id, delegation.id) |> Map.put(:review_reservation, reservation)}
+    else
+      _ -> {:error, :review_responsibility_identity_unavailable}
+    end
+  end
+
+  defp review_reservation_identity(runtime, execution, entry) do
+    %{
+      issue_id: execution.issue_id,
+      repository_ref: execution.repository,
+      managed_project_profile_id: runtime.managed_project_profile_id,
+      runner_id: runtime.runner_id,
+      generation: execution.generation,
+      session_id: entry.execution_session_id,
+      process_id: entry.process_id,
+      execution_fence_token: "#{execution.issue_id}:#{execution.generation}",
+      runtime_lease_id: entry.execution_session_id
+    }
+  end
+
+  defp finish_review_handoff(state, execution, entry) do
+    observe = state.review_handoff_evidence || (&ReviewHandoffEvidence.observe/1)
+
+    with {:ok, %{accepted_head: head, merge_identity: merge}} <- observe.(execution),
+         :ok <- recheck_review_issue(state, entry.issue) do
+      evidence = %{
+        accepted_head: head,
+        merge_identity: merge,
+        terminal_outcome: :completed,
+        review_merge_verified: true
+      }
+
+      entry = Map.merge(entry, evidence)
+      state = maybe_fence_terminal_execution(state, entry, true)
+      cleanup_review_handoff(state, entry)
+    else
+      {:error, reason} ->
+        Logger.warning("Review handoff awaits accepted merge for #{issue_context(entry.issue)}: #{inspect(reason)}")
+        state
+
+      _ ->
+        Logger.warning("Review handoff received malformed merge evidence for #{issue_context(entry.issue)}")
+        state
+    end
+  end
+
+  defp recheck_review_issue(state, issue) do
+    with {:ok, [%Issue{} = current]} <- fetch_review_issues(state, [issue.id]),
+         true <- current.id == issue.id and current.state == issue.state and current.updated_at == issue.updated_at do
+      :ok
+    else
+      _ -> {:error, :review_native_state_changed}
+    end
+  end
+
+  defp cleanup_review_handoff(state, entry) do
+    status = get_in(state.responsibility_graph, [:delegations, entry.responsibility_delegation_id, :status])
+    ready = ExecutionFence.validate_cleanup(state.execution_fence, entry.execution_token, entry.accepted_head)
+
+    if status == :completed and ready == :ok do
+      state = maybe_confirm_execution_supervisor(state, entry)
+      state = cleanup_fenced_workspace_or_legacy(state, entry.issue, entry)
+      release_cleaned_review_claim(state, entry.issue.id)
+    else
+      state
+    end
+  end
+
+  defp release_cleaned_review_claim(state, issue_id) do
+    if get_in(state.execution_fence, [:executions, issue_id, :cleanup]) == :cleaned do
+      release_issue_claim(state, issue_id)
+    else
+      state
     end
   end
 
@@ -591,12 +767,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        state |> refresh_running_issue_state(issue) |> terminate_running_issue(issue.id, true)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        state |> refresh_running_issue_state(issue) |> terminate_running_issue(issue.id, false)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -604,7 +780,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        state |> refresh_running_issue_state(issue) |> terminate_running_issue(issue.id, false)
     end
   end
 
@@ -729,7 +905,10 @@ defmodule SymphonyElixir.Orchestrator do
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         running_entry = Map.put(running_entry, :terminal_outcome, terminal_outcome_for(running_entry, :orchestrator_stop))
         state = record_session_completion_totals(state, running_entry)
-        state = maybe_fence_terminal_execution(state, running_entry, cleanup_workspace)
+        # Persist the lease release before stopping. A crash after process exit
+        # must leave the exact generation discoverable by terminal reconciliation.
+        state = release_execution_lease(state, running_entry, :orchestrator_stop)
+        state = maybe_fence_stopped_execution(state, running_entry, cleanup_workspace)
 
         stop_running_task(pid, ref, state.task_supervisor)
         {state, running_entry} = drain_stopped_managed_usage(state, issue_id, running_entry)
@@ -748,10 +927,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp finish_stopped_issue(state, issue_id, running_entry, identifier, cleanup_workspace) do
     state = release_execution_lease(state, running_entry, :orchestrator_stop)
-    state = maybe_confirm_execution_supervisor(state, running_entry, identifier)
+    state = maybe_confirm_execution_supervisor(state, running_entry)
 
     state =
-      if cleanup_workspace do
+      if cleanup_workspace and is_nil(state.work_package_runtime) do
         cleanup_fenced_workspace_or_legacy(state, Map.get(running_entry, :issue, identifier), running_entry)
       else
         state
@@ -765,6 +944,13 @@ defmodule SymphonyElixir.Orchestrator do
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
+
+  defp maybe_fence_stopped_execution(%State{work_package_runtime: nil} = state, entry, cleanup),
+    do: maybe_fence_terminal_execution(state, entry, cleanup)
+
+  # Managed completion needs a fresh accepted merge, not the worker's initial
+  # checkout head. The persisted generation is reconciled on the ordinary poll.
+  defp maybe_fence_stopped_execution(state, _entry, _cleanup), do: state
 
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
@@ -1818,12 +2004,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp maybe_confirm_execution_supervisor(%State{} = state, running_entry, session_id) do
+  defp maybe_confirm_execution_supervisor(%State{} = state, running_entry) do
     token = Map.get(running_entry, :execution_token)
+    session_id = Map.get(running_entry, :execution_session_id)
 
     case supervisor_identity_for(state.execution_fence, token, session_id) do
       identity when is_map(identity) ->
-        case ExecutionSupervisor.terminate(identity) do
+        case terminate_execution(state, identity) do
           {:ok, evidence} ->
             now_ms = execution_fence_now_ms()
 
@@ -1853,6 +2040,11 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp terminate_execution(state, identity) do
+    terminate = state.execution_termination_fun || (&ExecutionSupervisor.terminate/1)
+    terminate.(identity)
+  end
+
   defp supervisor_identity_for(fence_state, %{issue_id: issue_id, generation: generation}, session_id)
        when is_binary(issue_id) and is_integer(generation) and is_binary(session_id) do
     case get_in(fence_state, [:executions, issue_id]) do
@@ -1876,7 +2068,7 @@ defmodule SymphonyElixir.Orchestrator do
        when is_map(runtime) and is_map(evidence) do
     issue_id = Map.get(entry.execution_token, :issue_id) || entry.issue.id
     execution = get_in(state.execution_fence, [:executions, issue_id])
-    accepted_head = get_in(execution, [:terminal, :accepted_head]) || get_in(execution, [:leases, entry.execution_session_id, :head])
+    accepted_head = get_in(execution, [:terminal, :accepted_head])
 
     if is_map(execution) and is_binary(accepted_head) and accepted_head != "unobserved" do
       input =
@@ -1887,7 +2079,7 @@ defmodule SymphonyElixir.Orchestrator do
           fence_state: state.execution_fence
         })
 
-      attrs = %{terminal_outcome: Map.get(entry, :terminal_outcome, :blocked), accepted_head: accepted_head}
+      attrs = %{terminal_outcome: cleanup_terminal_outcome(state, entry.execution_token), accepted_head: accepted_head}
       opts = [] |> maybe_claim_option(runtime, :request_fun) |> maybe_claim_option(runtime, :now_fun)
 
       case WorkPackageCleanupReceipt.termination_confirmed(input, attrs, opts) do
@@ -1980,7 +2172,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_fence_terminal_execution(state, _running_entry, false), do: state
 
-  defp maybe_fence_terminal_execution(state, %{execution_token: token, issue: %Issue{state: issue_state} = issue} = entry, true)
+  defp maybe_fence_terminal_execution(state, entry, true) do
+    if is_nil(state.work_package_runtime) or Map.get(entry, :review_merge_verified, false),
+      do: fence_terminal_execution(state, entry),
+      else: state
+  end
+
+  defp fence_terminal_execution(state, %{execution_token: token, issue: %Issue{state: issue_state} = issue} = entry)
        when is_binary(issue_state) do
     terminal_head = Map.get(entry, :accepted_head, "unobserved")
     terminal_attrs = %{terminal_state: issue_state, accepted_head: terminal_head, merge_identity: Map.get(entry, :merge_identity)}
@@ -2002,20 +2200,29 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp maybe_fence_terminal_execution(state, _running_entry, _cleanup_workspace), do: state
+  defp fence_terminal_execution(state, _entry), do: state
 
   defp complete_responsibility_execution(
          %State{} = state,
-         %{responsibility_delegation_id: delegation_id},
+         %{responsibility_delegation_id: delegation_id} = entry,
          terminal_attrs
        )
        when is_binary(delegation_id) and is_map(terminal_attrs) do
-    case ResponsibilityGraph.complete(
-           state.responsibility_graph,
-           delegation_id,
-           terminal_attrs,
-           execution_fence_now_ms()
-         ) do
+    result =
+      if Map.get(entry, :review_merge_verified, false) do
+        ReviewCompletion.complete(
+          state.responsibility_graph,
+          state.execution_fence,
+          entry,
+          terminal_attrs,
+          execution_fence_now_ms()
+        )
+      else
+        now_ms = execution_fence_now_ms()
+        ResponsibilityGraph.complete(state.responsibility_graph, delegation_id, terminal_attrs, now_ms)
+      end
+
+    case result do
       {:ok, graph_state, _impact} ->
         case persist_responsibility_graph(state, graph_state) do
           {:ok, next_state} ->
@@ -2034,7 +2241,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp complete_responsibility_execution(state, _entry, _terminal_attrs), do: state
 
-  defp cleanup_fenced_workspace_or_legacy(%State{} = state, issue_or_identifier, %{execution_token: token} = entry) do
+  defp cleanup_fenced_workspace_or_legacy(state, issue_or_identifier, entry) do
+    if is_nil(state.work_package_runtime) or Map.get(entry, :review_merge_verified, false),
+      do: cleanup_verified_workspace(state, issue_or_identifier, entry),
+      else: state
+  end
+
+  defp cleanup_verified_workspace(%State{} = state, issue_or_identifier, %{execution_token: token} = entry) do
     case Map.get(entry, :accepted_head) do
       head when is_binary(head) and head != "" and head != "unobserved" ->
         case execution_workspace_path(state.execution_fence, token, entry) do
@@ -2080,7 +2293,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp cleanup_fenced_workspace_or_legacy(state, issue_or_identifier, entry) do
+  defp cleanup_verified_workspace(state, issue_or_identifier, entry) do
     cleanup_issue_workspace(issue_or_identifier, entry)
     state
   end
@@ -2608,8 +2821,8 @@ defmodule SymphonyElixir.Orchestrator do
 
         termination_actions =
           Enum.flat_map(execution.leases, fn {_session_id, lease} ->
-            case {Map.get(lease, :termination_confirmed_at_ms), Map.get(lease, :termination_evidence)} do
-              {confirmed_at_ms, evidence} when is_integer(confirmed_at_ms) and is_map(evidence) ->
+            case {execution.terminal, Map.get(lease, :termination_confirmed_at_ms), Map.get(lease, :termination_evidence)} do
+              {terminal, at_ms, evidence} when is_map(terminal) and is_integer(at_ms) and is_map(evidence) ->
                 [
                   {:termination, token, lease.session_id, evidence, %Issue{id: issue_id, identifier: issue_id}, cleanup_terminal_outcome(state, token)}
                 ]
