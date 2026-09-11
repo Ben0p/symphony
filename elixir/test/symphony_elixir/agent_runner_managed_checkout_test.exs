@@ -96,9 +96,19 @@ defmodule SymphonyElixir.AgentRunnerManagedCheckoutTest do
     )
 
     assert_raise RuntimeError, ~r/managed_checkout_git_identity_mismatch/, fn ->
-      AgentRunner.run(ctx.issue, self(), execution_checkout: ctx.identity, execution_fence_guard: fn -> :ok end)
+      AgentRunner.run(ctx.issue, self(),
+        execution_checkout: ctx.identity,
+        execution_fence_guard: fn -> :ok end,
+        execution_checkout_checkpoint: fn checkpoint ->
+          send(self(), {:preflight_checkpoint, checkpoint.kind})
+          :ok
+        end
+      )
     end
 
+    assert_receive {:preflight_checkpoint, :baseline}
+    refute_received {:preflight_checkpoint, _}
+    refute Enum.any?(Process.get_keys(), &match?({SymphonyElixir.ManagedCheckout.Progress, _}, &1))
     refute File.exists?(ctx.started)
     refute File.exists?(Path.join(ctx.identity.worktree, "after-hook.txt"))
     assert git(ctx.identity.worktree, ["branch", "--show-current"]) == "main"
@@ -182,6 +192,63 @@ defmodule SymphonyElixir.AgentRunnerManagedCheckoutTest do
 
     assert File.read!(Path.join(ctx.identity.worktree, "after-hook.txt")) == "authorized"
     assert git(ctx.identity.worktree, ["branch", "--show-current"]) == ctx.identity.branch
+  end
+
+  test "commit checkpoints keep one cursor through initial reporting and final hooks", ctx do
+    before_hook =
+      "git config user.name 'Progress fixture' && git config user.email progress@example.invalid && " <>
+        "printf before > README.md && git add README.md && git commit -m before"
+
+    after_hook = "printf after > README.md && git add README.md && git commit -m after"
+    write_workflow_file!(Workflow.workflow_file_path(), Keyword.merge(ctx.workflow, hook_before_run: before_hook, hook_after_run: after_hook))
+
+    assert :ok =
+             AgentRunner.run(ctx.issue, self(),
+               execution_checkout: ctx.identity,
+               execution_fence_guard: fn -> {:ok, %{authorized: true}} end,
+               execution_session_id: ctx.identity.session_id,
+               execution_checkout_checkpoint: fn checkpoint ->
+                 send(self(), {:progress_checkpoint, checkpoint})
+                 :ok
+               end,
+               issue_state_fetcher: fn [_id] -> {:ok, [%{ctx.issue | state: "Done"}]} end
+             )
+
+    assert_receive {:progress_checkpoint, %{kind: :baseline, sequence: 0}}
+    assert_receive {:progress_checkpoint, %{kind: :durable, sequence: 1}}
+    assert_receive {:progress_checkpoint, %{kind: :durable, sequence: 2}}
+    refute_received {:progress_checkpoint, _}
+    refute Enum.any?(Process.get_keys(), &match?({SymphonyElixir.ManagedCheckout.Progress, _}, &1))
+  end
+
+  test "a final checkpoint rejection exits as failure while preserving the changed checkout", ctx do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      Keyword.merge(ctx.workflow,
+        hook_before_run: "git config user.name 'Progress fixture' && git config user.email progress@example.invalid",
+        hook_after_run: "printf after > README.md && git add README.md && git commit -m after"
+      )
+    )
+
+    callback = fn checkpoint ->
+      send(self(), {:final_checkpoint, checkpoint.kind})
+      if checkpoint.kind == :baseline, do: :ok, else: {:error, :final_checkpoint_rejected}
+    end
+
+    assert_raise RuntimeError, ~r/final_checkpoint_rejected/, fn ->
+      AgentRunner.run(ctx.issue, self(),
+        execution_checkout: ctx.identity,
+        execution_fence_guard: fn -> :ok end,
+        execution_checkout_checkpoint: callback,
+        issue_state_fetcher: fn [_id] -> {:ok, [%{ctx.issue | state: "Done"}]} end
+      )
+    end
+
+    assert_receive {:final_checkpoint, :baseline}
+    assert_receive {:final_checkpoint, :durable}
+    refute_received {:final_checkpoint, _}
+    assert File.read!(Path.join(ctx.identity.worktree, "README.md")) == "after"
+    refute Enum.any?(Process.get_keys(), &match?({SymphonyElixir.ManagedCheckout.Progress, _}, &1))
   end
 
   defp git(cwd, args) do

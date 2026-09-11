@@ -28,6 +28,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.Codex.Progress
   alias SymphonyElixir.ExecutionFence.Persistence
+  alias SymphonyElixir.ManagedCheckout.Checkpoint
   alias SymphonyElixir.ManagedResponsibility.Admission, as: ManagedAdmission
   alias SymphonyElixir.ManagedTokenBudget.Runtime, as: ManagedBudget
   alias SymphonyElixir.ManagedTokenBudget.Stop, as: ManagedBudgetStop
@@ -1602,6 +1603,13 @@ defmodule SymphonyElixir.Orchestrator do
                execution_token: token,
                execution_session_id: session_id,
                execution_checkout: managed_execution_checkout(state, token, session_id),
+               execution_checkout_checkpoint: fn checkpoint ->
+                 GenServer.call(
+                   recipient,
+                   {:execution_checkout_progress, issue.id, checkpoint},
+                   @execution_authorization_timeout_ms
+                 )
+               end,
                execution_supervisor: supervisor_identity,
                secret_environment_names: Map.get(runtime, :secret_environment_names, []),
                execution_supervisor_recorder: fn identity ->
@@ -3543,6 +3551,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:execution_checkout_progress, issue_id, checkpoint}, {sender, _tag}, %State{} = state) do
+    case Checkpoint.accept(state, issue_id, sender, checkpoint, DateTime.utc_now()) do
+      {:ok, entry} -> {:reply, :ok, %{state | running: Map.put(state.running, issue_id, entry)}}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
   def handle_call({:execution_fence_authorize, token, action}, _from, %State{} = state) do
     {:reply, ExecutionFence.authorize(state.execution_fence, token, action), state}
   end

@@ -6,6 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Codex.{AppServer, ModelRouter}
   alias SymphonyElixir.{Config, ManagedCheckout, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.ManagedCheckout.Progress, as: CheckoutProgress
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -41,17 +42,24 @@ defmodule SymphonyElixir.AgentRunner do
     with :ok <- execution_fence_preflight(opts) do
       case create_workspace(issue, worker_host, opts) do
         {:ok, workspace} ->
+          opts = CheckoutProgress.attach(workspace, opts)
           opts = checkout_guarded_options(workspace, opts)
-          send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
 
           try do
+            send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
+
             with :ok <- execution_fence_preflight(opts),
                  :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
               run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
             end
           after
-            run_after_run_hook_if_authorized(workspace, issue, worker_host, opts)
-            send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
+            try do
+              run_after_run_hook_if_authorized(workspace, issue, worker_host, opts)
+              send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
+              require_checkout_progress!(issue, opts)
+            after
+              CheckoutProgress.clear(opts)
+            end
           end
 
         {:error, reason} ->
@@ -71,6 +79,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp require_checkout_progress!(issue, opts) do
+    case CheckoutProgress.status(opts) do
+      :ok -> :ok
+      {:error, reason} -> raise RuntimeError, "Checkout progress failed: #{inspect(reason)} (#{issue_context(issue)})"
+    end
+  end
+
   defp checkout_guarded_options(workspace, opts) do
     case Keyword.get(opts, :execution_checkout) do
       nil ->
@@ -82,9 +97,13 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp checkout_preflight(workspace, identity, opts) do
-    with :ok <- execution_fence_preflight(opts),
-         {:ok, _observed} <- ManagedCheckout.verify(workspace, identity) do
-      execution_fence_preflight(opts)
+    with :ok <- CheckoutProgress.status(opts),
+         :ok <- execution_fence_preflight(opts),
+         {:ok, observed} <- ManagedCheckout.verify(workspace, identity),
+         :ok <- execution_fence_preflight(opts) do
+      CheckoutProgress.observe(opts, observed)
+    else
+      {:error, reason} -> CheckoutProgress.fail(opts, reason)
     end
   end
 

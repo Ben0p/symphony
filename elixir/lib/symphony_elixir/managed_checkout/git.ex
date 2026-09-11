@@ -25,7 +25,7 @@ defmodule SymphonyElixir.ManagedCheckout.Git do
         :binary,
         :exit_status,
         :stderr_to_stdout,
-        {:args, Enum.map(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null" | args], &to_charlist/1)},
+        {:args, Enum.map(["--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null" | args], &to_charlist/1)},
         {:cd, to_charlist(cwd)},
         {:env, environment}
       ])

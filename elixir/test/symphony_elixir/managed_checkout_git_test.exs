@@ -38,6 +38,18 @@ defmodule SymphonyElixir.ManagedCheckoutGitTest do
     assert {:error, {:git_failed, 23}} = Git.run(ctx.root, ["status"])
   end
 
+  @tag timeout: 25_000
+  test "a silent Git process reaches the fixed deadline and preserves uncertain termination", ctx do
+    # A shell builtin creates no descendant and exits when closing the port closes stdin.
+    executable(ctx, "read -r -t 20 ignored")
+    started = System.monotonic_time(:millisecond)
+    assert {:error, reason} = Git.run(ctx.root, ["status"])
+    elapsed = System.monotonic_time(:millisecond) - started
+    assert elapsed >= 15_000 and elapsed < 19_000
+    uncertain = {:git_process_termination_unconfirmed, :git_timeout_requires_reconciliation}
+    assert reason in [:git_timeout_requires_reconciliation, uncertain]
+  end
+
   defp executable(ctx, body) do
     File.write!(ctx.executable, "#!/bin/bash\n" <> body <> "\n")
     File.chmod!(ctx.executable, 0o755)

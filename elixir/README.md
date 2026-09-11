@@ -105,6 +105,20 @@ Existing session/turn outcomes, cumulative token limits, no-progress limits, tim
 and claim fencing remain in force. Restarted attempts must use the existing fenced recovery
 path; an old session's notifications cannot qualify a new session's progress.
 
+Managed checkout preflight also recognizes committed source advancement. The first verified
+HEAD establishes an attempt-local baseline without progress credit. A later strict descendant
+earns durable progress only when its endpoint tree differs. Empty commits advance the
+observation cursor without credit; unchanged HEADs do neither. Rewritten history, failed Git
+observations and rejected checkpoints hold the attempt through its final hooks.
+
+The existing worker process performs bounded Git reads before its next authorized tool.
+The orchestrator receives a synchronous checkpoint bound to the actual caller, current
+generation, session, repository, workspace and branch. It updates only the durable baseline
+to currently reported cumulative usage. Later usage remains chargeable; neither historical
+usage nor the meaningful-progress baseline is adjusted. Restart begins a new observation
+baseline through the existing fenced recovery path. A checkpoint is source progress, not
+reviewed completion, and cannot authorize publication, terminal cleanup or a successor.
+
 ## Burrito releases
 
 Symphony ships self-contained executables built with
