@@ -1601,6 +1601,7 @@ defmodule SymphonyElixir.Orchestrator do
                worker_host: worker_host,
                execution_token: token,
                execution_session_id: session_id,
+               execution_checkout: managed_execution_checkout(state, token, session_id),
                execution_supervisor: supervisor_identity,
                secret_environment_names: Map.get(runtime, :secret_environment_names, []),
                execution_supervisor_recorder: fn identity ->
@@ -1918,6 +1919,14 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         raise ArgumentError, "Symphony pool repository identity requires both pool and repository"
     end
+  end
+
+  defp managed_execution_checkout(%State{work_package_runtime: nil}, _token, _session_id), do: nil
+
+  defp managed_execution_checkout(state, token, session_id) do
+    state.execution_fence.executions[token.issue_id]
+    |> Map.take([:issue_id, :generation, :repository, :branch, :worktree])
+    |> Map.put(:session_id, session_id)
   end
 
   defp execution_attributes(%Issue{id: issue_id, identifier: identifier, branch_name: branch_name}, worker_host) do
