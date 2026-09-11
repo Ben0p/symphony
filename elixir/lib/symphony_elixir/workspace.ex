@@ -37,6 +37,49 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc "Prepares a managed checkout without deleting contradictory or partially created state."
+  @spec create_for_execution(map(), map(), worker_host(), (-> :ok | {:error, term()})) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_for_execution(issue, identity, nil, guard) when is_map(identity) and is_function(guard, 0) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), nil),
+         :ok <- validate_workspace_path(workspace, nil),
+         true <- workspace == Map.get(identity, :worktree),
+         :ok <- guard.(),
+         {:ok, created?} <- ensure_execution_workspace(workspace),
+         :ok <- guard.(),
+         :ok <- maybe_run_after_create_hook(workspace, issue_context(issue), created?, nil),
+         :ok <- guard.(),
+         {:ok, _observed} <- SymphonyElixir.ManagedCheckout.prepare(workspace, identity, created?, guard),
+         :ok <- guard.() do
+      {:ok, workspace}
+    else
+      false -> {:error, :managed_checkout_path_mismatch}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def create_for_execution(_issue, _identity, _worker_host, _guard),
+    do: {:error, :unsupported_managed_checkout_host_or_identity}
+
+  defp ensure_execution_workspace(workspace) do
+    case File.lstat(workspace) do
+      {:ok, %File.Stat{type: :directory}} ->
+        {:ok, false}
+
+      {:error, :enoent} ->
+        case File.mkdir(workspace) do
+          :ok -> {:ok, true}
+          {:error, reason} -> {:error, {:managed_checkout_create_failed, reason}}
+        end
+
+      {:ok, _collision} ->
+        {:error, :managed_checkout_path_collision}
+
+      {:error, reason} ->
+        {:error, {:managed_checkout_path_unavailable, reason}}
+    end
+  end
+
   @doc "Reads the exact Git commit currently checked out in a workspace."
   @spec current_head(Path.t()) :: {:ok, String.t()} | {:error, term()}
   @spec current_head(Path.t(), worker_host()) :: {:ok, String.t()} | {:error, term()}

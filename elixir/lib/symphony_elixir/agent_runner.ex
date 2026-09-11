@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.{AppServer, ModelRouter}
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, ManagedCheckout, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -39,8 +39,9 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     with :ok <- execution_fence_preflight(opts) do
-      case Workspace.create_for_issue(issue, worker_host) do
+      case create_workspace(issue, worker_host, opts) do
         {:ok, workspace} ->
+          opts = checkout_guarded_options(workspace, opts)
           send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, opts)
 
           try do
@@ -56,6 +57,34 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason} ->
           {:error, reason}
       end
+    end
+  end
+
+  defp create_workspace(issue, worker_host, opts) do
+    case Keyword.get(opts, :execution_checkout) do
+      nil ->
+        Workspace.create_for_issue(issue, worker_host)
+
+      identity ->
+        guard = fn -> execution_fence_preflight(opts) end
+        Workspace.create_for_execution(issue, identity, worker_host, guard)
+    end
+  end
+
+  defp checkout_guarded_options(workspace, opts) do
+    case Keyword.get(opts, :execution_checkout) do
+      nil ->
+        opts
+
+      identity ->
+        Keyword.put(opts, :execution_fence_guard, fn -> checkout_preflight(workspace, identity, opts) end)
+    end
+  end
+
+  defp checkout_preflight(workspace, identity, opts) do
+    with :ok <- execution_fence_preflight(opts),
+         {:ok, _observed} <- ManagedCheckout.verify(workspace, identity) do
+      execution_fence_preflight(opts)
     end
   end
 
@@ -98,21 +127,38 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, opts)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) and is_list(opts) do
-    runtime_info =
-      %{
-        worker_host: worker_host,
-        workspace_path: workspace,
-        execution_token: Keyword.get(opts, :execution_token),
-        execution_session_id: Keyword.get(opts, :execution_session_id)
-      }
-      |> maybe_put_runtime_head(Workspace.current_head(workspace, worker_host))
-
-    send(recipient, {:worker_runtime_info, issue_id, runtime_info})
+    if execution_fence_preflight(opts) == :ok do
+      send_authorized_worker_runtime_info(recipient, issue_id, worker_host, workspace, opts)
+    end
 
     :ok
   end
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
+
+  defp send_authorized_worker_runtime_info(recipient, issue_id, worker_host, workspace, opts) do
+    with {:ok, observed} <- observed_repository_info(workspace, worker_host, opts),
+         :ok <- execution_fence_preflight(opts) do
+      runtime_info =
+        Map.merge(observed, %{
+          worker_host: worker_host,
+          workspace_path: workspace,
+          execution_token: Keyword.get(opts, :execution_token),
+          execution_session_id: Keyword.get(opts, :execution_session_id)
+        })
+
+      send(recipient, {:worker_runtime_info, issue_id, runtime_info})
+    end
+
+    :ok
+  end
+
+  defp observed_repository_info(workspace, worker_host, opts) do
+    case Keyword.get(opts, :execution_checkout) do
+      nil -> {:ok, maybe_put_runtime_head(%{}, Workspace.current_head(workspace, worker_host))}
+      identity -> ManagedCheckout.verify(workspace, identity)
+    end
+  end
 
   defp maybe_put_runtime_head(runtime_info, {:ok, head}),
     do: Map.put(runtime_info, :head, head)
@@ -198,10 +244,12 @@ defmodule SymphonyElixir.AgentRunner do
     Include this routing evidence in the Linear implementation handoff comment.
 
     #{PromptBuilder.build_prompt(issue, opts)}
+
+    #{managed_checkout_guidance(opts)}
     """
   end
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns, _route) do
+  defp build_turn_prompt(_issue, opts, turn_number, max_turns, _route) do
     """
     Continuation guidance:
 
@@ -210,7 +258,28 @@ defmodule SymphonyElixir.AgentRunner do
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+
+    #{managed_checkout_guidance(opts)}
     """
+  end
+
+  defp managed_checkout_guidance(opts) do
+    case Keyword.get(opts, :execution_checkout) do
+      nil ->
+        ""
+
+      identity ->
+        """
+        Managed checkout authority for this execution:
+        The runtime prepared and verified repository #{identity.repository}, workspace #{identity.worktree},
+        branch #{identity.branch}, issue #{identity.issue_id}, generation #{identity.generation}.
+        Work only in that workspace and branch. Branch creation, switching and retry workspace replacement
+        belong to the runtime; generic workflow instructions to create or change a branch do not apply.
+        Preserve .git/symphony-execution.json. If checkout identity disagrees, stop and report the mismatch.
+        Commit and push useful changes on the prepared branch. A closed or merged PR requires runtime
+        reconciliation; do not create a replacement branch or repair another generation in place.
+        """
+    end
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

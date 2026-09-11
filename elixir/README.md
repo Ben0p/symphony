@@ -218,6 +218,29 @@ with delays of 5, 10, 20, 40, and at most 60 seconds; requests have a five-secon
 and a 30-second response deadline to accommodate the provider's current native prerequisite check.
 Each retry signs a fresh timestamp with the same nonce and authority tuple.
 
+Managed local source preparation consumes the checkout created by `hooks.after_create`.
+The hook must leave a full clone on clean `main`, with `HEAD` equal to the captured `origin/main`
+and an exact `https://github.com/<owner>/<repository>.git` origin matching the execution record.
+The clone must include all remote branch refs; shallow/single-branch clones are rejected.
+Bootstrap dependencies without modifying checkout contents. The runtime creates the exact fenced
+task branch only if neither its local nor captured remote ref exists. It performs no additional
+network access and does not reset, force-switch or repair a retained checkout. The workspace root
+must already exist. Linked Git worktrees, path aliases and remote worker hosts are unsupported.
+
+An exclusively created `.git/symphony-execution.json` binds repository, canonical workspace, branch,
+issue, generation, session and initial commit. Same-generation continuation may retain dirty work
+and descendant commits. Missing, partial, mismatched or noncanonical markers require recovery.
+The marker file is synced and read back; directory-entry power-loss durability is not claimed.
+Before-run hooks, Codex startup, turns and guarded tool boundaries compare actual checkout identity
+as well as current execution authority. Runtime observations report the verified branch and head.
+The runtime appends the exact prepared identity to each worker turn; generic workflow branch-creation
+instructions do not override that identity. A new branch or generation requires runtime admission.
+
+Git probes use explicit arguments, a 15-second deadline and 64 KiB output limit. Timeout or overflow
+fails the attempt; a closed port alone is not evidence that its OS child terminated. Unconfirmed
+termination requires host process reconciliation before signed cleanup or reuse. These checkout
+checks preserve identity and recovery state; they are not an OS isolation boundary.
+
 A deterministic provider rejection, exhausted budget, missing/corrupt journal, changed authority,
 or recorded spawn attempt requires reconciliation and preserves the fence. Legacy journal entries
 without a spawn marker cannot prove that no worker started. Old provider claims whose local

@@ -76,6 +76,13 @@ retries and restarts. A larger configured ceiling does not enlarge a smaller gra
 mismatched bound authority stops running work; changing the manifest cannot widen an active lease.
 Unmanaged workflows may use zero to disable the optional cumulative cap.
 
+Managed source runs receive a runtime-prepared repository/workspace/branch identity in each turn.
+That identity takes precedence over generic branch-creation and restart instructions below.
+Do not switch branches, replace the workspace or edit `.git/symphony-execution.json`; report an
+identity conflict or a closed/merged branch PR for runtime reconciliation. A managed `after_create`
+hook must leave the full clean clone described in `README.md`; the sample shallow clone above is
+for the unmanaged reference workflow and must be replaced before managed qualification.
+
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}

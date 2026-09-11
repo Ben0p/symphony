@@ -17,6 +17,10 @@ and workspace cleanup. See [elixir/README.md](elixir/README.md) for the host env
 Recovery archives retain junctions and symbolic links as verified metadata, without following their
 targets or requiring link-creation privileges on the archive host.
 
+Before managed source execution, the local runtime prepares the authorized task branch and verifies
+the actual checkout against the execution generation. Conflicting retained work is preserved for
+recovery. Worker prompts receive the prepared identity; branch preparation belongs to the runtime.
+
 An enforced managed pool can consume a digest-pinned, operator-issued delegation manifest.
 It creates responsibility only for the exact freshly eligible issue, through the existing graph
 owner, and keeps successor admission behind predecessor cleanup and provider claims. A ready label
