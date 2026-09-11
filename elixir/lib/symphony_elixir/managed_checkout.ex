@@ -115,6 +115,10 @@ defmodule SymphonyElixir.ManagedCheckout do
     with {:ok, %File.Stat{type: :directory}} <- File.lstat(git),
          :ok <- absent(Path.join(git, "commondir")),
          :ok <- absent(Path.join(git, "gitdir")),
+         {:ok, %File.Stat{type: :directory}} <- File.lstat(Path.join(git, "objects")),
+         {:ok, %File.Stat{type: :directory}} <- File.lstat(Path.join(git, "objects/info")),
+         :ok <- absent(Path.join(git, "objects/info/alternates")),
+         :ok <- absent(Path.join(git, "objects/info/http-alternates")),
          :ok <- expect(workspace, ["rev-parse", "--show-toplevel"], workspace),
          :ok <- expect(workspace, ["rev-parse", "--absolute-git-dir"], git),
          :ok <- expect(workspace, ["config", "--get", "remote.origin.url"], "https://github.com/#{repository}.git") do
