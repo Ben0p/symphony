@@ -241,14 +241,14 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   def release_runtime_lease(_state, _delegation_id, _runtime_lease, _now_ms),
     do: {:error, :invalid_runtime_lease_release}
 
-  @doc "Marks active delegations expired when their bounded lease has elapsed."
+  @doc "Expires active or restart-blocked authority without releasing runtime leases."
   @spec reconcile(state(), non_neg_integer()) :: {:ok, state(), map()} | {:error, term()}
   def reconcile(state, now_ms) when is_integer(now_ms) and now_ms >= 0 do
     with :ok <- validate_state(state) do
       expired_ids =
         state.delegations
         |> Enum.filter(fn {_id, delegation} ->
-          delegation.status == :active and delegation.expires_at_ms <= now_ms
+          expirable_for_reconcile?(delegation) and delegation.expires_at_ms <= now_ms
         end)
         |> Enum.map(&elem(&1, 0))
         |> Enum.sort()
@@ -262,13 +262,15 @@ defmodule SymphonyElixir.ResponsibilityGraph do
           |> append_event(:expired, delegation_id, now_ms, %{})
         end)
 
-      {:ok, next_state, %{expired: expired_ids}}
+      with :ok <- validate_state(next_state) do
+        {:ok, next_state, %{expired: expired_ids}}
+      end
     end
   end
 
   def reconcile(_state, _now_ms), do: {:error, :invalid_reconciliation}
 
-  @doc "Re-opens a restart-blocked delegation after its runtime lease is reconciled."
+  @doc "Re-opens unexpired restart-blocked authority with its exact persisted runtime lease."
   @spec reconcile_delegation(state(), String.t(), map() | nil, non_neg_integer()) ::
           {:ok, state()} | {:error, term()}
   def reconcile_delegation(state, delegation_id, runtime_lease, now_ms)
@@ -276,9 +278,12 @@ defmodule SymphonyElixir.ResponsibilityGraph do
     with :ok <- validate_state(state),
          {:ok, delegation} <- fetch_delegation(state, delegation_id),
          :ok <- blocked_for_restart(delegation),
-         :ok <- parent_available_for_reconcile(state, delegation),
+         :ok <- not_expired(delegation, now_ms),
+         :ok <- reconcile_clock_is_monotonic(delegation, now_ms),
+         :ok <- parent_available_for_reconcile(state, delegation, now_ms),
          :ok <- validate_reconciled_runtime_lease(delegation, runtime_lease),
-         :ok <- runtime_lease_matches_scope?(delegation, runtime_lease) do
+         :ok <- runtime_lease_matches_scope?(delegation, runtime_lease),
+         :ok <- persisted_runtime_lease_matches?(delegation, runtime_lease) do
       updated = %{
         delegation
         | runtime_lease: runtime_lease,
@@ -287,10 +292,14 @@ defmodule SymphonyElixir.ResponsibilityGraph do
           last_heartbeat_at: now_ms
       }
 
-      {:ok,
-       state
-       |> put_in([:delegations, delegation_id], updated)
-       |> append_event(:reconciled, delegation_id, now_ms, %{})}
+      next_state =
+        state
+        |> put_in([:delegations, delegation_id], updated)
+        |> append_event(:reconciled, delegation_id, now_ms, %{})
+
+      with :ok <- validate_state(next_state) do
+        {:ok, next_state}
+      end
     end
   end
 
@@ -784,11 +793,20 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   defp blocked_for_restart(%{status: :blocked, blocked_on: :restart_reconciliation}), do: :ok
   defp blocked_for_restart(_delegation), do: {:error, :delegation_not_restart_blocked}
 
-  defp parent_available_for_reconcile(_state, %{parent_delegation_id: nil}), do: :ok
+  defp expirable_for_reconcile?(%{status: :active}), do: true
+  defp expirable_for_reconcile?(%{status: :blocked, blocked_on: :restart_reconciliation}), do: true
+  defp expirable_for_reconcile?(_delegation), do: false
 
-  defp parent_available_for_reconcile(state, %{parent_delegation_id: parent_id}) do
+  defp reconcile_clock_is_monotonic(%{last_heartbeat_at: last_heartbeat_at}, now_ms) when now_ms < last_heartbeat_at,
+    do: {:error, :delegation_clock_regression}
+
+  defp reconcile_clock_is_monotonic(_delegation, _now_ms), do: :ok
+
+  defp parent_available_for_reconcile(_state, %{parent_delegation_id: nil}, _now_ms), do: :ok
+
+  defp parent_available_for_reconcile(state, %{parent_delegation_id: parent_id}, now_ms) do
     case Map.get(state.delegations, parent_id) do
-      %{status: :active} -> :ok
+      %{status: :active} = parent -> not_expired(parent, now_ms)
       _ -> {:error, :parent_not_reconciled}
     end
   end
@@ -878,6 +896,9 @@ defmodule SymphonyElixir.ResponsibilityGraph do
 
   defp validate_reconciled_runtime_lease(%{role: role}, nil) when role not in [:responsible, :reviewer], do: :ok
   defp validate_reconciled_runtime_lease(_delegation, lease), do: validate_runtime_lease(lease)
+
+  defp persisted_runtime_lease_matches?(%{runtime_lease: lease}, lease), do: :ok
+  defp persisted_runtime_lease_matches?(_delegation, _lease), do: {:error, :runtime_lease_conflict}
 
   defp runtime_lease_matches_scope?(delegation, lease) do
     if is_nil(lease) or (lease.issue_id == delegation.scope.issue_id and lease.repository == delegation.scope.repository) do

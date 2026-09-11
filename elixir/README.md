@@ -274,6 +274,13 @@ request fresh authority for the same useful issue. A cleaned failed attempt can
 reconcile its restart-blocked accountable delegation only after its responsible
 runtime lease is released; current authorization and normal admission still apply.
 
+Restart reconciliation requires an unexpired delegation, a nondecreasing heartbeat,
+an active unexpired parent, and the exact persisted runtime lease. Public graph
+reconciliation expires both active and restart-blocked authority at the original
+expiry boundary while retaining its clocks, budget, history and runtime identity.
+Expiry does not prove worker termination, release execution fences or provider
+reservations, clean a workspace, renew a budget, or authorize another attempt.
+
 To enable this managed runtime on a Linux runner, the host must provide the complete tuple below;
 the service rejects a partial tuple during supervisor startup and leaves the adapter disabled when
 all five values are absent. A host that declares `SYMPHONY_POOL_KEY` or
