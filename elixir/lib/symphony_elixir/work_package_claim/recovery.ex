@@ -14,7 +14,7 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
 
       %{status: :terminal, cleanup: :cleaned, terminal: %{state: "Failed attempt"}} = execution ->
         with :new <- completed_claim(runtime, issue.id, execution) do
-          prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms)
+          prepare_terminal_failed_claim(runtime, fence, graph, issue, attempt, execution, now_ms)
         end
 
       %{status: :terminal, cleanup: :cleaned} = execution ->
@@ -39,6 +39,87 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
       :submitted -> recover(runtime, fence, graph, issue, attempt, now_ms, execution)
       result -> result
     end
+  end
+
+  defp prepare_terminal_failed_claim(runtime, fence, graph, issue, attempt, execution, now_ms) do
+    with {:ok, journal} <- load_journal(runtime),
+         key = reservation_key(runtime, issue.id, execution),
+         %{responsible_delegation_id: prior_id} <- journal.reservations[key],
+         %{entries: entries} <- runtime[:managed_delegations],
+         entry when is_map(entry) <- Enum.find(entries, &(&1.issue_id == issue.id)) do
+      if prior_id == entry.responsible.id do
+        prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms)
+      else
+        prepare_distinct_failed_claim(
+          runtime,
+          fence,
+          graph,
+          issue,
+          attempt,
+          execution,
+          now_ms,
+          {prior_id, entry}
+        )
+      end
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :claim_abandonment_responsibility_changed}
+    end
+  end
+
+  defp prepare_distinct_failed_claim(runtime, fence, graph, issue, attempt, execution, now_ms, {prior_id, entry}) do
+    with nil <- graph.delegations[entry.accountable.id],
+         nil <- graph.delegations[entry.responsible.id],
+         true <- expired_previous_pair?(graph, prior_id, entry, issue, execution, now_ms),
+         :ok <-
+           ExecutionFence.validate_cleanup(
+             fence,
+             %{issue_id: issue.id, generation: execution.generation},
+             execution.terminal.accepted_head
+           ),
+         {:ok, candidate} <-
+           Admission.prepare(graph, fence, runtime.managed_delegations, issue, attempt, now_ms, runtime) do
+      {:new, candidate}
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :claim_abandonment_responsibility_changed}
+    end
+  end
+
+  defp expired_previous_pair?(graph, prior_id, entry, issue, execution, now_ms) do
+    with %{
+           id: ^prior_id,
+           role: :responsible,
+           status: :expired,
+           runtime_lease: nil,
+           parent_delegation_id: parent
+         } = responsible <-
+           graph.delegations[prior_id],
+         %{
+           id: ^parent,
+           role: :accountable,
+           status: :expired,
+           runtime_lease: nil,
+           parent_delegation_id: nil
+         } = accountable <-
+           graph.delegations[parent],
+         true <- is_integer(responsible.expires_at_ms) and responsible.expires_at_ms <= now_ms,
+         true <- is_integer(accountable.expires_at_ms) and accountable.expires_at_ms <= now_ms do
+      previous_pair_matches_claim?(responsible, accountable, entry, issue, execution)
+    else
+      _ -> false
+    end
+  end
+
+  defp previous_pair_matches_claim?(responsible, accountable, entry, issue, execution) do
+    accountable.actor_id == entry.owner_id and
+      entry.owner_id == issue.assignee_id and
+      responsible.actor_id == entry.responsible.actor_id and
+      responsible.scope == accountable.scope and
+      responsible.scope == entry.responsible.scope and
+      entry.responsible.scope == entry.accountable.scope and
+      responsible.scope.issue_id == issue.id and
+      responsible.scope.repository == execution.repository
   end
 
   defp prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms) do

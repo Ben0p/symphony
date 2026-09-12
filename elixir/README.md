@@ -279,6 +279,12 @@ receipt acknowledgements before using a supported failed-attempt recovery to
 request fresh authority for the same useful issue. A cleaned failed attempt can
 reconcile its restart-blocked accountable delegation only after its responsible
 runtime lease is released; current authorization and normal admission still apply.
+When a current manifest names a distinct pair, failed-attempt recovery accepts it
+only after verified terminal cleanup and expiry of the previous, lease-free pair.
+Both new IDs must be absent, and the owner, runner and scope must match the old
+authority. Normal admission creates the new pair; the old graph records, claim
+journal and fenced generation history remain intact. Existing same-ID recovery
+and signed pre-spawn abandonment keep their original checks.
 
 Restart reconciliation requires an unexpired delegation, a nondecreasing heartbeat,
 an active unexpired parent, and the exact persisted runtime lease. Public graph
