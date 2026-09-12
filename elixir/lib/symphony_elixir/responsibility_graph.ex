@@ -225,12 +225,7 @@ defmodule SymphonyElixir.ResponsibilityGraph do
           {:ok, state, :already_released}
 
         ^runtime_lease ->
-          updated = %{delegation | runtime_lease: nil, last_heartbeat_at: now_ms}
-
-          {:ok,
-           state
-           |> put_in([:delegations, delegation_id], updated)
-           |> append_event(:runtime_lease_released, delegation_id, now_ms, %{}), :released}
+          release_bound_runtime_lease(state, delegation_id, delegation, now_ms)
 
         _other ->
           {:error, :runtime_lease_conflict}
@@ -240,6 +235,18 @@ defmodule SymphonyElixir.ResponsibilityGraph do
 
   def release_runtime_lease(_state, _delegation_id, _runtime_lease, _now_ms),
     do: {:error, :invalid_runtime_lease_release}
+
+  defp release_bound_runtime_lease(state, delegation_id, delegation, now_ms) do
+    with :ok <- reconcile_clock_is_monotonic(delegation, now_ms),
+         updated <- %{delegation | runtime_lease: nil},
+         next_state <-
+           state
+           |> put_in([:delegations, delegation_id], updated)
+           |> append_event(:runtime_lease_released, delegation_id, now_ms, %{}),
+         :ok <- validate_state(next_state) do
+      {:ok, next_state, :released}
+    end
+  end
 
   @doc "Expires active or restart-blocked authority without releasing runtime leases."
   @spec reconcile(state(), non_neg_integer()) :: {:ok, state(), map()} | {:error, term()}

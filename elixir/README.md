@@ -281,6 +281,11 @@ expiry boundary while retaining its clocks, budget, history and runtime identity
 Expiry does not prove worker termination, release execution fences or provider
 reservations, clean a workspace, renew a budget, or authorize another attempt.
 
+Releasing an exact runtime lease from an active delegation preserves its heartbeat
+and expiry, including when cleanup occurs after expiry. The release event records
+the actual time; it does not renew authority. Already expired or revoked delegation
+statuses remain ineligible for this release operation.
+
 To enable this managed runtime on a Linux runner, the host must provide the complete tuple below;
 the service rejects a partial tuple during supervisor startup and leaves the adapter disabled when
 all five values are absent. A host that declares `SYMPHONY_POOL_KEY` or

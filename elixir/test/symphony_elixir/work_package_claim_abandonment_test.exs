@@ -31,7 +31,8 @@ defmodule SymphonyElixir.WorkPackageClaimAbandonmentTest do
         {:ok, admitted, token, session, delegation, lease} = Orchestrator.admit_execution_for_test(current, issue, nil)
         {:ok, fence, _} = ExecutionFence.release(admitted.execution_fence, token, session, :spawn_failed)
         graph = admitted.responsibility_graph
-        {:ok, released, _} = ResponsibilityGraph.release_runtime_lease(graph, delegation, lease, now)
+        release_now = System.system_time(:millisecond)
+        {:ok, released, _} = ResponsibilityGraph.release_runtime_lease(graph, delegation, lease, release_now)
         %{admitted | execution_fence: fence, responsibility_graph: released}
       end)
 
