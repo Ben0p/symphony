@@ -21,6 +21,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     "DAHLIA_WORK_PACKAGE_CLAIM_TOKEN",
     "DAHLIA_CLEANUP_ATTESTATION_KEY"
   ]
+  @managed_checkout_timer_key {__MODULE__, :managed_checkout_timer}
+  @managed_checkout_timer_interval_ms 1_000
+
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -33,6 +36,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           worker_host: String.t() | nil,
           dynamic_tool_binding: map(),
           execution_fence_guard: (-> term()) | nil,
+          managed_checkout_timer_enabled: boolean(),
           model_route: map(),
           execution_supervisor: ExecutionSupervisor.identity() | nil
         }
@@ -64,6 +68,10 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     dynamic_tool_binding = DynamicTool.bind()
     execution_fence_guard = Keyword.get(opts, :execution_fence_guard)
+    managed_checkout_timer_enabled =
+      not is_nil(Keyword.get(opts, :execution_checkout)) and
+        is_function(execution_fence_guard, 0)
+
     execution_supervisor = Keyword.get(opts, :execution_supervisor)
     execution_supervisor_recorder = Keyword.get(opts, :execution_supervisor_recorder)
     secret_environment_names = secret_environment_names(Keyword.get(opts, :secret_environment_names, []))
@@ -90,7 +98,8 @@ defmodule SymphonyElixir.Codex.AppServer do
             execution_fence_guard,
             model_route,
             captured_supervisor,
-            execution_supervisor_recorder
+            execution_supervisor_recorder,
+            managed_checkout_timer_enabled
           )
 
         {:error, reason, captured_supervisor} ->
@@ -103,7 +112,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp record_and_start_session(port, workspace, worker_host, binding, guard, route, supervisor, recorder) do
+  defp record_and_start_session(port, workspace, worker_host, binding, guard, route, supervisor, recorder, managed_checkout_timer_enabled) do
     case record_execution_supervisor(supervisor, recorder) do
       :ok ->
         start_session_on_port(
@@ -113,7 +122,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           binding,
           guard,
           route,
-          supervisor
+          supervisor,
+          managed_checkout_timer_enabled
         )
 
       {:error, reason} = error ->
@@ -138,7 +148,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          dynamic_tool_binding,
          execution_fence_guard,
          model_route,
-         execution_supervisor
+         execution_supervisor,
+         managed_checkout_timer_enabled
        ) do
     metadata = port_metadata(port, worker_host)
 
@@ -159,6 +170,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          worker_host: worker_host,
          dynamic_tool_binding: dynamic_tool_binding,
          execution_fence_guard: execution_fence_guard,
+         managed_checkout_timer_enabled: managed_checkout_timer_enabled,
          model_route: model_route,
          execution_supervisor: execution_supervisor
        }}
@@ -194,7 +206,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: thread_id,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding,
-          execution_fence_guard: session_execution_fence_guard
+          execution_fence_guard: session_execution_fence_guard,
+          managed_checkout_timer_enabled: managed_checkout_timer_enabled
         },
         prompt,
         issue,
@@ -224,7 +237,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         metadata
       )
 
-      case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, execution_fence_guard) do
+      case await_turn_completion(
+             port,
+             on_message,
+             tool_executor,
+             auto_approve_requests,
+             execution_fence_guard,
+             managed_checkout_timer_enabled and is_function(execution_fence_guard, 0)
+           ) do
         {:ok, result} ->
           Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -593,19 +613,151 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, execution_fence_guard) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         execution_fence_guard,
+         managed_checkout_timer_enabled
+       ) do
+    timeout_ms = Config.settings!().codex.turn_timeout_ms
+
+    receive_fun = fn ->
+      receive_loop(
+        port,
+        on_message,
+        timeout_ms,
+        "",
+        tool_executor,
+        auto_approve_requests,
+        execution_fence_guard
+      )
+    end
+
+    if managed_checkout_timer_enabled do
+      with_managed_checkout_timer(timeout_ms, receive_fun)
+    else
+      receive_fun.()
+    end
+  end
+
+  defp with_managed_checkout_timer(timeout_ms, receive_fun) do
+    start_managed_checkout_timer(timeout_ms)
+
+    try do
+      receive_fun.()
+    after
+      stop_managed_checkout_timer()
+    end
+  end
+
+  defp start_managed_checkout_timer(timeout_ms) do
+    state = %{
+      tag: make_ref(),
+      timer_ref: nil,
+      deadline_ms: monotonic_milliseconds() + timeout_ms
+    }
+
+    Process.put(@managed_checkout_timer_key, state)
+    schedule_managed_checkout_timer()
+  end
+
+  defp schedule_managed_checkout_timer do
+    case Process.get(@managed_checkout_timer_key) do
+      %{tag: tag} = state ->
+        timer_ref =
+          Process.send_after(
+            self(),
+            {:symphony_managed_checkout_tick, tag},
+            @managed_checkout_timer_interval_ms
+          )
+
+        Process.put(@managed_checkout_timer_key, %{state | timer_ref: timer_ref})
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp stop_managed_checkout_timer do
+    case Process.get(@managed_checkout_timer_key) do
+      %{tag: tag, timer_ref: timer_ref} ->
+        if is_reference(timer_ref) do
+          Process.cancel_timer(timer_ref, async: false, info: true)
+        end
+
+        drain_managed_checkout_timer_messages(tag)
+        Process.delete(@managed_checkout_timer_key)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp drain_managed_checkout_timer_messages(tag) do
+    receive do
+      {:symphony_managed_checkout_tick, ^tag} ->
+        drain_managed_checkout_timer_messages(tag)
+    after
+      0 ->
+        :ok
+    end
+  end
+
+  defp managed_checkout_timer_tag do
+    case Process.get(@managed_checkout_timer_key) do
+      %{tag: tag} -> tag
+      _ -> nil
+    end
+  end
+
+  defp touch_managed_checkout_deadline(timeout_ms) do
+    case Process.get(@managed_checkout_timer_key) do
+      %{deadline_ms: _deadline_ms} = state ->
+        Process.put(
+          @managed_checkout_timer_key,
+          %{state | deadline_ms: monotonic_milliseconds() + timeout_ms}
+        )
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp remaining_receive_timeout_ms(timeout_ms) do
+    case Process.get(@managed_checkout_timer_key) do
+      %{deadline_ms: deadline_ms} ->
+        max(deadline_ms - monotonic_milliseconds(), 0)
+
+      _ ->
+        timeout_ms
+    end
+  end
+
+  defp monotonic_milliseconds, do: System.monotonic_time(:millisecond)
+
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, execution_fence_guard) do
     receive_loop(
       port,
       on_message,
-      Config.settings!().codex.turn_timeout_ms,
-      "",
+      timeout_ms,
+      pending_line,
       tool_executor,
       auto_approve_requests,
-      execution_fence_guard
+      execution_fence_guard,
+      :reset
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, execution_fence_guard) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, execution_fence_guard, deadline_mode) do
+    if deadline_mode == :reset do
+      touch_managed_checkout_deadline(timeout_ms)
+    end
+
+    timer_tag = managed_checkout_timer_tag()
+    wait_timeout_ms = remaining_receive_timeout_ms(timeout_ms)
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
@@ -622,10 +774,38 @@ defmodule SymphonyElixir.Codex.AppServer do
           execution_fence_guard
         )
 
+      {:symphony_managed_checkout_tick, ^timer_tag} when is_reference(timer_tag) ->
+        if remaining_receive_timeout_ms(timeout_ms) <= 0 do
+          {:error, :turn_timeout}
+        else
+          case execution_fence_preflight(execution_fence_guard) do
+            :ok ->
+              if remaining_receive_timeout_ms(timeout_ms) <= 0 do
+                {:error, :turn_timeout}
+              else
+                schedule_managed_checkout_timer()
+
+                receive_loop(
+                  port,
+                  on_message,
+                  timeout_ms,
+                  pending_line,
+                  tool_executor,
+                  auto_approve_requests,
+                  execution_fence_guard,
+                  :preserve
+                )
+              end
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end
+
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
+      wait_timeout_ms ->
         {:error, :turn_timeout}
     end
   end

@@ -234,6 +234,207 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "managed checkout timer does not extend turn inactivity timeout" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-timer-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-TIMER-TIMEOUT")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-timer-timeout"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-timer-timeout"}}}'
+            sleep 1.5
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 1_250
+      )
+
+      issue = %Issue{
+        id: "issue-managed-timer-timeout",
+        identifier: "MT-TIMER-TIMEOUT",
+        title: "Managed timer timeout",
+        description: "Keep the existing inactivity deadline across private timer ticks",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-TIMER-TIMEOUT",
+        labels: []
+      }
+
+      assert {:error, :turn_timeout} =
+               AppServer.run(workspace, "Stay silent", issue,
+                 execution_checkout: %{},
+                 execution_fence_guard: fn -> :ok end
+               )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "managed checkout timer preserves a partial turn-stream line" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-timer-partial-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-TIMER-PARTIAL")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-timer-partial"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-timer-partial"}}}'
+            printf '%s' '{"method":"item/updated","params":{"item":{"id":"timer-partial","padding":"'
+            head -c 1100000 /dev/zero | tr '\\000' 'a'
+            sleep 1.2
+            printf '%s\\n' '"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 5_000
+      )
+
+      issue = %Issue{
+        id: "issue-managed-timer-partial",
+        identifier: "MT-TIMER-PARTIAL",
+        title: "Managed timer partial line",
+        description: "Retain pending app-server bytes across a private timer tick",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-TIMER-PARTIAL",
+        labels: []
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:managed_timer_message, message}) end
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Stream a partial line", issue,
+                 execution_checkout: %{},
+                 execution_fence_guard: fn -> :ok end,
+                 on_message: on_message
+               )
+
+      assert_received {:managed_timer_message,
+                       %{
+                         event: :notification,
+                         payload: %{
+                           "method" => "item/updated",
+                           "params" => %{"item" => %{"id" => "timer-partial"}}
+                         }
+                       }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "managed checkout timer stops the turn when its guard is revoked" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-timer-revoked-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-TIMER-REVOKED")
+      codex_binary = Path.join(test_root, "fake-codex")
+      revoked = Path.join(test_root, "revoked")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-timer-revoked"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-timer-revoked"}}}'
+            printf revoked > #{quote_path(revoked)}
+            sleep 3
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 5_000
+      )
+
+      issue = %Issue{
+        id: "issue-managed-timer-revoked",
+        identifier: "MT-TIMER-REVOKED",
+        title: "Managed timer revocation",
+        description: "Stop a silent turn when managed checkout authority is revoked",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-TIMER-REVOKED",
+        labels: []
+      }
+
+      guard = fn -> if File.exists?(revoked), do: {:error, :terminal_fenced}, else: :ok end
+
+      assert {:error, :terminal_fenced} =
+               AppServer.run(workspace, "Wait for revocation", issue,
+                 execution_checkout: %{},
+                 execution_fence_guard: guard
+               )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server passes explicit turn sandbox policies through unchanged" do
     test_root =
       Path.join(

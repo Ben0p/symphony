@@ -162,6 +162,7 @@ defmodule SymphonyElixir.AgentRunnerManagedCheckoutTest do
     assert_receive {:worker_runtime_info, "checkout-launch", %{branch: ^expected_branch, head: _}}
     assert_receive {:worker_runtime_info, "checkout-launch", %{branch: ^expected_branch, head: ^final_head}}
     refute_receive {:silent_checkpoint, _}, 1_200
+    refute_received {:symphony_managed_checkout_tick, _}
   end
 
   test "a before-run hook changing the branch never launches Codex or runs the after hook", ctx do
