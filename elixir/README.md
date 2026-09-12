@@ -112,6 +112,12 @@ observation cursor without credit; unchanged HEADs do neither. Rewritten history
 observations and rejected checkpoints hold the attempt through its final hooks.
 
 The existing worker process performs bounded Git reads before its next authorized tool.
+During a managed checkout turn it also performs the same wrapped preflight on a private
+one-second timer while Codex is silent. Timer ticks consume the current pending inactivity
+deadline; external stream messages continue to reset the full sliding timeout. A tick is
+rearmed only after a successful preflight, and the latest timer is synchronously canceled
+and drained when the turn exits. Timer messages carry a per-turn reference and do not
+affect unmanaged callers or later turns.
 The orchestrator receives a synchronous checkpoint bound to the actual caller, current
 generation, session, repository, workspace and branch. It updates only the durable baseline
 to currently reported cumulative usage. Later usage remains chargeable; neither historical

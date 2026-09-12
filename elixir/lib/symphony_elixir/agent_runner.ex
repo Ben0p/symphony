@@ -197,6 +197,7 @@ defmodule SymphonyElixir.AgentRunner do
       worker_host: worker_host,
       model_route: route,
       execution_fence_guard: Keyword.get(opts, :execution_fence_guard),
+      execution_checkout: Keyword.get(opts, :execution_checkout),
       execution_supervisor: Keyword.get(opts, :execution_supervisor),
       execution_supervisor_recorder: Keyword.get(opts, :execution_supervisor_recorder),
       secret_environment_names: Keyword.get(opts, :secret_environment_names, [])

@@ -86,6 +86,85 @@ defmodule SymphonyElixir.AgentRunnerManagedCheckoutTest do
     assert prompt =~ "generic workflow instructions to create or change a branch do not apply"
   end
 
+  test "silent turn stays alive until observed durable checkout progress", ctx do
+    root = Path.dirname(ctx.trace)
+    ack = Path.join(root, "silent-turn-ack")
+    executable = Path.join(root, "silent-turn-codex")
+
+    File.write!(executable, """
+    #!/bin/sh
+    count=0
+    while IFS= read -r _line; do
+      count=$((count + 1))
+      case "$count" in
+        1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        2) ;;
+        3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"silent-thread"}}}' ;;
+        4)
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"silent-turn"}}}'
+          git config user.name "Silent turn fixture"
+          git config user.email silent@example.invalid
+          printf native > native.txt
+          git add native.txt && git commit -m observed >/dev/null 2>&1
+          waited=0
+          while [ ! -f #{quote_path(ack)} ] && [ "$waited" -lt 100 ]; do
+            sleep 0.05
+            waited=$((waited + 1))
+          done
+          [ -f #{quote_path(ack)} ] || exit 41
+          printf '%s\\n' '{"method":"turn/completed"}'
+          exit 0
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(executable, 0o755)
+
+    workflow =
+      Keyword.merge(ctx.workflow,
+        codex_command: "#{quote_path(executable)} app-server",
+        codex_turn_timeout_ms: 5_000
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(), workflow)
+    identity = ctx.identity
+    expected_branch = identity.branch
+
+    assert :ok =
+             AgentRunner.run(ctx.issue, self(),
+               execution_checkout: identity,
+               execution_fence_guard: fn -> :ok end,
+               execution_session_id: identity.session_id,
+               execution_checkout_checkpoint: fn checkpoint ->
+                 send(self(), {:silent_checkpoint, checkpoint})
+                 if checkpoint.kind == :durable, do: File.write!(ack, "durable")
+                 :ok
+               end,
+               issue_state_fetcher: fn [_id] -> {:ok, [%{ctx.issue | state: "Done"}]} end
+             )
+
+    assert_receive {:silent_checkpoint, baseline}
+    assert baseline.kind == :baseline
+    assert baseline.sequence == 0
+    assert baseline.identity == identity
+    assert_receive {:silent_checkpoint, durable}
+    assert durable.kind == :durable
+    assert durable.sequence == 1
+    assert durable.previous_head == baseline.head
+    assert durable.identity == identity
+    assert durable.tree_changed
+    final_head = git(identity.worktree, ["rev-parse", "HEAD"])
+    assert durable.head == final_head
+    assert final_head != baseline.head
+    assert File.read!(Path.join(identity.worktree, "native.txt")) == "native"
+    assert File.read!(ack) == "durable"
+    assert_receive {:worker_runtime_info, "checkout-launch", %{branch: ^expected_branch, head: _}}
+    assert_receive {:worker_runtime_info, "checkout-launch", %{branch: ^expected_branch, head: ^final_head}}
+    refute_receive {:silent_checkpoint, _}, 1_200
+    refute_received {:symphony_managed_checkout_tick, _}
+  end
+
   test "a before-run hook changing the branch never launches Codex or runs the after hook", ctx do
     write_workflow_file!(
       Workflow.workflow_file_path(),
