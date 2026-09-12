@@ -68,6 +68,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     dynamic_tool_binding = DynamicTool.bind()
     execution_fence_guard = Keyword.get(opts, :execution_fence_guard)
+
     managed_checkout_timer_enabled =
       not is_nil(Keyword.get(opts, :execution_checkout)) and
         is_function(execution_fence_guard, 0)
