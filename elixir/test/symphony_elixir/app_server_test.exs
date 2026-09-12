@@ -2041,4 +2041,6 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  defp quote_path(path), do: "'" <> String.replace(path, "'", "'\\''") <> "'"
 end
