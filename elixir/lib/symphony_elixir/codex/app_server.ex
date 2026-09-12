@@ -96,11 +96,10 @@ defmodule SymphonyElixir.Codex.AppServer do
             expanded_workspace,
             worker_host,
             dynamic_tool_binding,
-            execution_fence_guard,
+            {execution_fence_guard, managed_checkout_timer_enabled},
             model_route,
             captured_supervisor,
-            execution_supervisor_recorder,
-            managed_checkout_timer_enabled
+            execution_supervisor_recorder
           )
 
         {:error, reason, captured_supervisor} ->
@@ -113,7 +112,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp record_and_start_session(port, workspace, worker_host, binding, guard, route, supervisor, recorder, managed_checkout_timer_enabled) do
+  defp record_and_start_session(port, workspace, worker_host, binding, {guard, managed_checkout_timer_enabled}, route, supervisor, recorder) do
     case record_execution_supervisor(supervisor, recorder) do
       :ok ->
         start_session_on_port(
