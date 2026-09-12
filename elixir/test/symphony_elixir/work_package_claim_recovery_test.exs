@@ -283,6 +283,67 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     assert Enum.any?(recovered.execution_fence.history, &(&1.generation == context.token.generation and &1.terminal.state == "Failed attempt"))
   end
 
+  test "real restart preserves expired authority while admitting a distinct manifest pair", context do
+    now = System.system_time(:millisecond)
+    cleaned = cleaned_failed_attempt(context)
+    graph = expired_old_pair(cleaned.responsibility_graph, context.delegation, now)
+    {:ok, manifest} = distinct_manifest(context.issue.id, now)
+    runtime = %{cleaned.work_package_runtime | managed_delegations: manifest}
+    :ok = ExecutionFence.Persistence.save(cleaned.execution_fence_path, cleaned.execution_fence)
+    :ok = ResponsibilityGraph.Persistence.save(cleaned.responsibility_graph_path, graph)
+    journal_before = File.read!(runtime.journal_path)
+    name = Module.concat(__MODULE__, "DistinctRestart#{System.unique_integer([:positive])}")
+    pid = start_supervised!({Orchestrator, name: name, work_package_runtime: runtime})
+    restarted = :sys.get_state(pid)
+
+    assert {:ok, recovered, token, session, "responsible-gen2", lease} =
+             Orchestrator.admit_execution_for_test(restarted, context.issue, nil)
+
+    assert token.generation == context.token.generation + 1
+    assert session != context.session
+    assert lease.generation == token.generation
+    assert recovered.responsibility_graph.delegations["responsible-gen2"].parent_delegation_id == "accountable-gen2"
+    assert Map.take(recovered.responsibility_graph.delegations, Map.keys(graph.delegations)) == restarted.responsibility_graph.delegations
+    assert Enum.take(recovered.responsibility_graph.events, -length(restarted.responsibility_graph.events)) == restarted.responsibility_graph.events
+    assert :ok = ResponsibilityGraph.validate(recovered.responsibility_graph)
+    assert File.read!(runtime.journal_path) == journal_before
+    assert recovered.execution_fence.history == [restarted.execution_fence.executions[context.issue.id] | restarted.execution_fence.history]
+    assert {:error, :stale_generation} = ExecutionFence.authorize(recovered.execution_fence, context.token, :commit)
+  end
+
+  test "distinct recovery rejects partial authority, old leases, expired grants and changed ownership", context do
+    now = System.system_time(:millisecond)
+    cleaned = cleaned_failed_attempt(context)
+    graph = expired_old_pair(cleaned.responsibility_graph, context.delegation, now)
+    {:ok, manifest} = distinct_manifest(context.issue.id, now)
+    entry = Enum.find(manifest.entries, &(&1.issue_id == context.issue.id))
+    runtime = %{cleaned.work_package_runtime | managed_delegations: manifest}
+    state = %{cleaned | work_package_runtime: runtime, responsibility_graph: graph}
+    {:ok, partial, _} = ResponsibilityGraph.delegate(graph, entry.accountable, now)
+    leased = put_in(graph, [:delegations, context.delegation, :runtime_lease], context.lease)
+    parent = graph.delegations[context.delegation].parent_delegation_id
+    accountable_leased = put_in(graph.delegations[parent].runtime_lease, context.lease)
+    {:ok, expired_new_manifest} = distinct_manifest(context.issue.id, now - 120_000)
+    {:ok, reused_parent} = distinct_manifest(context.issue.id, now, parent, "responsible-gen2")
+    {:ok, reused_responsible} = distinct_manifest(context.issue.id, now, "accountable-gen2", context.delegation)
+    missing = %{graph | delegations: Map.delete(graph.delegations, context.delegation)}
+    journal_before = File.read!(runtime.journal_path)
+
+    for {candidate, issue} <- [
+          {%{state | responsibility_graph: partial}, context.issue},
+          {%{state | responsibility_graph: leased}, context.issue},
+          {%{state | responsibility_graph: accountable_leased}, context.issue},
+          {%{state | responsibility_graph: missing}, context.issue},
+          {put_in(state.work_package_runtime.managed_delegations, expired_new_manifest), context.issue},
+          {put_in(state.work_package_runtime.managed_delegations, reused_parent), context.issue},
+          {put_in(state.work_package_runtime.managed_delegations, reused_responsible), context.issue},
+          {state, %{context.issue | assignee_id: "different-owner"}}
+        ] do
+      assert {:error, _} = Orchestrator.admit_execution_for_test(candidate, issue, nil)
+      assert File.read!(runtime.journal_path) == journal_before
+    end
+  end
+
   test "failed retry refuses changed responsibility and missing cleanup acknowledgement", context do
     cleaned = cleaned_failed_attempt(context)
     {:ok, graph} = ResponsibilityGraph.mark_unreconciled_after_restart(cleaned.responsibility_graph)
@@ -496,6 +557,38 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
              Orchestrator.admit_execution_for_test(admitted, context.issue, nil)
 
     assert File.read!(context.runtime.journal_path) == before
+  end
+
+  defp expired_old_pair(graph, responsible_id, now) do
+    parent_id = graph.delegations[responsible_id].parent_delegation_id
+
+    graph =
+      Enum.reduce([parent_id, responsible_id], graph, fn id, current ->
+        update_in(current.delegations[id], &Map.merge(&1, %{accepted_at_ms: now - 3, last_heartbeat_at: now - 2, expires_at_ms: now - 1}))
+      end)
+
+    {:ok, expired, %{expired: ids}} = ResponsibilityGraph.reconcile(graph, now)
+    assert Enum.sort(ids) == Enum.sort([parent_id, responsible_id])
+    assert :ok = ResponsibilityGraph.validate(expired)
+    expired
+  end
+
+  defp distinct_manifest(issue_id, now, accountable_id \\ "accountable-gen2", responsible_id \\ "responsible-gen2") do
+    raw = Fixture.payload(now)
+
+    entries =
+      Enum.map(raw["entries"], fn entry ->
+        if entry["issue_id"] == issue_id do
+          entry
+          |> put_in(["accountable", "id"], accountable_id)
+          |> put_in(["responsible", "id"], responsible_id)
+          |> put_in(["responsible", "parent_delegation_id"], accountable_id)
+        else
+          entry
+        end
+      end)
+
+    ManagedResponsibility.decode(%{raw | "entries" => entries}, Fixture.context(), now)
   end
 
   defp cleaned_failed_attempt(context) do
