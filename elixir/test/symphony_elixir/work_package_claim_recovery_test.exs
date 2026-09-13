@@ -336,8 +336,12 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
       assert Map.drop(current, [:status, :terminal_reason]) == Map.drop(previous, [:status, :terminal_reason])
     end
 
-    expiry_events = Enum.filter(recovered.responsibility_graph.events, &(&1.type == :expired))
-    assert Enum.sort(Enum.map(expiry_events, & &1.delegation_id)) == Enum.sort([parent, context.delegation])
+    expiry_events =
+      Enum.filter(recovered.responsibility_graph.events, fn event ->
+        (Map.get(event, :type) || Map.get(event, "type")) in [:expired, "expired"]
+      end)
+
+    assert Enum.sort(Enum.map(expiry_events, &(Map.get(&1, :delegation_id) || Map.get(&1, "delegation_id")))) == Enum.sort([parent, context.delegation])
     unrelated_ids = Map.keys(restarted.responsibility_graph.delegations) -- [parent, context.delegation]
     assert Map.take(recovered.responsibility_graph.delegations, unrelated_ids) == Map.take(restarted.responsibility_graph.delegations, unrelated_ids)
     assert {:ok, same_graph, %{expired: []}} = ResponsibilityGraph.reconcile(recovered.responsibility_graph, System.system_time(:millisecond))
