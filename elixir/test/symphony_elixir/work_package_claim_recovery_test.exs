@@ -311,6 +311,54 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     assert {:error, :stale_generation} = ExecutionFence.authorize(recovered.execution_fence, context.token, :commit)
   end
 
+  test "real restart reconciles elapsed prior authority before distinct recovery", context do
+    now = System.system_time(:millisecond)
+    cleaned = cleaned_failed_attempt(context)
+    graph = elapsed_old_pair(cleaned.responsibility_graph, context.delegation, now)
+    parent = graph.delegations[context.delegation].parent_delegation_id
+    assert Enum.all?([parent, context.delegation], &(graph.delegations[&1].status == :active))
+    {:ok, manifest} = distinct_manifest(context.issue.id, now)
+    runtime = %{cleaned.work_package_runtime | managed_delegations: manifest}
+    :ok = ExecutionFence.Persistence.save(cleaned.execution_fence_path, cleaned.execution_fence)
+    :ok = ResponsibilityGraph.Persistence.save(cleaned.responsibility_graph_path, graph)
+    journal_before = File.read!(runtime.journal_path)
+    name = Module.concat(__MODULE__, "ElapsedRestart#{System.unique_integer([:positive])}")
+    pid = start_supervised!({Orchestrator, name: name, work_package_runtime: runtime})
+    restarted = :sys.get_state(pid)
+
+    assert {:ok, recovered, token, _session, "responsible-gen2", _lease} =
+             Orchestrator.admit_execution_for_test(restarted, context.issue, nil)
+
+    for id <- [parent, context.delegation] do
+      previous = restarted.responsibility_graph.delegations[id]
+      current = recovered.responsibility_graph.delegations[id]
+      assert current.status == :expired and current.terminal_reason == :lease_expired
+      assert Map.drop(current, [:status, :terminal_reason]) == Map.drop(previous, [:status, :terminal_reason])
+    end
+
+    expiry_events =
+      Enum.filter(recovered.responsibility_graph.events, fn event ->
+        (Map.get(event, :type) || Map.get(event, "type")) in [:expired, "expired"]
+      end)
+
+    expired_ids = Enum.map(expiry_events, &(Map.get(&1, :delegation_id) || Map.get(&1, "delegation_id")))
+    assert Enum.sort(expired_ids) == Enum.sort([parent, context.delegation])
+    unrelated_ids = Map.keys(restarted.responsibility_graph.delegations) -- [parent, context.delegation]
+    previous_unrelated = Map.take(restarted.responsibility_graph.delegations, unrelated_ids)
+    assert Map.take(recovered.responsibility_graph.delegations, unrelated_ids) == previous_unrelated
+    reconciliation_time = System.system_time(:millisecond)
+    recovered_graph = recovered.responsibility_graph
+    assert {:ok, same_graph, %{expired: []}} = ResponsibilityGraph.reconcile(recovered_graph, reconciliation_time)
+    assert same_graph == recovered.responsibility_graph
+
+    assert token.generation == context.token.generation + 1
+    assert File.read!(runtime.journal_path) == journal_before
+    assert Enum.take(recovered.responsibility_graph.events, -length(restarted.responsibility_graph.events)) == restarted.responsibility_graph.events
+    assert recovered.execution_fence.history == [restarted.execution_fence.executions[context.issue.id] | restarted.execution_fence.history]
+    assert {:error, :stale_generation} = ExecutionFence.authorize(recovered.execution_fence, context.token, :commit)
+    assert :ok = ResponsibilityGraph.validate(recovered.responsibility_graph)
+  end
+
   test "distinct recovery rejects partial authority, old leases, expired grants and changed ownership", context do
     now = System.system_time(:millisecond)
     cleaned = cleaned_failed_attempt(context)
@@ -330,6 +378,7 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     journal_before = File.read!(runtime.journal_path)
 
     for {candidate, issue} <- [
+          {%{state | responsibility_graph: cleaned.responsibility_graph}, context.issue},
           {%{state | responsibility_graph: partial}, context.issue},
           {%{state | responsibility_graph: leased}, context.issue},
           {%{state | responsibility_graph: accountable_leased}, context.issue},
@@ -560,17 +609,20 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
   end
 
   defp expired_old_pair(graph, responsible_id, now) do
+    graph = elapsed_old_pair(graph, responsible_id, now)
     parent_id = graph.delegations[responsible_id].parent_delegation_id
-
-    graph =
-      Enum.reduce([parent_id, responsible_id], graph, fn id, current ->
-        update_in(current.delegations[id], &Map.merge(&1, %{accepted_at_ms: now - 3, last_heartbeat_at: now - 2, expires_at_ms: now - 1}))
-      end)
-
     {:ok, expired, %{expired: ids}} = ResponsibilityGraph.reconcile(graph, now)
     assert Enum.sort(ids) == Enum.sort([parent_id, responsible_id])
     assert :ok = ResponsibilityGraph.validate(expired)
     expired
+  end
+
+  defp elapsed_old_pair(graph, responsible_id, now) do
+    parent_id = graph.delegations[responsible_id].parent_delegation_id
+
+    Enum.reduce([parent_id, responsible_id], graph, fn id, current ->
+      update_in(current.delegations[id], &Map.merge(&1, %{accepted_at_ms: now - 3, last_heartbeat_at: now - 2, expires_at_ms: now - 1}))
+    end)
   end
 
   defp distinct_manifest(issue_id, now, accountable_id \\ "accountable-gen2", responsible_id \\ "responsible-gen2") do

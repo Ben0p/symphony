@@ -1680,6 +1680,11 @@ and released leases are required. Preserve journal and fence history, reconcile 
 restart-blocked accountable delegation, and reapply current responsibility, owner and budget
 checks. The next generation is created by normal admission, never by rewriting old authority.
 
+Distinct failed-attempt recovery applies the existing expiry reconciler to its graph
+candidate before checking the old pair. Time-expired active or restart-blocked grants
+may transition to expired through the normal domain events; their leases, scope,
+actors and budgets remain unchanged. A rejected recovery does not persist that candidate.
+
 An attempted managed execution may record a local failed-attempt terminal outcome without
 changing the tracker issue to a terminal state. This requires already-confirmed termination
 for every required lease, reconciled ownership, an exact accepted head and a content-addressed
