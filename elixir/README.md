@@ -282,8 +282,11 @@ runtime lease is released; current authorization and normal admission still appl
 When a current manifest names a distinct pair, failed-attempt recovery accepts it
 only after verified terminal cleanup and expiry of the previous, lease-free pair.
 Both new IDs must be absent, and the owner, runner and scope must match the old
-authority. Normal admission creates the new pair; the old graph records, claim
-journal and fenced generation history remain intact. Existing same-ID recovery
+authority. Recovery first applies normal expiry reconciliation to its graph candidate,
+so elapsed active or restart-blocked grants do not require a separate persisted expiry
+step. Normal admission creates the new pair; prior grant fields and history remain
+intact apart from the legitimate expiry status and event. Rejected candidates are not
+persisted, and the claim journal and fenced generation history remain intact. Existing same-ID recovery
 and signed pre-spawn abandonment keep their original checks.
 
 Restart reconciliation requires an unexpired delegation, a nondecreasing heartbeat,

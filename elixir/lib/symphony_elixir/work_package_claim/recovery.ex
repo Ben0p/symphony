@@ -70,6 +70,7 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
   defp prepare_distinct_failed_claim(runtime, fence, graph, issue, attempt, execution, now_ms, {prior_id, entry}) do
     with nil <- graph.delegations[entry.accountable.id],
          nil <- graph.delegations[entry.responsible.id],
+         {:ok, graph, _expiry} <- ResponsibilityGraph.reconcile(graph, now_ms),
          true <- expired_previous_pair?(graph, prior_id, entry, issue, execution, now_ms),
          :ok <-
            ExecutionFence.validate_cleanup(
