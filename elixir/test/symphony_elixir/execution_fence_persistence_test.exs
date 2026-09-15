@@ -273,8 +273,14 @@ defmodule SymphonyElixir.ExecutionFencePersistenceTest do
   defp cold_process(script, args) do
     code_paths = Enum.flat_map(:code.get_path(), &["-pa", List.to_string(&1)])
     executable = System.find_executable("elixir") || raise "elixir executable unavailable"
+    script_path = Path.join(System.tmp_dir!(), "symphony-cold-process-#{System.unique_integer([:positive])}.exs")
 
-    System.cmd(executable, ["--erl", "+S 2:2"] ++ code_paths ++ ["-e", script | args], stderr_to_stdout: true)
+    try do
+      File.write!(script_path, script)
+      System.cmd(executable, ["--erl", "+S 2:2"] ++ code_paths ++ [script_path | args], stderr_to_stdout: true)
+    after
+      File.rm(script_path)
+    end
   end
 
   defp admission(issue_id \\ @issue) do

@@ -84,10 +84,13 @@ defmodule SymphonyElixir.ManagedCheckout do
   defp valid_text?(_text), do: false
 
   defp validate_workspace(workspace, identity) when is_binary(workspace) do
-    with true <- Path.type(workspace) == :absolute and Path.expand(workspace) == workspace,
-         true <- identity.worktree == workspace,
+    with true <-
+           Path.type(workspace) == :absolute and
+             PathSafety.lexically_equal?(Path.expand(workspace), workspace),
+         true <- PathSafety.lexically_equal?(identity.worktree, workspace),
          {:ok, %File.Stat{type: :directory}} <- File.lstat(workspace),
-         {:ok, ^workspace} <- PathSafety.canonicalize(workspace) do
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+         true <- PathSafety.lexically_equal?(canonical_workspace, workspace) do
       :ok
     else
       _ -> {:error, :managed_checkout_path_mismatch}
@@ -119,8 +122,8 @@ defmodule SymphonyElixir.ManagedCheckout do
          {:ok, %File.Stat{type: :directory}} <- File.lstat(Path.join(git, "objects/info")),
          :ok <- absent(Path.join(git, "objects/info/alternates")),
          :ok <- absent(Path.join(git, "objects/info/http-alternates")),
-         :ok <- expect(workspace, ["rev-parse", "--show-toplevel"], workspace),
-         :ok <- expect(workspace, ["rev-parse", "--absolute-git-dir"], git),
+         :ok <- expect_path(workspace, ["rev-parse", "--show-toplevel"], workspace),
+         :ok <- expect_path(workspace, ["rev-parse", "--absolute-git-dir"], git),
          :ok <- expect(workspace, ["config", "--get", "remote.origin.url"], "https://github.com/#{repository}.git") do
       :ok
     else
@@ -226,6 +229,18 @@ defmodule SymphonyElixir.ManagedCheckout do
       {:ok, ^expected} -> :ok
       {:ok, _} -> {:error, :managed_checkout_git_identity_mismatch}
       error -> error
+    end
+  end
+
+  defp expect_path(workspace, args, expected) do
+    case Git.run(workspace, args) do
+      {:ok, actual} ->
+        if PathSafety.lexically_equal?(actual, expected),
+          do: :ok,
+          else: {:error, :managed_checkout_git_identity_mismatch}
+
+      error ->
+        error
     end
   end
 end

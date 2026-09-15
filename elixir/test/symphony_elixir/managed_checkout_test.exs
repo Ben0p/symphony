@@ -151,6 +151,7 @@ defmodule SymphonyElixir.ManagedCheckoutTest do
     end
   end
 
+  @tag skip: match?({:win32, _}, :os.type())
   test "symlink workspace aliases and marker links are rejected", ctx do
     assert {:ok, _} = ManagedCheckout.prepare(ctx.workspace, ctx.identity, true)
     alias_path = Path.join(ctx.root, "alias")

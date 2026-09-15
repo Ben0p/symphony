@@ -57,6 +57,12 @@ after all leases quiesce. A changed, unreadable, or unrecorded head preserves th
 workspace and leaves the execution pending for reconciliation; `PR merged` or an
 unknown head is never treated as proof of quiescence.
 
+Managed checkout identity follows the host filesystem's lexical rules: Windows
+comparisons normalize separators and case while canonicalization still rejects
+symlink aliases. Local workspace hooks use `sh` when available and fall back to
+Git for Windows' bundled `sh.exe`, preserving the same command and timeout
+contract on hosts without a standalone POSIX shell.
+
 The serialized snapshot is persisted through
 `ExecutionFence.Persistence`. Save uses a temporary file and a recoverable
 previous-snapshot rename on platforms where replacement cannot be atomic; startup

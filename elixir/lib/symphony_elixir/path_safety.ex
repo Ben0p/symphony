@@ -1,6 +1,20 @@
 defmodule SymphonyElixir.PathSafety do
   @moduledoc false
 
+  @doc "Compares lexical paths using the host filesystem's case and separator rules."
+  @spec lexically_equal?(Path.t(), Path.t()) :: boolean()
+  def lexically_equal?(left, right) when is_binary(left) and is_binary(right) do
+    case :os.type() do
+      {:win32, _name} ->
+        normalize_windows(left) == normalize_windows(right)
+
+      _other ->
+        left == right
+    end
+  end
+
+  def lexically_equal?(_left, _right), do: false
+
   @spec canonicalize(Path.t()) :: {:ok, Path.t()} | {:error, term()}
   def canonicalize(path) when is_binary(path) do
     expanded_path = Path.expand(path)
@@ -49,5 +63,11 @@ defmodule SymphonyElixir.PathSafety do
 
   defp join_path(root, segments) when is_list(segments) do
     Enum.reduce(segments, root, fn segment, acc -> Path.join(acc, segment) end)
+  end
+
+  defp normalize_windows(path) when is_binary(path) do
+    path
+    |> String.replace("\\", "/")
+    |> String.downcase()
   end
 end

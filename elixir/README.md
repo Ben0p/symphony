@@ -251,6 +251,8 @@ An exclusively created `.git/symphony-execution.json` binds repository, canonica
 issue, generation, session and initial commit. Same-generation continuation may retain dirty work
 and descendant commits. Missing, partial, mismatched or noncanonical markers require recovery.
 The marker file is synced and read back; directory-entry power-loss durability is not claimed.
+On Windows, managed identity comparisons follow case-insensitive filesystem path rules, and local
+hooks use Git for Windows' bundled `sh.exe` when a standalone POSIX shell is unavailable.
 Before-run hooks, Codex startup, turns and guarded tool boundaries compare actual checkout identity
 as well as current execution authority. Runtime observations report the verified branch and head.
 The runtime appends the exact prepared identity to each worker turn; generic workflow branch-creation

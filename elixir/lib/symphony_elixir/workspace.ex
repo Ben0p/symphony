@@ -43,7 +43,7 @@ defmodule SymphonyElixir.Workspace do
   def create_for_execution(issue, identity, nil, guard) when is_map(identity) and is_function(guard, 0) do
     with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), nil),
          :ok <- validate_workspace_path(workspace, nil),
-         true <- workspace == Map.get(identity, :worktree),
+         true <- PathSafety.lexically_equal?(workspace, Map.get(identity, :worktree)),
          :ok <- guard.(),
          {:ok, created?} <- ensure_execution_workspace(workspace),
          :ok <- guard.(),
@@ -746,21 +746,27 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
-      end)
-
-    case Task.yield(task, timeout_ms) do
-      {:ok, cmd_result} ->
-        handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
-
+    case local_shell_executable() do
       nil ->
-        Task.shutdown(task, :brutal_kill)
+        {:error, {:workspace_shell_unavailable, hook_name}}
 
-        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
+      shell ->
+        task =
+          Task.async(fn ->
+            System.cmd(shell, ["-lc", command], cd: workspace, stderr_to_stdout: true)
+          end)
 
-        {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+        case Task.yield(task, timeout_ms) do
+          {:ok, cmd_result} ->
+            handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
+
+          nil ->
+            Task.shutdown(task, :brutal_kill)
+
+            Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
+
+            {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+        end
     end
   end
 
@@ -778,6 +784,35 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp local_shell_executable do
+    case System.find_executable("sh") do
+      nil -> windows_git_shell_executable()
+      executable -> executable
+    end
+  end
+
+  defp windows_git_shell_executable do
+    case :os.type() do
+      {:win32, _name} ->
+        case System.find_executable("git") do
+          nil ->
+            nil
+
+          git ->
+            git_dir = Path.dirname(git)
+
+            [
+              Path.expand(Path.join(git_dir, "../bin/sh.exe")),
+              Path.expand(Path.join(git_dir, "../usr/bin/sh.exe"))
+            ]
+            |> Enum.find(&File.regular?/1)
+        end
+
+      _other ->
+        nil
     end
   end
 
