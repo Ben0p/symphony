@@ -250,14 +250,7 @@ defmodule SymphonyElixir.ResponsibilityGraph do
           {:ok, state}
 
         delegation.runtime_lease == lease and expired_unsubmitted_releasable?(delegation) ->
-          updated = %{delegation | status: :expired, runtime_lease: nil, terminal_reason: :expired_never_submitted, terminal_evidence: evidence}
-
-          next =
-            state
-            |> put_in([:delegations, id], updated)
-            |> append_event(:expired_never_submitted, id, now_ms, evidence)
-
-          with :ok <- validate_state(next), do: {:ok, next}
+          persist_expired_unsubmitted(state, id, delegation, evidence, now_ms)
 
         true ->
           {:error, :expired_unsubmitted_authority_changed}
@@ -270,6 +263,22 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   defp expired_unsubmitted_releasable?(%{status: :blocked, blocked_on: :restart_reconciliation}), do: true
   defp expired_unsubmitted_releasable?(%{status: :expired, terminal_reason: reason}) when reason in [:lease_expired, "lease_expired"], do: true
   defp expired_unsubmitted_releasable?(_delegation), do: false
+
+  defp persist_expired_unsubmitted(state, id, delegation, evidence, now_ms) do
+    updated =
+      delegation
+      |> Map.put(:status, :expired)
+      |> Map.put(:runtime_lease, nil)
+      |> Map.put(:terminal_reason, :expired_never_submitted)
+      |> Map.put(:terminal_evidence, evidence)
+
+    next =
+      state
+      |> put_in([:delegations, id], updated)
+      |> append_event(:expired_never_submitted, id, now_ms, evidence)
+
+    with :ok <- validate_state(next), do: {:ok, next}
+  end
 
   defp release_bound_runtime_lease(state, delegation_id, delegation, now_ms) do
     with :ok <- reconcile_clock_is_monotonic(delegation, now_ms),

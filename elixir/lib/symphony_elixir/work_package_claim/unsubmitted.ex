@@ -75,8 +75,8 @@ defmodule SymphonyElixir.WorkPackageClaim.Unsubmitted do
            true <- receipt["repository"] == execution.repository and receipt["worktree"] == execution.worktree,
            true <- receipt["profile"] == runtime[:managed_project_profile_id],
            true <- receipt["responsible_id"] == delegation.id and receipt["responsible_digest"] == grant_digest(delegation),
-           %{role: :accountable, status: :expired, runtime_lease: nil, terminal_evidence: ^receipt} = parent <- graph.delegations[receipt["accountable_id"]],
-           true <- delegation.parent_delegation_id == parent.id and receipt["accountable_digest"] == grant_digest(parent),
+           parent when is_map(parent) <- graph.delegations[receipt["accountable_id"]],
+           true <- retired_parent?(parent, delegation, receipt),
            [%{status: :released, release_reason: reason} = worker] <- Map.values(execution.leases),
            true <- reason in [:claim_not_submitted, "claim_not_submitted"],
            true <- worker.session_id == receipt["session_id"] and worker.process_id == receipt["process_id"],
@@ -86,6 +86,12 @@ defmodule SymphonyElixir.WorkPackageClaim.Unsubmitted do
         _ -> false
       end
     end)
+  end
+
+  defp retired_parent?(parent, delegation, receipt) do
+    match?(%{role: :accountable, status: :expired, runtime_lease: nil}, parent) and
+      parent.terminal_evidence == receipt and delegation.parent_delegation_id == parent.id and
+      receipt["accountable_digest"] == grant_digest(parent)
   end
 
   defp retired_execution(runtime, fence, execution) do
