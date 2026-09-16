@@ -129,7 +129,21 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: entry.codex_total_tokens
       }
     }
+    |> put_checkout_progress(entry)
   end
+
+  defp put_checkout_progress(payload, entry) do
+    case Map.get(entry, :checkout_progress) do
+      %{head: head} = progress when is_binary(head) ->
+        Map.put(payload, :checkout_progress, Map.update!(progress, :committed, &committed_checkpoint/1))
+
+      _ ->
+        payload
+    end
+  end
+
+  defp committed_checkpoint(nil), do: nil
+  defp committed_checkpoint(checkpoint), do: Map.update!(checkpoint, :observed_at, &iso8601/1)
 
   defp retry_entry_payload(entry) do
     %{
@@ -178,6 +192,7 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: running.codex_total_tokens
       }
     }
+    |> put_checkout_progress(running)
   end
 
   defp retry_issue_payload(retry) do

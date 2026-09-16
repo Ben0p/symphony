@@ -3866,6 +3866,11 @@ defmodule SymphonyElixir.Orchestrator do
           configured_stall_timeout_ms: Config.settings!().codex.stall_timeout_ms,
           qualifying_activity_silence_ms: stall_elapsed_ms(metadata, now_ms),
           last_qualifying_activity_class: Map.get(metadata, :codex_last_activity_method) || "worker_started",
+          checkout_progress: %{
+            head: Map.get(metadata, :checkout_head),
+            sequence: Map.get(metadata, :checkout_progress_sequence),
+            committed: Map.get(metadata, :checkout_commit_checkpoint)
+          },
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
