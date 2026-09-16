@@ -449,6 +449,58 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     end
   end
 
+  test "same-grant failed retry verifies an expired never-submitted predecessor through runtime", context do
+    now = System.system_time(:millisecond)
+    cleaned = cleaned_failed_attempt(context)
+    manifest = cleaned.work_package_runtime.managed_delegations
+
+    entries =
+      Enum.map(manifest.entries, fn entry ->
+        if entry.issue_id == Fixture.issue(2).id do
+          entry = put_in(entry.accountable.expires_at_ms, now + 1_000)
+          put_in(entry.responsible.expires_at_ms, now + 1_000)
+        else
+          entry
+        end
+      end)
+
+    state = put_in(cleaned.work_package_runtime.managed_delegations, %{manifest | entries: entries})
+    manifest = state.work_package_runtime.managed_delegations
+    {:ok, empty_graph, _} = ResponsibilityGraph.activate(ResponsibilityGraph.new(), now)
+    prior_state = %{state | execution_fence: ExecutionFence.new(), responsibility_graph: empty_graph}
+    {:ok, predecessor, _, _, _, _} = Orchestrator.admit_execution_for_test(prior_state, Fixture.issue(2), nil)
+    entry = Enum.find(manifest.entries, &(&1.issue_id == Fixture.issue(2).id))
+    execution = predecessor.execution_fence.executions[entry.issue_id]
+    File.mkdir_p!(Path.dirname(execution.worktree))
+    assert File.lstat(execution.worktree) == {:error, :enoent}
+    assert Map.take(predecessor.responsibility_graph.delegations[entry.accountable.id], Map.keys(entry.accountable)) == entry.accountable
+    assert Map.take(predecessor.responsibility_graph.delegations[entry.responsible.id], Map.keys(entry.responsible)) == entry.responsible
+    [worker] = Map.values(execution.leases)
+    prior_fence = predecessor.execution_fence
+    prior_token = %{issue_id: execution.issue_id, generation: execution.generation}
+    assert {:ok, _} = ExecutionFence.release_unsubmitted_claim(prior_fence, prior_token, worker.session_id)
+    {:ok, restart_graph} = ResponsibilityGraph.mark_unreconciled_after_restart(predecessor.responsibility_graph)
+    predecessor = %{predecessor | responsibility_graph: restart_graph}
+    observation = %{"issue_id" => entry.issue_id, "generation" => execution.generation, "provider_claim" => "absent", "active_process" => "absent", "evidence_ref" => "test:independent-absence"}
+    runtime = predecessor.work_package_runtime
+    prior_graph = predecessor.responsibility_graph
+    {:ok, fence, graph} = Unsubmitted.retire_expired(runtime, prior_fence, prior_graph, entry, observation, now + 2_000)
+    fence = %{cleaned.execution_fence | executions: Map.merge(cleaned.execution_fence.executions, fence.executions), sessions: Map.merge(cleaned.execution_fence.sessions, fence.sessions)}
+    graph = %{cleaned.responsibility_graph | delegations: Map.merge(cleaned.responsibility_graph.delegations, graph.delegations), events: graph.events ++ cleaned.responsibility_graph.events}
+    assert :ok = ExecutionFence.validate(fence)
+    assert :ok = ResponsibilityGraph.validate(graph)
+    retired = %{state | execution_fence: fence, responsibility_graph: graph}
+    journal_before = File.read!(context.runtime.journal_path)
+    assert {:ok, retried, token, _, _, _} = Orchestrator.admit_execution_for_test(retired, context.issue, nil)
+    assert token.generation > context.token.generation
+    assert retried.execution_fence.executions[entry.issue_id] == fence.executions[entry.issue_id]
+    assert retried.responsibility_graph.delegations[entry.responsible.id] == graph.delegations[entry.responsible.id]
+    assert File.read!(context.runtime.journal_path) == journal_before
+    File.mkdir!(execution.worktree)
+    assert {:error, :previous_repository_cleanup_required} = Orchestrator.admit_execution_for_test(retired, context.issue, nil)
+    assert File.read!(context.runtime.journal_path) == journal_before
+  end
+
   test "failed retry refuses changed responsibility and missing cleanup acknowledgement", context do
     cleaned = cleaned_failed_attempt(context)
     {:ok, graph} = ResponsibilityGraph.mark_unreconciled_after_restart(cleaned.responsibility_graph)
