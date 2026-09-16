@@ -236,6 +236,50 @@ defmodule SymphonyElixir.ResponsibilityGraph do
   def release_runtime_lease(_state, _delegation_id, _runtime_lease, _now_ms),
     do: {:error, :invalid_runtime_lease_release}
 
+  @doc "Retires an expired delegation's exact lease with caller-verified never-submitted evidence."
+  @spec retire_expired_unsubmitted(state(), String.t(), map() | nil, map(), non_neg_integer()) ::
+          {:ok, state()} | {:error, term()}
+  def retire_expired_unsubmitted(state, id, lease, evidence, now_ms) do
+    with :ok <- validate_state(state),
+         {:ok, delegation} <- fetch_delegation(state, id),
+         true <- delegation.expires_at_ms <= now_ms,
+         true <- evidence["type"] == "expired_never_submitted",
+         :ok <- reconcile_clock_is_monotonic(delegation, now_ms) do
+      cond do
+        delegation.status == :expired and delegation.runtime_lease == nil and delegation.terminal_evidence == evidence ->
+          {:ok, state}
+
+        delegation.runtime_lease == lease and expired_unsubmitted_releasable?(delegation) ->
+          persist_expired_unsubmitted(state, id, delegation, evidence, now_ms)
+
+        true ->
+          {:error, :expired_unsubmitted_authority_changed}
+      end
+    else
+      _ -> {:error, :expired_unsubmitted_authority_changed}
+    end
+  end
+
+  defp expired_unsubmitted_releasable?(%{status: :blocked, blocked_on: :restart_reconciliation}), do: true
+  defp expired_unsubmitted_releasable?(%{status: :expired, terminal_reason: reason}) when reason in [:lease_expired, "lease_expired"], do: true
+  defp expired_unsubmitted_releasable?(_delegation), do: false
+
+  defp persist_expired_unsubmitted(state, id, delegation, evidence, now_ms) do
+    updated =
+      delegation
+      |> Map.put(:status, :expired)
+      |> Map.put(:runtime_lease, nil)
+      |> Map.put(:terminal_reason, :expired_never_submitted)
+      |> Map.put(:terminal_evidence, evidence)
+
+    next =
+      state
+      |> put_in([:delegations, id], updated)
+      |> append_event(:expired_never_submitted, id, now_ms, evidence)
+
+    with :ok <- validate_state(next), do: {:ok, next}
+  end
+
   defp release_bound_runtime_lease(state, delegation_id, delegation, now_ms) do
     with :ok <- reconcile_clock_is_monotonic(delegation, now_ms),
          updated <- %{delegation | runtime_lease: nil},

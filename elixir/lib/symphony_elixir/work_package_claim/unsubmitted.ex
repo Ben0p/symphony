@@ -4,6 +4,110 @@ defmodule SymphonyElixir.WorkPackageClaim.Unsubmitted do
   alias SymphonyElixir.{ExecutionFence, ResponsibilityGraph}
   alias SymphonyElixir.WorkPackageClaim.Journal
 
+  @grant_fields ~w(id parent_delegation_id role actor_id scope authority budget expires_at_ms expected_deliverable expected_evidence return_to_parent)a
+
+  @doc "Builds retirement candidates from retained authorization and independently observed host/provider absence."
+  @spec retire_expired(map(), map(), map(), map(), map(), non_neg_integer()) ::
+          {:ok, map(), map()} | {:error, term()}
+  def retire_expired(runtime, fence, graph, %{issue_id: _, accountable: %{id: _}, responsible: %{id: _, scope: %{issue_id: _, repository: _}}} = entry, observation, now_ms)
+      when is_map(runtime) and is_map(observation) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- ExecutionFence.validate(fence),
+         :ok <- ResponsibilityGraph.validate(graph),
+         execution when is_map(execution) <- fence.executions[entry.issue_id],
+         true <- observation["issue_id"] == execution.issue_id and observation["generation"] == execution.generation,
+         true <- observation["provider_claim"] == "absent" and observation["active_process"] == "absent",
+         ref when is_binary(ref) and ref != "" <- observation["evidence_ref"],
+         true <- absent_local_workspace?(execution),
+         :absent <- current_claim(runtime, execution),
+         true <- immutable_match?(graph.delegations[entry.accountable.id], entry.accountable),
+         true <- immutable_match?(graph.delegations[entry.responsible.id], entry.responsible),
+         %{role: :accountable, runtime_lease: nil} <- graph.delegations[entry.accountable.id],
+         %{role: :responsible, parent_delegation_id: parent} <- graph.delegations[entry.responsible.id],
+         true <- parent == entry.accountable.id,
+         true <- entry.responsible.scope.issue_id == execution.issue_id and entry.responsible.scope.repository == execution.repository,
+         [worker] <- Map.values(execution.leases),
+         lease = Map.take(worker, [:issue_id, :repository, :generation, :session_id, :process_id]),
+         token = %{issue_id: execution.issue_id, generation: execution.generation},
+         {:ok, next_fence} <- ExecutionFence.release_unsubmitted_claim(fence, token, worker.session_id),
+         receipt = %{
+           "type" => "expired_never_submitted",
+           "issue_id" => execution.issue_id,
+           "generation" => execution.generation,
+           "repository" => execution.repository,
+           "profile" => runtime.managed_project_profile_id,
+           "worktree" => execution.worktree,
+           "session_id" => worker.session_id,
+           "process_id" => worker.process_id,
+           "accountable_id" => entry.accountable.id,
+           "responsible_id" => entry.responsible.id,
+           "accountable_digest" => grant_digest(entry.accountable),
+           "responsible_digest" => grant_digest(entry.responsible),
+           "evidence_ref" => ref
+         },
+         {:ok, graph} <- ResponsibilityGraph.retire_expired_unsubmitted(graph, entry.accountable.id, nil, receipt, now_ms),
+         {:ok, graph} <- ResponsibilityGraph.retire_expired_unsubmitted(graph, entry.responsible.id, lease, receipt, now_ms) do
+      {:ok, next_fence, graph}
+    else
+      _ -> {:error, :expired_unsubmitted_retirement_not_proven}
+    end
+  end
+
+  def retire_expired(_runtime, _fence, _graph, _entry, _observation, _now_ms),
+    do: {:error, :expired_unsubmitted_retirement_not_proven}
+
+  defp grant_digest(grant) do
+    grant |> Map.take(@grant_fields) |> :erlang.term_to_binary([:deterministic]) |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+  end
+
+  defp absent_local_workspace?(%{worker_host: nil, worktree: path}) when is_binary(path) do
+    Path.type(path) == :absolute and Path.expand(path) == path and
+      not String.starts_with?(path, ["//", "\\\\"]) and
+      File.lstat(path) == {:error, :enoent} and plain_directory_ancestors?(Path.dirname(path))
+  end
+
+  defp absent_local_workspace?(_execution), do: false
+
+  defp retired_authorization?(runtime, fence, graph, execution) do
+    Enum.any?(graph.delegations, fn {_id, delegation} ->
+      with %{role: :responsible, status: :expired, runtime_lease: nil, terminal_evidence: receipt} <- delegation,
+           %{"type" => "expired_never_submitted"} <- receipt,
+           true <- receipt["issue_id"] == execution.issue_id and receipt["generation"] == execution.generation,
+           true <- receipt["repository"] == execution.repository and receipt["worktree"] == execution.worktree,
+           true <- receipt["profile"] == runtime[:managed_project_profile_id],
+           true <- receipt["responsible_id"] == delegation.id and receipt["responsible_digest"] == grant_digest(delegation),
+           parent when is_map(parent) <- graph.delegations[receipt["accountable_id"]],
+           true <- retired_parent?(parent, delegation, receipt),
+           [%{status: :released, release_reason: reason} = worker] <- Map.values(execution.leases),
+           true <- reason in [:claim_not_submitted, "claim_not_submitted"],
+           true <- worker.session_id == receipt["session_id"] and worker.process_id == receipt["process_id"],
+           {:ok, ^execution} <- retired_execution(runtime, fence, execution) do
+        true
+      else
+        _ -> false
+      end
+    end)
+  end
+
+  defp retired_parent?(parent, delegation, receipt) do
+    match?(%{role: :accountable, status: :expired, runtime_lease: nil}, parent) and
+      parent.terminal_evidence == receipt and delegation.parent_delegation_id == parent.id and
+      receipt["accountable_digest"] == grant_digest(parent)
+  end
+
+  defp retired_execution(runtime, fence, execution) do
+    token = %{issue_id: execution.issue_id, generation: execution.generation}
+    [worker] = Map.values(execution.leases)
+
+    with :absent <- current_claim(runtime, execution),
+         true <- absent_local_workspace?(execution),
+         true <- execution.ownership == :reconciled,
+         {:ok, ^fence} <- ExecutionFence.release_unsubmitted_claim(fence, token, worker.session_id) do
+      {:ok, execution}
+    else
+      _ -> {:error, :retired_execution_changed}
+    end
+  end
+
   @doc "Proves an already released local generation has no claim or workspace blocking another issue."
   @spec released_without_workspace?(map() | nil, map(), map(), map(), non_neg_integer()) :: boolean()
   def released_without_workspace?(runtime, fence, graph, %{worker_host: nil, worktree: path} = execution, now_ms)
@@ -17,7 +121,7 @@ defmodule SymphonyElixir.WorkPackageClaim.Unsubmitted do
          {:new, ^fence, ^graph} <- prepare(runtime, fence, graph, execution, now_ms) do
       true
     else
-      _ -> false
+      _ -> retired_authorization?(runtime, fence, graph, execution)
     end
   end
 
