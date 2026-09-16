@@ -11,6 +11,22 @@ defmodule SymphonyElixir.ManagedResponsibilityTest do
     %{now: now, manifest: manifest}
   end
 
+  test "retirement authorization is optional, typed and preserves legacy manifest identities", %{now: now, manifest: legacy} do
+    payload = Fixture.payload(now)
+    [first | rest] = payload["entries"]
+    assert {:ok, ^legacy} = ManagedResponsibility.decode(payload, Fixture.context(), now)
+    ref = "sha256:" <> String.duplicate("a", 64)
+    valid = %{payload | "entries" => [Map.put(first, "prior_authority_revocation_ref", ref) | rest]}
+    assert {:ok, decoded} = ManagedResponsibility.decode(valid, Fixture.context(), now)
+    assert hd(decoded.entries).prior_authority_revocation_ref == ref
+    assert Map.delete(hd(decoded.entries), :prior_authority_revocation_ref) == hd(legacy.entries)
+
+    for invalid <- [nil, 1, %{}, "", "sha256:" <> String.duplicate("A", 64)] do
+      bad = %{payload | "entries" => [Map.put(first, "prior_authority_revocation_ref", invalid) | rest]}
+      assert {:error, :invalid_managed_delegation_entry} = ManagedResponsibility.decode(bad, Fixture.context(), now)
+    end
+  end
+
   test "an explicitly empty batch authorizes no issue", %{now: now} do
     payload = Map.put(Fixture.payload(now), "entries", [])
     assert {:ok, empty} = ManagedResponsibility.decode(payload, Fixture.context(), now)

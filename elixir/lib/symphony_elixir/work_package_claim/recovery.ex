@@ -5,6 +5,37 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
   alias SymphonyElixir.ManagedResponsibility.Admission
   alias SymphonyElixir.WorkPackageClaim.{Abandonment, Dispatch, Journal, Unsubmitted}
 
+  @doc "Computes a cleanup-bound retirement reference; it does not revoke or authorize a replacement grant."
+  @spec authority_revocation_ref(map(), map(), map(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def authority_revocation_ref(fence, graph, %{issue_id: id, generation: generation} = token, prior_id)
+      when is_binary(id) and is_integer(generation) and generation > 0 and is_binary(prior_id) do
+    with :ok <- ExecutionFence.validate(fence),
+         :ok <- ResponsibilityGraph.validate(graph),
+         %{generation: ^generation, status: :terminal, cleanup: :cleaned} = execution <- fence.executions[id],
+         %{state: "Failed attempt"} <- execution.terminal,
+         %{phase: :verified} <- execution.cleanup_receipt,
+         :ok <- ExecutionFence.validate_cleanup(fence, token, execution.terminal.accepted_head),
+         %{role: :responsible, runtime_lease: nil} = responsible <- graph.delegations[prior_id],
+         parent = responsible.parent_delegation_id,
+         accountable <- graph.delegations[parent],
+         %{role: :accountable, runtime_lease: nil, parent_delegation_id: nil} <- accountable,
+         true <-
+           responsible.scope == accountable.scope and responsible.scope.issue_id == id and
+             responsible.scope.repository == execution.repository do
+      mutable = [:status, :blocked_on, :terminal_reason, :terminal_evidence]
+      prior_accountable = Map.drop(accountable, mutable)
+      prior_responsible = Map.drop(responsible, mutable)
+      binding = {token, prior_accountable, prior_responsible, execution.terminal, execution.cleanup_receipt}
+      digest = :crypto.hash(:sha256, :erlang.term_to_binary(binding, [:deterministic])) |> Base.encode16(case: :lower)
+      {:ok, "sha256:" <> digest}
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :authority_revocation_not_available}
+    end
+  end
+
+  def authority_revocation_ref(_fence, _graph, _token, _prior_id), do: {:error, :authority_revocation_not_available}
+
   @spec prepare(map(), map(), map(), map(), non_neg_integer() | nil, non_neg_integer()) ::
           :new | {:new, map()} | {:new, map(), map()} | {:ok, map(), map(), map()} | {:error, term()}
   def prepare(runtime, fence, graph, issue, attempt, now_ms) do
@@ -71,7 +102,7 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
     with nil <- graph.delegations[entry.accountable.id],
          nil <- graph.delegations[entry.responsible.id],
          {:ok, graph, _expiry} <- ResponsibilityGraph.reconcile(graph, now_ms),
-         true <- expired_previous_pair?(graph, prior_id, entry, issue, execution, now_ms),
+         true <- retired_previous_pair?(fence, graph, prior_id, entry, issue, execution, now_ms),
          :ok <-
            ExecutionFence.validate_cleanup(
              fence,
@@ -87,11 +118,11 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
     end
   end
 
-  defp expired_previous_pair?(graph, prior_id, entry, issue, execution, now_ms) do
+  defp retired_previous_pair?(fence, graph, prior_id, entry, issue, execution, now_ms) do
     with %{
            id: ^prior_id,
            role: :responsible,
-           status: :expired,
+           status: status,
            runtime_lease: nil,
            parent_delegation_id: parent
          } = responsible <-
@@ -99,18 +130,36 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
          %{
            id: ^parent,
            role: :accountable,
-           status: :expired,
+           status: ^status,
            runtime_lease: nil,
            parent_delegation_id: nil
          } = accountable <-
            graph.delegations[parent],
-         true <- is_integer(responsible.expires_at_ms) and responsible.expires_at_ms <= now_ms,
-         true <- is_integer(accountable.expires_at_ms) and accountable.expires_at_ms <= now_ms do
+         true <- prior_authority_retired?(status, fence, graph, {responsible, accountable}, entry, execution, now_ms) do
       previous_pair_matches_claim?(responsible, accountable, entry, issue, execution)
     else
       _ -> false
     end
   end
+
+  defp prior_authority_retired?(:expired, _fence, _graph, {responsible, accountable}, _entry, _execution, now_ms) do
+    is_integer(responsible.expires_at_ms) and responsible.expires_at_ms <= now_ms and
+      is_integer(accountable.expires_at_ms) and accountable.expires_at_ms <= now_ms
+  end
+
+  defp prior_authority_retired?(:revoked, fence, graph, {responsible, accountable}, entry, execution, _now_ms) do
+    token = %{issue_id: execution.issue_id, generation: execution.generation}
+
+    with {:ok, ref} <- authority_revocation_ref(fence, graph, token, responsible.id),
+         %{prior_authority_revocation_ref: ^ref} <- entry,
+         ^ref <- accountable.terminal_reason do
+      responsible.terminal_reason in [{:ancestor_terminal, accountable.id}, inspect({:ancestor_terminal, accountable.id})]
+    else
+      _ -> false
+    end
+  end
+
+  defp prior_authority_retired?(_status, _fence, _graph, _pair, _entry, _execution, _now_ms), do: false
 
   defp previous_pair_matches_claim?(responsible, accountable, entry, issue, execution) do
     accountable.actor_id == entry.owner_id and
