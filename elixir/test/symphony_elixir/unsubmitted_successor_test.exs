@@ -52,6 +52,78 @@ defmodule SymphonyElixir.UnsubmittedSuccessorTest do
     assert {:ok, state.responsibility_graph} == Admission.prepare(state.responsibility_graph, nil, nil, nil, nil, now)
   end
 
+  test "expired never-submitted retirement survives manifest rotation and persistence", context do
+    state = context.admitted
+    entry = hd(state.work_package_runtime.managed_delegations.entries)
+    now = entry.responsible.expires_at_ms + 1
+    observation = retirement_observation(context)
+    before = File.read!(state.work_package_runtime.journal_path)
+    {:ok, restart_graph} = ResponsibilityGraph.mark_unreconciled_after_restart(state.responsibility_graph)
+    assert {:ok, fence, graph} = Unsubmitted.retire_expired(state.work_package_runtime, state.execution_fence, restart_graph, entry, observation, now)
+    assert fence.history == state.execution_fence.history
+    assert fence.executions[entry.issue_id].generation == 1
+    assert fence.executions[entry.issue_id].terminal == nil
+    assert graph.delegations[entry.responsible.id].status == :expired
+    assert graph.delegations[entry.responsible.id].runtime_lease == nil
+    assert graph.delegations[entry.responsible.id].last_heartbeat_at == restart_graph.delegations[entry.responsible.id].last_heartbeat_at
+    assert Enum.take(graph.events, -length(restart_graph.events)) == restart_graph.events
+    path = Path.join(context.root, "retired-graph.json")
+    assert :ok = ResponsibilityGraph.Persistence.save(path, graph)
+    assert {:ok, graph} = ResponsibilityGraph.Persistence.load(path)
+    assert {:ok, ^fence, ^graph} = Unsubmitted.retire_expired(state.work_package_runtime, fence, graph, entry, observation, now + 1)
+    payload = update_in(Fixture.payload(now), ["entries"], &Enum.reject(&1, fn entry -> entry["issue_id"] == Fixture.issue(1).id end))
+    {:ok, manifest} = ManagedResponsibility.decode(payload, Fixture.context(), now)
+    runtime = %{state.work_package_runtime | managed_delegations: manifest}
+    old = fence.executions[entry.issue_id]
+    refute Unsubmitted.released_without_workspace?(runtime, state.execution_fence, graph, context.execution, now)
+    refute Unsubmitted.released_without_workspace?(runtime, fence, restart_graph, old, now)
+    assert {:error, _} = Unsubmitted.prepare(runtime, fence, graph, old, now)
+    assert {:error, _} = ManagedResponsibility.admit(graph, state.work_package_runtime.managed_delegations, Fixture.issue(1), now)
+    [session] = Map.keys(old.leases)
+    assert {:error, _} = ExecutionFence.heartbeat(fence, %{issue_id: old.issue_id, generation: old.generation}, session, now)
+    assert Unsubmitted.released_without_workspace?(runtime, fence, graph, fence.executions[entry.issue_id], now)
+    assert {:ok, _} = Admission.prepare(graph, fence, manifest, Fixture.issue(2), nil, now, runtime)
+    assert File.read!(runtime.journal_path) == before
+    changed = put_in(graph, [:delegations, entry.responsible.id, :expected_deliverable], "Changed expired grant")
+    refute Unsubmitted.released_without_workspace?(runtime, fence, changed, fence.executions[entry.issue_id], now)
+    File.write!(context.execution.worktree, "appeared after retirement")
+    refute Unsubmitted.released_without_workspace?(runtime, fence, graph, fence.executions[entry.issue_id], now)
+  end
+
+  test "retirement rejects unexpired authority, stale observation and any worker activity", context do
+    state = context.admitted
+    {:ok, graph} = ResponsibilityGraph.mark_unreconciled_after_restart(state.responsibility_graph)
+    state = %{state | responsibility_graph: graph}
+    entry = hd(state.work_package_runtime.managed_delegations.entries)
+    observation = retirement_observation(context)
+    now = entry.responsible.expires_at_ms + 1
+    assert {:error, _} = Unsubmitted.retire_expired(state.work_package_runtime, state.execution_fence, state.responsibility_graph, entry, observation, context.now)
+
+    for observation <- [Map.put(observation, "generation", 2), Map.put(observation, "provider_claim", "unknown"), Map.put(observation, "active_process", "present")] do
+      assert {:error, _} = Unsubmitted.retire_expired(state.work_package_runtime, state.execution_fence, state.responsibility_graph, entry, observation, now)
+    end
+
+    [session] = Map.keys(context.execution.leases)
+
+    for change <- [%{head: "observed"}, %{last_heartbeat_at: 1}, %{supervisor_identity: %{unexpected: true}}, %{termination_required: true}] do
+      fence = update_in(state.execution_fence, [:executions, entry.issue_id, :leases, session], &Map.merge(&1, change))
+      assert {:error, _} = Unsubmitted.retire_expired(state.work_package_runtime, fence, state.responsibility_graph, entry, retirement_observation(context), now)
+    end
+
+    File.write!(state.work_package_runtime.journal_path, "{partial")
+    assert {:error, _} = Unsubmitted.retire_expired(state.work_package_runtime, state.execution_fence, state.responsibility_graph, entry, retirement_observation(context), now)
+  end
+
+  defp retirement_observation(context) do
+    %{
+      "issue_id" => context.execution.issue_id,
+      "generation" => context.execution.generation,
+      "provider_claim" => "absent",
+      "active_process" => "absent",
+      "evidence_ref" => "test:independent-host-provider-census"
+    }
+  end
+
   test "multiple released histories do not deadlock the repository and an active successor keeps ownership", context do
     state = context.state
     {:ok, second, _, _, _, _} = Orchestrator.admit_execution_for_test(state, Fixture.issue(2), nil)

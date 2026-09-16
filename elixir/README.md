@@ -303,6 +303,27 @@ and expiry, including when cleanup occurs after expiry. The release event record
 the actual time; it does not renew authority. Already expired or revoked delegation
 statuses remain ineligible for this release operation.
 
+An expired, restart-blocked local generation proven never submitted can instead
+use `WorkPackageClaim.Unsubmitted.retire_expired/6`. Decode its retained pinned
+authorization with `ResponsibilityGraph.Persistence.decode_delegation_input/1`;
+do not backdate or admit expired authorization. The trusted host operator must stop
+the scoped claim writer, retain raw authorization and before-state hashes, and supply
+generation-bound provider-claim/process absence with a retained evidence reference.
+The candidate independently checks immutable grants, exact leases, a readable claim
+journal with no current or later reservation, and an absent canonical local workspace
+with plain ancestors. Observed, supervised or uncertain workers remain ineligible.
+Persist both candidates under the existing exclusive writer/CAS contract, preserving
+an immutable intent and partial-failure evidence. Repeating the same retirement is
+idempotent. A split graph/fence write remains fail closed until coherent recovery.
+
+Retirement expires the pair and releases only the never-submitted local lease. Its
+receipt retains both grant fingerprints and exact generation, profile, repository,
+workspace and worker identity. It neither invents a Git checkpoint nor satisfies
+terminal Git cleanup, releases a provider reservation, changes usage, or authorizes
+the old issue. A distinct current-manifest successor can pass the repository gate
+only after the retained receipt, unchanged grants, journal absence and workspace
+absence are reverified. Normal admission and same-issue generation fencing still apply.
+
 To enable this managed runtime on a Linux runner, the host must provide the complete tuple below;
 the service rejects a partial tuple during supervisor startup and leaves the adapter disabled when
 all five values are absent. A host that declares `SYMPHONY_POOL_KEY` or
