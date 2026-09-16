@@ -66,7 +66,7 @@ defmodule SymphonyElixir.ManagedResponsibility do
   end
 
   defp decode_entry(raw, context, now_ms) when is_map(raw) do
-    with true <- exact_keys?(raw, @entry_keys),
+    with true <- entry_keys?(raw),
          true <- is_binary(raw["issue_id"]) and Regex.match?(@uuid, raw["issue_id"]),
          true <- is_binary(raw["identifier"]) and Regex.match?(@identifier, raw["identifier"]),
          true <- present?(raw["owner_id"]),
@@ -90,7 +90,9 @@ defmodule SymphonyElixir.ManagedResponsibility do
         responsible: responsible
       }
 
-      {:ok, entry}
+      if Map.has_key?(raw, "prior_authority_revocation_ref"),
+        do: {:ok, Map.put(entry, :prior_authority_revocation_ref, raw["prior_authority_revocation_ref"])},
+        else: {:ok, entry}
     else
       {:error, _reason} = error -> error
       _ -> {:error, :invalid_managed_delegation_entry}
@@ -98,6 +100,14 @@ defmodule SymphonyElixir.ManagedResponsibility do
   end
 
   defp decode_entry(_raw, _repository, _now_ms), do: {:error, :invalid_managed_delegation_entry}
+
+  defp entry_keys?(raw) do
+    exact_keys?(raw, @entry_keys) or
+      (exact_keys?(raw, @entry_keys ++ ["prior_authority_revocation_ref"]) and valid_revocation_ref?(raw["prior_authority_revocation_ref"]))
+  end
+
+  defp valid_revocation_ref?(ref) when is_binary(ref), do: Regex.match?(~r/\Asha256:[0-9a-f]{64}\z/, ref)
+  defp valid_revocation_ref?(_ref), do: false
 
   defp repository_authority?(delegation) do
     delegation.authority.class == :routine_engineering and delegation.authority.environments == ["repository"]

@@ -282,7 +282,7 @@ request fresh authority for the same useful issue. A cleaned failed attempt can
 reconcile its restart-blocked accountable delegation only after its responsible
 runtime lease is released; current authorization and normal admission still apply.
 When a current manifest names a distinct pair, failed-attempt recovery accepts it
-only after verified terminal cleanup and expiry of the previous, lease-free pair.
+only after verified terminal cleanup and retirement of the previous, lease-free pair.
 Both new IDs must be absent, and the owner, runner and scope must match the old
 authority. Recovery first applies normal expiry reconciliation to its graph candidate,
 so elapsed active or restart-blocked grants do not require a separate persisted expiry
@@ -290,6 +290,20 @@ step. Normal admission creates the new pair; prior grant fields and history rema
 intact apart from the legitimate expiry status and event. Rejected candidates are not
 persisted, and the claim journal and fenced generation history remain intact. Existing same-ID recovery
 and signed pre-spawn abandonment keep their original checks.
+
+An owner can explicitly revoke exhausted failed-attempt authority without changing
+its expiry or budget. After both cleanup acknowledgements and lease release,
+`WorkPackageClaim.Recovery.authority_revocation_ref/4` computes a reference bound
+to the exact failed generation, original grants and verified cleanup. It grants no
+authority and mutates nothing. Use public `ResponsibilityGraph.revoke/4` on the
+accountable root with that reference as its reason; its responsible child must be
+revoked by that same cascade. A separately issued, validated manifest can name
+distinct new IDs and an optional entry-level `prior_authority_revocation_ref`
+containing that exact SHA-256 reference. Recovery still checks the native owner,
+runner, scope, absent new IDs, failed cleanup and normal admission. Active
+unexpired authority, a partial revocation or a changed grant fingerprint remains
+inadmissible. Old grants and debits stay intact; any replacement token ceiling is
+cumulative and must include the failed attempt's usage.
 
 Restart reconciliation requires an unexpired delegation, a nondecreasing heartbeat,
 an active unexpired parent, and the exact persisted runtime lease. Public graph

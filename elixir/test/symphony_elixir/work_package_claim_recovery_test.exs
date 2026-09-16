@@ -283,6 +283,62 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     assert Enum.any?(recovered.execution_fence.history, &(&1.generation == context.token.generation and &1.terminal.state == "Failed attempt"))
   end
 
+  test "public revocation survives persistence and authorizes only its exact replacement", context do
+    now = System.system_time(:millisecond)
+    cleaned = cleaned_failed_attempt(context)
+    before = cleaned.responsibility_graph
+    parent = before.delegations[context.delegation].parent_delegation_id
+    assert before.delegations[parent].expires_at_ms > now
+    assert {:ok, ref} = Recovery.authority_revocation_ref(cleaned.execution_fence, before, context.token, context.delegation)
+    assert {:ok, revoked, _} = ResponsibilityGraph.revoke(before, parent, ref, now)
+    path = Path.join(Path.dirname(cleaned.responsibility_graph_path), "revoked-authority.json")
+    assert :ok = ResponsibilityGraph.Persistence.save(path, revoked)
+    assert {:ok, reloaded} = ResponsibilityGraph.Persistence.load(path)
+    assert {:ok, ^ref} = Recovery.authority_revocation_ref(cleaned.execution_fence, reloaded, context.token, context.delegation)
+    assert {:ok, manifest} = distinct_manifest(context.issue.id, now, "accountable-gen2", "responsible-gen2", ref)
+    runtime = %{cleaned.work_package_runtime | managed_delegations: manifest}
+    journal_before = File.read!(runtime.journal_path)
+
+    assert {:new, candidate} = Recovery.prepare(runtime, cleaned.execution_fence, reloaded, context.issue, nil, now)
+    assert candidate.delegations["responsible-gen2"].status == :active
+    assert candidate.delegations["accountable-gen2"].actor_id == context.issue.assignee_id
+    assert Map.take(candidate.delegations, Map.keys(reloaded.delegations)) == reloaded.delegations
+    assert File.read!(runtime.journal_path) == journal_before
+
+    for id <- [parent, context.delegation] do
+      assert reloaded.delegations[id].status == :revoked
+
+      assert Map.drop(reloaded.delegations[id], [:status, :terminal_reason, :terminal_evidence]) ==
+               Map.drop(before.delegations[id], [:status, :terminal_reason, :terminal_evidence])
+    end
+  end
+
+  test "revoked recovery refuses absent, wrong or changed retirement evidence and active authority", context do
+    now = System.system_time(:millisecond)
+    cleaned = cleaned_failed_attempt(context)
+    graph = cleaned.responsibility_graph
+    parent = graph.delegations[context.delegation].parent_delegation_id
+    {:ok, ref} = Recovery.authority_revocation_ref(cleaned.execution_fence, graph, context.token, context.delegation)
+    {:ok, revoked, _} = ResponsibilityGraph.revoke(graph, parent, ref, now)
+    {:ok, valid} = distinct_manifest(context.issue.id, now, "accountable-gen2", "responsible-gen2", ref)
+    {:ok, absent} = distinct_manifest(context.issue.id, now)
+    {:ok, wrong} = distinct_manifest(context.issue.id, now, "accountable-gen2", "responsible-gen2", "sha256:" <> String.duplicate("f", 64))
+    changed = update_in(revoked.delegations[parent].budget.max_tokens, &(&1 + 1))
+    mixed = put_in(revoked.delegations[context.delegation].status, :active)
+
+    invalid_candidates = [{revoked, absent}, {revoked, wrong}, {graph, valid}, {changed, valid}, {mixed, valid}]
+
+    for {candidate_graph, manifest} <- invalid_candidates do
+      runtime = %{cleaned.work_package_runtime | managed_delegations: manifest}
+
+      assert {:error, :claim_abandonment_responsibility_changed} =
+               Recovery.prepare(runtime, cleaned.execution_fence, candidate_graph, context.issue, nil, now)
+    end
+
+    assert {:error, _} = Recovery.authority_revocation_ref(cleaned.execution_fence, graph, %{context.token | generation: context.token.generation + 1}, context.delegation)
+    assert {:error, _} = Recovery.authority_revocation_ref(context.state.execution_fence, graph, context.token, context.delegation)
+  end
+
   test "real restart preserves expired authority while admitting a distinct manifest pair", context do
     now = System.system_time(:millisecond)
     cleaned = cleaned_failed_attempt(context)
@@ -625,16 +681,19 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
     end)
   end
 
-  defp distinct_manifest(issue_id, now, accountable_id \\ "accountable-gen2", responsible_id \\ "responsible-gen2") do
+  defp distinct_manifest(issue_id, now, accountable_id \\ "accountable-gen2", responsible_id \\ "responsible-gen2", revocation_ref \\ nil) do
     raw = Fixture.payload(now)
 
     entries =
       Enum.map(raw["entries"], fn entry ->
         if entry["issue_id"] == issue_id do
-          entry
-          |> put_in(["accountable", "id"], accountable_id)
-          |> put_in(["responsible", "id"], responsible_id)
-          |> put_in(["responsible", "parent_delegation_id"], accountable_id)
+          updated =
+            entry
+            |> put_in(["accountable", "id"], accountable_id)
+            |> put_in(["responsible", "id"], responsible_id)
+            |> put_in(["responsible", "parent_delegation_id"], accountable_id)
+
+          with_revocation_ref(updated, revocation_ref)
         else
           entry
         end
@@ -642,6 +701,9 @@ defmodule SymphonyElixir.WorkPackageClaimRecoveryTest do
 
     ManagedResponsibility.decode(%{raw | "entries" => entries}, Fixture.context(), now)
   end
+
+  defp with_revocation_ref(entry, ref) when is_binary(ref), do: Map.put(entry, "prior_authority_revocation_ref", ref)
+  defp with_revocation_ref(entry, _ref), do: entry
 
   defp cleaned_failed_attempt(context) do
     now = System.system_time(:millisecond)
