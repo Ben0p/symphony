@@ -30,6 +30,7 @@ defmodule SymphonyElixir.OrchestratorCheckoutProgressTest do
       execution_session_id: identity.session_id,
       responsibility_delegation_id: nil,
       session_id: nil,
+      codex_app_server_pid: nil,
       codex_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
@@ -77,6 +78,26 @@ defmodule SymphonyElixir.OrchestratorCheckoutProgressTest do
     assert state.retry_attempts[ctx.issue.id].stall_diagnostic.durable_token_stall
     assert state.retry_attempts[ctx.issue.id].stall_diagnostic.no_durable_progress_tokens == 254_999
     assert {:error, _} = GenServer.call(ctx.server, {:execution_checkout_progress, ctx.issue.id, durable})
+  end
+
+  test "API preserves the credited commit witness after empty advancement and delayed usage", ctx do
+    {:registered_name, server_name} = Process.info(ctx.server, :registered_name)
+    assert :ok = call(ctx, checkpoint(ctx, :baseline, 0, nil, head("a")))
+    baseline = SymphonyElixirWeb.Presenter.state_payload(server_name, 1_000).running |> hd()
+    assert baseline.checkout_progress == %{head: head("a"), sequence: 0, committed: nil}
+    usage(ctx, 245_000)
+    assert :ok = call(ctx, checkpoint(ctx, :durable, 1, head("a"), head("b")))
+    accepted = SymphonyElixirWeb.Presenter.state_payload(server_name, 1_000).running |> hd()
+    receipt = accepted.checkout_progress.committed
+    assert receipt.head == head("b") and receipt.sequence == 1 and receipt.token_baseline == 245_000
+    assert receipt.generation == ctx.identity.generation and receipt.session_id == ctx.identity.session_id
+    assert {:ok, _, _} = DateTime.from_iso8601(receipt.observed_at)
+    assert :ok = call(ctx, checkpoint(ctx, :observed, 2, head("b"), head("c")))
+    usage(ctx, 293_132)
+    {:ok, issue} = SymphonyElixirWeb.Presenter.issue_payload(ctx.issue.identifier, server_name, 1_000)
+    assert issue.running.checkout_progress == %{head: head("c"), sequence: 2, committed: receipt}
+    assert issue.running.tokens.total_tokens == 293_132
+    assert :sys.get_state(ctx.server).execution_fence == ctx.fence
   end
 
   test "wrong sender, identity, ordering and malformed messages cannot mutate running state", ctx do

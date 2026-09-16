@@ -779,3 +779,12 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+The existing observability state and per-issue APIs include `checkout_progress`
+after the first accepted managed checkout observation. Its current HEAD and
+sequence can advance without credit. The nullable `committed` witness records
+the last accepted nonempty descendant commit, its sequence, exact managed
+generation/session, current-known token baseline and acceptance time. Later
+empty commits or delayed usage cannot relabel that credited OID. This is a
+projection of the live accepted checkpoint, not additional accounting credit or
+terminal acceptance; an unobserved checkout has no progress field.

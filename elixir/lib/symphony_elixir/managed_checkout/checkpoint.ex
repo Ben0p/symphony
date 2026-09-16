@@ -106,6 +106,14 @@ defmodule SymphonyElixir.ManagedCheckout.Checkpoint do
       |> Map.put(:codex_durable_progress_token_baseline, entry.codex_total_tokens)
       |> Map.put(:codex_last_durable_progress_timestamp, now)
       |> Map.put(:codex_last_durable_progress_method, "managed_checkout_commit")
+      |> Map.put(:checkout_commit_checkpoint, %{
+        head: checkpoint.head,
+        sequence: checkpoint.sequence,
+        token_baseline: entry.codex_total_tokens,
+        observed_at: now,
+        generation: checkpoint.identity.generation,
+        session_id: checkpoint.identity.session_id
+      })
     else
       next
     end
