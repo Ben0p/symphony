@@ -173,12 +173,12 @@ defmodule SymphonyElixir.WorkPackageClaim.Recovery do
   end
 
   defp prepare_released_claim(runtime, fence, graph, issue, attempt, now_ms) do
-    with %{entries: entries} <- runtime[:managed_delegations],
+    with %{entries: entries} = manifest <- runtime[:managed_delegations],
          entry when is_map(entry) <- Enum.find(entries, &(&1.issue_id == issue.id)),
          %{role: :responsible, status: :active, runtime_lease: nil, parent_delegation_id: parent} <- graph.delegations[entry.responsible.id],
          true <- parent == entry.accountable.id,
          {:ok, graph} <- reconcile_parent(graph, parent, now_ms),
-         {:ok, graph} <- Admission.prepare(graph, fence, runtime.managed_delegations, issue, attempt, now_ms) do
+         {:ok, graph} <- Admission.prepare(graph, fence, manifest, issue, attempt, now_ms, runtime) do
       {:new, graph}
     else
       {:error, _reason} = error -> error
