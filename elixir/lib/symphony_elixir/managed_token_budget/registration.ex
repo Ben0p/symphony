@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ManagedTokenBudget.Registration do
   @moduledoc "Explicit append-only registration of a new canonical issue with no prior execution."
 
-  @max_entries 20
+  alias SymphonyElixir.ManagedTokenBudget.Codec
   @attr_keys ~w(issue_id known_minimum_tokens continuation_floor evidence_ref authority_ref ledger_prefix_sha256 ledger_prefix_size_bytes)a
   @row_keys ["kind", "version" | Enum.map(@attr_keys, &Atom.to_string/1)]
   @state_maps ~w(baselines issue_totals highwaters threads corrections registrations)a
@@ -98,7 +98,7 @@ defmodule SymphonyElixir.ManagedTokenBudget.Registration do
   defp valid_phase(_), do: {:error, :registration_phase_invalid}
 
   defp under_limit(%{baselines: baselines}) do
-    if map_size(baselines) < @max_entries, do: :ok, else: {:error, :registration_limit}
+    if map_size(baselines) < Codec.max_issues(), do: :ok, else: {:error, :registration_limit}
   end
 
   defp pristine(state, issue_id) do
