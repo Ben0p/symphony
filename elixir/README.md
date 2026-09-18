@@ -390,7 +390,7 @@ private reservation journal and archive root. The archive root must be outside a
 Managed token accounting uses `<effective-journal-path>.token-usage.jsonl`. Before starting a
 managed pool, the host operator must explicitly call `SymphonyElixir.ManagedTokenBudget.initialize/3`
 with that absolute plain path, the manifest's `pool_key`, `repository_ref` and
-`managed_project_profile_id`, and at most 20 reviewed issue baselines. Each baseline contains
+`managed_project_profile_id`, and at most 256 reviewed historical issue baselines. Each baseline contains
 `issue_id` (stable UUID), `known_minimum_tokens`, positive `continuation_floor`, `evidence_ref` and
 `authority_ref`. The known minimum covers only generations below that floor. A previously active
 issue requires retained usage evidence; absence of a ledger is never evidence of zero consumption.
@@ -404,12 +404,18 @@ Missing accounting alone is not evidence of zero use. The sole host writer may e
 `issue_id`, `known_minimum_tokens: 0`, `continuation_floor: 1`, `evidence_ref`, `authority_ref`,
 `ledger_prefix_sha256` (lowercase SHA256 of the current bytes) and `ledger_prefix_size_bytes`.
 The append binds the complete prefix, retains every prior byte and usage total, seals bootstrap,
-and preserves the 20-issue limit. Existing UUIDs, including case aliases, cannot be registered again.
+and preserves the 256-issue historical portfolio limit. Existing UUIDs, including case aliases, cannot be registered again.
 Exact logical retries after reload or later usage append nothing; conflicting retries and duplicate
 physical rows fail. Pending or blocked writes prevent registration. Deploy this decoder before
 appending registration records; older runtimes reject them. Registration is bookkeeping, not an
 execution grant, allowance renewal or automatic scheduler action. Current manifest, responsibility,
 provider claim, generation, capacity and token limits still control admission.
+
+The historical portfolio capacity is shared by bootstrap, replay and registration.
+It does not increase worker concurrency, per-issue token grants or the separate
+20-entry managed delegation manifest limit. At 256 issues, registration still
+fails closed; never reset the ledger to make room. Older runtimes with the
+20-issue accounting bound cannot read a ledger after its twenty-first issue.
 
 Generation floors are per issue, not per pool: an issue with no prior execution starts at 1.
 To correct a mistaken floor for an unstarted issue, stop its managed service and retain the ledger,

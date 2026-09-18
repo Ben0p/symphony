@@ -3,6 +3,12 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
 
   alias SymphonyElixir.ManagedTokenBudget.{Correction, Registration}
 
+  @max_issues 256
+
+  @doc "Bounded historical issue capacity; this does not allocate execution or tokens."
+  @spec max_issues() :: pos_integer()
+  def max_issues, do: @max_issues
+
   @identity_keys ~w(pool_key repository_ref managed_project_profile_id)a
   @baseline_keys ~w(issue_id known_minimum_tokens continuation_floor evidence_ref authority_ref)a
   @usage_keys ~w(issue_id generation thread_id cumulative_total_tokens)a
@@ -11,7 +17,7 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
   @spec initial_bytes(map(), [map()]) :: {:ok, binary()} | {:error, term()}
   def initial_bytes(identity, baselines) do
     with :ok <- validate_identity(identity),
-         true <- is_list(baselines) and length(baselines) in 0..20,
+         true <- is_list(baselines) and length(baselines) in 0..@max_issues,
          true <- Enum.all?(baselines, &valid_baseline?/1),
          ids = Enum.map(baselines, & &1.issue_id),
          true <- Enum.uniq(ids) == ids do
@@ -37,7 +43,7 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
          {:ok, expected} <- decode_record(header),
          true <- expected == record("header", identity),
          {:ok, state} <- replay(lines, bytes, byte_size(header) + 1),
-         true <- map_size(state.baselines) in 0..20 do
+         true <- map_size(state.baselines) in 0..@max_issues do
       {:ok, state}
     else
       _ -> {:error, :invalid_budget_ledger}
@@ -125,7 +131,7 @@ defmodule SymphonyElixir.ManagedTokenBudget.Codec do
     attrs = attributes(row, @baseline_keys)
 
     if exact_record?(row, @baseline_keys) and valid_baseline?(attrs) and
-         not Map.has_key?(state.baselines, attrs.issue_id) and map_size(state.baselines) < 20 do
+         not Map.has_key?(state.baselines, attrs.issue_id) and map_size(state.baselines) < @max_issues do
       {:ok, %{state | baselines: Map.put(state.baselines, attrs.issue_id, attrs), issue_totals: Map.put(state.issue_totals, attrs.issue_id, attrs.known_minimum_tokens)}}
     else
       {:error, :invalid_budget_baseline}

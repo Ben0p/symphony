@@ -184,28 +184,55 @@ defmodule SymphonyElixir.ManagedTokenBudgetRegistrationTest do
     end
   end
 
-  test "registration preserves the twenty-issue cap", %{path: path} do
-    ids = Enum.map(1..20, &("b1111111-1111-4111-8111-" <> String.pad_leading(Integer.to_string(&1), 12, "0")))
+  test "registration preserves the bounded historical portfolio cap", %{path: path} do
+    ids = issue_ids(Codec.max_issues())
     {:ok, ledger} = Budget.initialize(path, @identity, Enum.map(ids, &baseline/1))
     before = File.read!(path)
     assert {:error, :registration_limit} = Budget.register_new_issue(ledger, attrs_for(ledger))
     assert File.read!(path) == before
   end
 
-  test "nineteen legacy baselines allow a twentieth registration but never a twenty-first", %{path: path} do
-    ids = Enum.map(1..19, &("b1111111-1111-4111-8111-" <> String.pad_leading(Integer.to_string(&1), 12, "0")))
+  test "twenty historical issues admit a new issue without resetting consumed usage", %{path: path} do
+    ids = issue_ids(20)
     {:ok, ledger} = Budget.initialize(path, @identity, Enum.map(ids, &baseline/1))
     assert ledger.phase == :bootstrap
     assert ledger.registrations == %{}
-    assert {:ok, registered} = Budget.register_new_issue(ledger, attrs_for(ledger))
-    assert map_size(registered.baselines) == 20
+    assert {:ok, used} = Budget.observe(ledger, hd(ids), 1, "retained-thread", 37)
+    prefix = File.read!(path)
+    assert {:ok, registered} = Budget.register_new_issue(used, attrs_for(used))
+    assert map_size(registered.baselines) == 21
     assert registered.phase == :usage
+    assert Map.drop(registered.issue_totals, [@new]) == used.issue_totals
+    assert registered.highwaters == used.highwaters
+    assert registered.threads == used.threads
+    assert binary_part(File.read!(path), 0, byte_size(prefix)) == prefix
+    assert {:ok, ^registered} = Budget.load(path, @identity)
+  end
+
+  test "the final portfolio slot appends and replay refuses an extra registration", %{path: path} do
+    {:ok, ledger} = Budget.initialize(path, @identity, Enum.map(issue_ids(Codec.max_issues() - 1), &baseline/1))
+    assert {:ok, registered} = Budget.register_new_issue(ledger, attrs_for(ledger))
     before = File.read!(path)
     attrs = %{attrs_for(registered) | issue_id: "d4444444-4444-4444-8444-444444444444"}
     assert {:error, :registration_limit} = Budget.register_new_issue(registered, attrs)
     assert File.read!(path) == before
     assert {:ok, ^registered} = Budget.load(path, @identity)
+    row = attrs |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end) |> Map.merge(%{"kind" => "new_issue_registration", "version" => 1})
+    File.write!(path, Codec.encode(row), [:append])
+    assert {:error, :invalid_budget_ledger} = Budget.load(path, @identity)
   end
+
+  test "bootstrap and replay refuse portfolios beyond the finite capacity", %{path: path} do
+    baselines = Enum.map(issue_ids(Codec.max_issues() + 1), &baseline/1)
+    assert {:error, :invalid_budget_bootstrap} = Budget.initialize(path, @identity, baselines)
+    refute File.exists?(path)
+    assert {:ok, _} = Budget.initialize(path, @identity, Enum.take(baselines, Codec.max_issues()))
+    row = List.last(baselines) |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end) |> Map.merge(%{"kind" => "bootstrap", "version" => 1})
+    File.write!(path, Codec.encode(row), [:append])
+    assert {:error, :invalid_budget_ledger} = Budget.load(path, @identity)
+  end
+
+  defp issue_ids(count), do: Enum.map(1..count, &("b1111111-1111-4111-8111-" <> String.pad_leading(Integer.to_string(&1), 12, "0")))
 
   defp baseline(id, minimum \\ 10) do
     %{
